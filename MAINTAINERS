@@ -1,0 +1,12 @@
+# cfs-snapshotter maintainers
+#
+# This file lists the maintainers of the cfs-snapshotter project. Maintainers
+# are responsible for reviewing and merging contributions and for the overall
+# health and direction of the project.
+#
+# Format (one maintainer per line):
+#   Name <email> (@github-handle)
+#
+# See CONTRIBUTING.md for how to propose changes and how decisions are made.
+
+Mykhaylo Sul <mykhaylo.sul@oss.qualcomm.com>
