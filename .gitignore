@@ -1,0 +1,27 @@
+# Go build and test artifacts
+/bin/
+/out/
+*.test
+*.out
+coverage.txt
+coverage.html
+
+# Editor / OS cruft
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Local AI-assistant / coding-agent state.
+#
+# Per-developer agent state is local-only and must never be committed. The
+# project's intentional, reviewed agent documentation — AGENTS.md and CLAUDE.md
+# at the repository root — is NOT matched by the patterns below and stays
+# versioned.
+.claude/
+CLAUDE.local.md
+AGENTS.local.md
+.cursor/
+.aider*
+.continue/
+.windsurf/
