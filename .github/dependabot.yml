@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: Apache-2.0
+version: 2
+updates:
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+
+  # Tracks the devcontainer base image (FROM). The runtime binaries
+  # (Docker, containerd, runc, CNI, Zot) are fetched by version-pinned build
+  # arguments rather than FROM lines, so they are bumped by editing
+  # .devcontainer/devcontainer.json.
+  - package-ecosystem: docker
+    directory: /.devcontainer
+    schedule:
+      interval: weekly

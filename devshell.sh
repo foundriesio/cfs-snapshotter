@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+
+set -euo pipefail
+
+# Resolve to the physical path so the workspace label is stable regardless of
+# which symlinked path (e.g. a GOPATH symlink) the script is invoked through;
+# otherwise `exec` may not match the container that `run` labelled.
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+IMAGE="${DEVCONTAINER_IMAGE:-cfs-snapshotter-devcontainer:test}"
+DOCKER="${DOCKER:-docker}"
+LABEL_DEVSHELL=io.foundries.cfs-snapshotter.devshell
+LABEL_WORKSPACE=io.foundries.cfs-snapshotter.workspace
+
+find_running_container() {
+	"${DOCKER}" ps -q \
+		--filter "label=${LABEL_DEVSHELL}=1" \
+		--filter "label=${LABEL_WORKSPACE}=${ROOT_DIR}" |
+		sed -n '1p'
+}
+
+exec_running_container() {
+	local container
+	container="$(find_running_container)"
+	if [ -z "${container}" ]; then
+		echo "no running devshell container found for ${ROOT_DIR}" >&2
+		echo "start one with: ./devshell.sh" >&2
+		exit 1
+	fi
+
+	if [ "$#" -eq 0 ]; then
+		set -- bash -il
+	fi
+
+	local exec_flags=()
+	if [ -t 0 ]; then
+		exec_flags+=(-i)
+	fi
+	if [ -t 1 ]; then
+		exec_flags+=(-t)
+	fi
+	"${DOCKER}" exec "${exec_flags[@]}" -w /workspace "${container}" "$@"
+}
+
+run_new_container() {
+	if [ "$#" -eq 0 ]; then
+		set -- bash -il
+	fi
+
+	mkdir -p /tmp/cfs-gocache /tmp/cfs-gomodcache
+
+	"${DOCKER}" build -f "${ROOT_DIR}/.devcontainer/Dockerfile" -t "${IMAGE}" "${ROOT_DIR}/.devcontainer"
+
+	local run_flags=(--rm --privileged)
+	if [ -t 0 ]; then
+		run_flags+=(-i)
+	fi
+	if [ -t 1 ]; then
+		run_flags+=(-t)
+	fi
+
+	"${DOCKER}" run "${run_flags[@]}" \
+		--label "${LABEL_DEVSHELL}=1" \
+		--label "${LABEL_WORKSPACE}=${ROOT_DIR}" \
+		--security-opt=seccomp=unconfined \
+		--security-opt=apparmor=unconfined \
+		--cgroupns=host \
+		-e CFS_DEVCONTAINER=1 \
+		-e PATH=/opt/cfs-dev/bin:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+		-e GOCACHE=/tmp/cfs-gocache \
+		-e GOMODCACHE=/tmp/cfs-gomodcache \
+		-v /tmp/cfs-gocache:/tmp/cfs-gocache \
+		-v /tmp/cfs-gomodcache:/tmp/cfs-gomodcache \
+		-v "${ROOT_DIR}:/workspace" \
+		-w /workspace \
+		"${IMAGE}" \
+		"$@"
+}
+
+if [ "${1:-}" = "exec" ]; then
+	shift
+	exec_running_container "$@"
+else
+	run_new_container "$@"
+fi

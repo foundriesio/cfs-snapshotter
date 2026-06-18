@@ -15,6 +15,7 @@ import (
 	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/containerd/containerd/v2/core/snapshots"
 	"github.com/containerd/errdefs"
+	"github.com/containerd/log"
 )
 
 // snapshotter is the cfs-snapshotter implementation of snapshots.Snapshotter.
@@ -58,6 +59,17 @@ func (s *snapshotter) Mounts(ctx context.Context, key string) ([]mount.Mount, er
 }
 
 func (s *snapshotter) Prepare(ctx context.Context, key, parent string, opts ...snapshots.Opt) ([]mount.Mount, error) {
+	info := snapshots.Info{}
+	for _, opt := range opts {
+		if err := opt(&info); err != nil {
+			return nil, fmt.Errorf("apply Prepare option: %w", err)
+		}
+	}
+	log.G(ctx).WithFields(log.Fields{
+		"key":    key,
+		"parent": parent,
+		"labels": info.Labels,
+	}).Debug("cfs snapshotter Prepare")
 	return nil, notImplemented("Prepare")
 }
 

@@ -34,6 +34,9 @@ version = 2
   type = "snapshot"
   address = "/run/containerd-cfs-grpc/containerd-cfs-grpc.sock"
 
+[proxy_plugins.cfs.exports]
+  enable_remote_snapshot_annotations = "true"
+
 # `ctr pull` unpacks via the transfer service, which only unpacks for the
 # snapshotters listed here. Listing any entry replaces the built-in default,
 # so keep overlayfs alongside cfs.
