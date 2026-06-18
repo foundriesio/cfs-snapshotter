@@ -1,0 +1,27 @@
+# SPDX-License-Identifier: Apache-2.0
+version: "2"
+
+linters:
+  default: none
+  enable:
+    - errcheck      # unchecked errors
+    - gosec         # security issues
+    - govet         # standard go vet checks
+    - ineffassign   # ineffectual assignments
+    - staticcheck   # static analysis
+    - unused        # unused vars / consts / types / funcs
+  exclusions:
+    rules:
+      # Test files routinely use 0o644 / 0o755 perms on temp paths; gosec's
+      # strict 0o600/0o750 rule is noise there. Non-test code keeps it.
+      - path: _test\.go$
+        linters:
+          - gosec
+        text: "G30(1|6)"
+
+run:
+  timeout: 5m
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0

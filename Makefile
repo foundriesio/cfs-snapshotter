@@ -2,6 +2,7 @@
 
 GO ?= go
 GOFLAGS ?=
+GOLANGCI_LINT ?= golangci-lint
 
 # Build artifacts live under bin/.
 BIN := bin
@@ -18,7 +19,7 @@ REVISION ?= $(shell git rev-parse HEAD 2>/dev/null || echo none)
 LDFLAGS := -X $(PKG)/pkg/version.Version=$(VERSION) -X $(PKG)/pkg/version.Revision=$(REVISION)
 
 .PHONY: all
-all: fmt vet test build
+all: fmt vet lint test build
 
 # build compiles the snapshotter daemon into bin/.
 .PHONY: build
@@ -35,10 +36,25 @@ install: build
 test:
 	$(GO) test $(GOFLAGS) ./...
 
+# test-smoke runs the cfs routing smoke test from inside the devcontainer.
+.PHONY: test-smoke
+test-smoke: run-cfs
+	.devcontainer/scripts/smoke-test-cfs-routing.sh
+
+# run-cfs builds and starts the cfs proxy snapshotter in the devcontainer.
+.PHONY: run-cfs
+run-cfs:
+	.devcontainer/scripts/run-cfs.sh
+
 # vet runs go vet across all packages.
 .PHONY: vet
 vet:
 	$(GO) vet $(GOFLAGS) ./...
+
+# lint runs golangci-lint (config in .golangci.yml).
+.PHONY: lint
+lint: fmt
+	$(GOLANGCI_LINT) run
 
 # fmt verifies that all Go sources are gofmt-clean; CI rejects unformatted code.
 .PHONY: fmt

@@ -47,7 +47,10 @@ func main() {
 		return
 	}
 
-	log.SetFormat(log.JSONFormat)
+	if err := log.SetFormat(log.JSONFormat); err != nil {
+		fmt.Fprintln(os.Stderr, "set log format:", err)
+		os.Exit(1)
+	}
 	if err := log.SetLevel(*logLevel); err != nil {
 		fmt.Fprintln(os.Stderr, "invalid log level:", err)
 		os.Exit(1)
@@ -59,20 +62,28 @@ func main() {
 	}
 }
 
-// run builds the stub snapshotter, serves it over a gRPC unix socket, and
-// blocks until SIGINT/SIGTERM, then shuts down gracefully.
+// run builds the snapshotter, serves it over a gRPC unix socket, and blocks
+// until SIGINT/SIGTERM, then shuts down gracefully.
 func run(ctx context.Context, address, root string) error {
 	sn, err := snapshot.NewSnapshotter(ctx, root)
 	if err != nil {
 		return fmt.Errorf("create snapshotter: %w", err)
 	}
-	defer sn.Close()
+	defer func() {
+		if err := sn.Close(); err != nil {
+			log.G(ctx).WithError(err).Warn("close snapshotter")
+		}
+	}()
 
 	listener, err := listen(address)
 	if err != nil {
 		return err
 	}
-	defer os.Remove(address)
+	defer func() {
+		if err := os.Remove(address); err != nil && !errors.Is(err, os.ErrNotExist) {
+			log.G(ctx).WithError(err).WithField("address", address).Warn("remove socket")
+		}
+	}()
 
 	server := grpc.NewServer()
 	snapshotsapi.RegisterSnapshotsServer(server, snapshotservice.FromSnapshotter(sn))

@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: Apache-2.0
+
+version = 2
+
+[grpc]
+  address = "/run/containerd/containerd.sock"
+
+[proxy_plugins.cfs]
+  type = "snapshot"
+  address = "/run/containerd-cfs-grpc/containerd-cfs-grpc.sock"
+
+[proxy_plugins.cfs.exports]
+  enable_remote_snapshot_annotations = "true"
+
+[plugins."io.containerd.cri.v1.images".registry]
+  config_path = "/etc/containerd/certs.d"
+
+[[plugins."io.containerd.transfer.v1.local".unpack_config]]
+  platform = "linux"
+  snapshotter = "overlayfs"
+
+[[plugins."io.containerd.transfer.v1.local".unpack_config]]
+  platform = "linux"
+  snapshotter = "cfs"
