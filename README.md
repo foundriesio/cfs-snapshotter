@@ -5,9 +5,19 @@ container rootfs from content-addressed, composefs-backed storage — using
 **composefs + EROFS + fs-verity** to mount a container's filesystem with a single
 `mount` syscall instead of unpacking and stacking layers.
 
-> **Status: early development.** This repository currently contains only project
-> governance and contribution scaffolding — there is no implementation yet.
-> Documentation for building, testing, and usage will be added as the code lands.
+> **Status: early development.** The snapshotter skeleton builds and runs as a
+> containerd proxy snapshotter, but its methods are currently stubs that return
+> `not implemented`; the composefs/CAS backend lands in a later change.
+
+## Build and run
+
+```sh
+make build            # writes bin/containerd-cfs-grpc
+./bin/containerd-cfs-grpc -version
+```
+
+See [docs/running.md](docs/running.md) for running the daemon and registering it
+with containerd via a `[proxy_plugins.cfs]` entry.
 
 ## Contributing
 
