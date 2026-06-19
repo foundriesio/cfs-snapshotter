@@ -7,10 +7,12 @@ daemon (`containerd-cfs-grpc`) that serves the containerd Snapshots gRPC API on 
 unix socket. containerd — and Docker, which uses the same containerd — is pointed
 at it through one `proxy_plugins` entry.
 
-> **Status:** the snapshotter methods are stubs that return `not implemented`.
-> This guide gets `ctr` and `docker` to route a pull *to* cfs; the pull then fails
-> at the snapshotter with `not implemented`, which is the expected proof that the
-> wiring is correct. The storage backend lands in a later change.
+> **Status:** the snapshotter tracks snapshot metadata and lifecycle (prepare,
+> commit, remove) and returns placeholder bind mounts. A pull routed to cfs now
+> completes: containerd extracts the layers into per-snapshot directories and
+> commits them. The mounts are not yet content-addressed composefs mounts and do
+> not compose a snapshot's parent chain, so a pulled image is not yet a usable
+> container rootfs; that materialization lands in a later change.
 
 ## 1. Build and start the daemon
 
@@ -74,9 +76,10 @@ sudo ctr image pull --snapshotter cfs docker.io/library/busybox:latest
 docker pull busybox
 ```
 
-Both fetch the image, then call into cfs and stop at `Prepare` with
-`not implemented`. That error means the routing works — both clients are reaching
-the cfs snapshotter through the proxy.
+Both fetch the image and unpack it through cfs: the snapshotter records the
+prepare/commit lifecycle and returns placeholder bind mounts that containerd
+extracts the layers into. `ctr snapshots --snapshotter cfs ls` then lists the
+committed snapshots, confirming both clients reached cfs through the proxy.
 
 ## Quick test without editing config
 
