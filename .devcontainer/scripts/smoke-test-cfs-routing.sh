@@ -31,23 +31,29 @@ require_cfs_plugin() {
 	fi
 }
 
-expect_not_implemented() {
+expect_pull_succeeds() {
 	local name="$1"
 	local log_file="$2"
 	shift 2
 
-	if "$@" >"${log_file}" 2>&1; then
-		echo "${name} unexpectedly succeeded; update this smoke test for the implemented backend" >&2
-		return 1
-	fi
-
-	if ! grep -qi 'not implemented' "${log_file}"; then
-		echo "${name} failed before reaching the cfs stub" >&2
+	if ! "$@" >"${log_file}" 2>&1; then
+		echo "${name} failed; the cfs snapshotter did not complete the pull" >&2
 		cat "${log_file}" >&2
 		return 1
 	fi
 
-	echo "${name} reached cfs and failed with not implemented as expected"
+	echo "${name} completed through the cfs snapshotter"
+}
+
+require_cfs_snapshots() {
+	local snaps
+	snaps="$(ctr --address "${CONTAINERD_SOCKET}" snapshots --snapshotter cfs ls)"
+	if ! grep -qi 'committed' <<<"${snaps}"; then
+		echo "cfs recorded no committed snapshots after pull" >&2
+		echo "${snaps}" >&2
+		return 1
+	fi
+	echo "cfs recorded committed snapshots"
 }
 
 trust_workspace() {
@@ -69,12 +75,13 @@ main() {
 	require_cfs_plugin
 	"${ROOT_DIR}/.devcontainer/scripts/seed-registry.sh" "${SMOKE_IMAGE}"
 
-	expect_not_implemented "ctr image pull" /tmp/cfs-ctr-pull.log \
+	expect_pull_succeeds "ctr image pull" /tmp/cfs-ctr-pull.log \
 		ctr --address "${CONTAINERD_SOCKET}" image pull --plain-http --snapshotter cfs "${SMOKE_IMAGE}"
-	expect_not_implemented "docker pull" /tmp/cfs-docker-pull.log \
+	require_cfs_snapshots
+	expect_pull_succeeds "docker pull" /tmp/cfs-docker-pull.log \
 		docker pull "${SMOKE_IMAGE}"
 
-	echo "future backend check: pulls succeed and 'docker run --rm ${SMOKE_IMAGE} true' works once the backend is implemented"
+	echo "future backend check: the pulled snapshots are placeholder bind mounts; composefs rootfs and 'docker run --rm ${SMOKE_IMAGE} true' land once mount materialization is implemented"
 }
 
 main "$@"
