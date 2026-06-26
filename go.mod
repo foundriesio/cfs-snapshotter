@@ -5,7 +5,7 @@ go 1.25.0
 require (
 	github.com/containerd/containerd/api v1.9.0
 	github.com/containerd/containerd/v2 v2.1.0
-	github.com/containerd/continuity v0.4.5
+	github.com/containerd/continuity v0.5.0
 	github.com/containerd/errdefs v1.0.0
 	github.com/containerd/log v0.1.0
 	golang.org/x/sys v0.33.0
