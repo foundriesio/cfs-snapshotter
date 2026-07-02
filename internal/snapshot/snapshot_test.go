@@ -5,7 +5,9 @@ package snapshot
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/containerd/containerd/v2/core/snapshots"
@@ -106,6 +108,85 @@ func TestParentResolution(t *testing.T) {
 
 	if _, err := sn.Prepare(ctx, "child", ""); !errdefs.IsAlreadyExists(err) {
 		t.Fatalf("Prepare() with duplicate key error = %v, want already exists", err)
+	}
+}
+
+func TestPrepareTarget(t *testing.T) {
+	ctx := context.Background()
+	sn := newTestSnapshotter(t)
+	target1 := "sha256:" + strings.Repeat("11", 32)
+	target2 := "sha256:" + strings.Repeat("22", 32)
+
+	mounts, err := sn.Prepare(ctx, "extract-1", "", snapshots.WithLabels(map[string]string{
+		targetSnapshotLabel: target1,
+	}))
+	if !errdefs.IsAlreadyExists(err) {
+		t.Fatalf("Prepare(extract-1) error = %v, want already exists", err)
+	}
+	if mounts != nil {
+		t.Fatalf("Prepare(extract-1) mounts = %v, want nil", mounts)
+	}
+
+	info, err := sn.Stat(ctx, target1)
+	if err != nil {
+		t.Fatalf("Stat(target1) error = %v", err)
+	}
+	if info.Kind != snapshots.KindCommitted {
+		t.Fatalf("Stat(target1).Kind = %v, want %v", info.Kind, snapshots.KindCommitted)
+	}
+	if info.Parent != "" {
+		t.Fatalf("Stat(target1).Parent = %q, want empty", info.Parent)
+	}
+	if got := info.Labels[targetSnapshotLabel]; got != target1 {
+		t.Fatalf("Stat(target1).Labels[%q] = %q, want %q", targetSnapshotLabel, got, target1)
+	}
+
+	if _, err := sn.Prepare(ctx, "extract-2", target1, snapshots.WithLabels(map[string]string{
+		targetSnapshotLabel: target2,
+	})); !errdefs.IsAlreadyExists(err) {
+		t.Fatalf("Prepare(extract-2) error = %v, want already exists", err)
+	}
+	info, err = sn.Stat(ctx, target2)
+	if err != nil {
+		t.Fatalf("Stat(target2) error = %v", err)
+	}
+	if info.Parent != target1 {
+		t.Fatalf("Stat(target2).Parent = %q, want %q", info.Parent, target1)
+	}
+
+	filter := fmt.Sprintf(`labels."containerd.io/snapshot.ref"==%s,parent==%q`, target2, target1)
+	var walked []snapshots.Info
+	if err := sn.Walk(ctx, func(_ context.Context, info snapshots.Info) error {
+		walked = append(walked, info)
+		return nil
+	}, filter); err != nil {
+		t.Fatalf("Walk(%q) error = %v", filter, err)
+	}
+	if len(walked) != 1 {
+		t.Fatalf("Walk(%q) yielded %d records, want 1: %v", filter, len(walked), walked)
+	}
+	if walked[0].Name != target2 {
+		t.Fatalf("Walk(%q)[0].Name = %q, want %q", filter, walked[0].Name, target2)
+	}
+
+	if _, err := sn.Prepare(ctx, "extract-1b", "", snapshots.WithLabels(map[string]string{
+		targetSnapshotLabel: target1,
+	})); !errdefs.IsAlreadyExists(err) {
+		t.Fatalf("Prepare(extract-1b) error = %v, want already exists", err)
+	}
+	if _, err := sn.Stat(ctx, "extract-1b"); !errdefs.IsNotFound(err) {
+		t.Fatalf("Stat(extract-1b) error = %v, want not found", err)
+	}
+
+	mounts, err = sn.Prepare(ctx, "active", target2)
+	if err != nil {
+		t.Fatalf("Prepare(active) error = %v", err)
+	}
+	if len(mounts) != 1 {
+		t.Fatalf("Prepare(active) returned %d mounts, want 1: %v", len(mounts), mounts)
+	}
+	if mounts[0].Type != mountType {
+		t.Fatalf("Prepare(active) mount type = %q, want %q", mounts[0].Type, mountType)
 	}
 }
 

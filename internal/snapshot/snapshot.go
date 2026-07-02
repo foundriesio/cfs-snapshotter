@@ -30,6 +30,11 @@ import (
 // a snapshot until composefs materialization lands.
 const mountType = "bind"
 
+// targetSnapshotLabel marks a Prepare call as a request for a committed
+// snapshot with the given name; the label value is the snapshot name to
+// commit under.
+const targetSnapshotLabel = "containerd.io/snapshot.ref"
+
 var defaultMountOptions = []string{"rbind"}
 
 // snapshotter is the cfs-snapshotter implementation of snapshots.Snapshotter.
@@ -134,13 +139,51 @@ func (s *snapshotter) Mounts(ctx context.Context, key string) (_ []mount.Mount, 
 // Prepare records a new active snapshot under key, descending from parent, and
 // returns its mounts.
 func (s *snapshotter) Prepare(ctx context.Context, key, parent string, opts ...snapshots.Opt) ([]mount.Mount, error) {
-	return s.createSnapshot(ctx, snapshots.KindActive, key, parent, opts)
+	var base snapshots.Info
+	for _, opt := range opts {
+		if err := opt(&base); err != nil {
+			return nil, fmt.Errorf("apply snapshot option: %w", err)
+		}
+	}
+	target, ok := base.Labels[targetSnapshotLabel]
+	if !ok {
+		return s.createSnapshot(ctx, snapshots.KindActive, key, parent, opts)
+	}
+	return nil, s.prepareTarget(ctx, key, parent, target, base.Labels, opts)
 }
 
 // View records a new read-only snapshot under key, descending from parent, and
 // returns its mounts.
 func (s *snapshotter) View(ctx context.Context, key, parent string, opts ...snapshots.Opt) ([]mount.Mount, error) {
 	return s.createSnapshot(ctx, snapshots.KindView, key, parent, opts)
+}
+
+// prepareTarget handles a Prepare carrying targetSnapshotLabel: it creates
+// the active snapshot, immediately commits it under the target name with the
+// caller's labels and parent, and reports ErrAlreadyExists. The committed
+// snapshot has no content; it only records that the target is present so the
+// caller can adopt it by walking for the label and parent.
+func (s *snapshotter) prepareTarget(ctx context.Context, key, parent, target string, labels map[string]string, opts []snapshots.Opt) error {
+	if _, err := s.createSnapshot(ctx, snapshots.KindActive, key, parent, opts); err != nil {
+		return fmt.Errorf("create target snapshot %q: %w", target, err)
+	}
+	err := s.Commit(ctx, target, key, append(opts, snapshots.WithLabels(labels))...)
+	if err != nil && !errdefs.IsAlreadyExists(err) {
+		return fmt.Errorf("commit target snapshot %q: %w", target, err)
+	}
+	if errdefs.IsAlreadyExists(err) {
+		// The target was committed by an earlier call; drop the extra
+		// active snapshot so no orphan record is left behind.
+		if rerr := s.Remove(ctx, key); rerr != nil {
+			log.G(ctx).WithError(rerr).WithField("key", key).Warn("failed to remove superseded active snapshot")
+		}
+	}
+	log.G(ctx).WithFields(log.Fields{
+		"key":    key,
+		"target": target,
+		"parent": parent,
+	}).Info("committed remote snapshot target")
+	return fmt.Errorf("target snapshot %q: %w", target, errdefs.ErrAlreadyExists)
 }
 
 // Commit moves the active snapshot identified by key to a committed snapshot
