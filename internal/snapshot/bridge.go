@@ -21,6 +21,7 @@ type engineAPI interface {
 	Inspect(ctx context.Context, ref string) (*knarr.ImageInfo, error)
 	Mount(ctx context.Context, ref, target string, opts ...knarr.MountOption) error
 	Unmount(ctx context.Context, target string) error
+	ObjectsDir() (string, error)
 }
 
 // bridgeEntry records the image root covering a layer chain.

@@ -7,11 +7,16 @@ daemon (`containerd-cfs-grpc`) that serves the containerd Snapshots gRPC API on 
 unix socket. containerd — and Docker, which uses the same containerd — is pointed
 at it through one `proxy_plugins` entry.
 
-> **Status:** the snapshotter tracks snapshot metadata and lifecycle (prepare,
-> commit, remove), indexes images already present in the local knarr store by
-> layer chain digest, and returns placeholder bind mounts. Target-labeled
-> prepares for unknown chains fail closed; the snapshotter does not fetch or
-> unpack missing image content as a fallback.
+> **Status:** the snapshotter serves container root filesystems for images
+> already present in the local knarr store, indexed by layer chain digest.
+> Each image's EROFS metadata is mounted read-only once, at its chain
+> snapshot; containers get standard flat overlay mount specs combining their
+> writable upper (and any committed intermediate layers, such as docker's
+> init layer) with that shared mount and the knarr object directory as a
+> verity-enforced data-only lower, and `docker run` executes from it without
+> any layer entering containerd's content store. Target-labeled prepares for
+> unknown chains fail closed; the snapshotter does not fetch or unpack
+> missing image content as a fallback.
 
 ## 1. Build and start the daemon
 
