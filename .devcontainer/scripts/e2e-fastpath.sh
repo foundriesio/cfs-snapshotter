@@ -8,9 +8,10 @@
 # that rootfs, that writes land in the overlay while the image stays immutable,
 # that a container's writes persist across its stop/start while a fresh
 # container starts clean, that stop/rm/rmi tear the container and then the
-# image mount down, that an unmaterialized image fails closed, that a tampered
-# store object is rejected by fs-verity, and that the snapshotter recovers
-# after a restart.
+# image mount down, that a real-world image runs digest-pinned from its home
+# registry with only manifest and config fetched, that an unmaterialized image
+# fails closed, that a tampered store object is rejected by fs-verity, and
+# that the snapshotter recovers after a restart.
 
 set -euo pipefail
 
@@ -26,6 +27,9 @@ KNARR_ROOT=/var/lib/knarr
 KNARR_BIN=/opt/cfs-dev/bin/knarr
 KNARR_SRC=/work/go/src/github.com/foundriesio/knarr
 CFS_LOG=/var/log/cfs-devcontainer/containerd-cfs-grpc.log
+# Real-world image for the registry round-trip check; needs network access to
+# its home registry (manifest and config only — layers must not be fetched).
+REAL_IMAGE="${CFS_E2E_REAL_IMAGE:-docker.io/library/busybox:latest}"
 
 work=""
 
@@ -238,6 +242,44 @@ assert_lifecycle_cleanup() {
 	echo "PASS: upper persists across restart, fresh container clean; stop/rm keep the shared mount; rmi tears it down"
 }
 
+# assert_real_image drives the same flow with a real-world image straight from
+# its home registry, digest-pinned like an OTA agent would: crane exports the
+# image as an OCI layout, knarr materializes it out of band, and docker runs it
+# by digest — the registry serves only the manifest and config while every
+# layer comes from the local store. A real image brings what the synthetic
+# seeds cannot: registry media types, a multi-arch index resolved per platform,
+# and a shell for an in-container write.
+assert_real_image() {
+	local image="${REAL_IMAGE}" layout="${work}/real-image" repo digest out
+	repo="${image#*/}"
+	repo="${repo%%[:@]*}"
+
+	crane pull --format=oci --platform "linux/$(go env GOARCH)" "${image}" "${layout}" ||
+		fail "crane pull of ${image} failed"
+	digest="$(jq -r '.manifests[0].digest' "${layout}/index.json")"
+	"${KNARR_BIN}" pull --from-dir "${layout}" "${repo}@${digest}" ||
+		fail "knarr pull of ${repo}@${digest} failed"
+
+	local pinned="${image%%[:@]*}@${digest}"
+	out="$(docker run --rm --network=none "${pinned}" /bin/sh -c 'echo "test write" >/somefile && cat /somefile')" ||
+		fail "docker run of ${pinned} failed"
+	[ "${out}" = "test write" ] ||
+		fail "real-image run output = '${out}', want 'test write'"
+
+	# Zero layer fetch: the layers named by the pinned manifest never entered
+	# containerd's content store; docker fetched only manifest and config.
+	local manifest d
+	manifest="$(cat "${layout}/blobs/sha256/${digest#sha256:}")"
+	while read -r d; do
+		content_has "${d}" && fail "real-image layer fetched into content store: ${d}"
+	done < <(jq -r '.layers[].digest' <<<"${manifest}")
+	content_has "$(jq -r '.config.digest' <<<"${manifest}")" ||
+		fail "real-image config absent from content store"
+
+	docker rmi "${pinned}" >/dev/null || fail "docker rmi of ${pinned} failed"
+	echo "PASS: real image ${image} runs digest-pinned with zero layer fetch"
+}
+
 assert_fail_closed() {
 	# Seed an image but do NOT pull it into the knarr store; the fast path has
 	# nothing to serve, so the pull must fail rather than fetch layers.
@@ -311,12 +353,14 @@ main() {
 	assert_fastpath_run
 	assert_docker_run
 	assert_lifecycle_cleanup
+	assert_real_image
 	assert_fail_closed
 	assert_verity_seals_store
 	assert_restart_recovers "${restart_ref}"
 
-	echo "E2E PASS: knarr-fed zero-fetch composefs create and run, stop/rm/rmi"
-	echo "cleanup, fail-closed miss, fs-verity sealing, and restart recovery all hold."
+	echo "E2E PASS: knarr-fed zero-fetch composefs create and run, lifecycle cleanup,"
+	echo "digest-pinned real image, fail-closed miss, fs-verity sealing, and restart"
+	echo "recovery all hold."
 }
 
 main "$@"
