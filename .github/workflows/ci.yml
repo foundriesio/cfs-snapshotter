@@ -58,8 +58,8 @@ jobs:
             | sh -s -- -b "$(go env GOPATH)/bin" "${GOLANGCI_LINT_VERSION}"
       - run: make lint
 
-  smoke:
-    name: devcontainer routing smoke test
+  e2e:
+    name: devcontainer fast-path e2e
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -73,7 +73,8 @@ jobs:
       # reuses; the build inside then resolves knarr offline.
       - name: Pre-fetch modules into the shared devcontainer cache
         run: GOMODCACHE=/tmp/cfs-gomodcache go mod download
-      # Builds the version-pinned devcontainer image and runs the smoke test
-      # inside it: starts the nested zot/containerd/dockerd/cfs stack and checks
-      # that ctr and Docker pulls route to the cfs proxy snapshotter.
-      - run: ./devshell.sh make test-smoke
+      # Builds the version-pinned devcontainer image and runs the fast-path e2e
+      # inside it: starts the nested zot/containerd/dockerd/cfs stack, pulls an
+      # image into the knarr store out of band, and checks a docker run is served
+      # from a composefs mount with no layer fetch.
+      - run: ./devshell.sh make test-e2e

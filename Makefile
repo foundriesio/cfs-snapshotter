@@ -36,10 +36,10 @@ install: build
 test:
 	$(GO) test $(GOFLAGS) ./...
 
-# test-smoke runs the cfs routing smoke test from inside the devcontainer.
-.PHONY: test-smoke
-test-smoke: run-cfs
-	.devcontainer/scripts/smoke-test-cfs-routing.sh
+# test-e2e runs the fast-path end-to-end test from inside the devcontainer.
+.PHONY: test-e2e
+test-e2e: run-cfs
+	.devcontainer/scripts/e2e-fastpath.sh
 
 # run-cfs builds and starts the cfs proxy snapshotter in the devcontainer.
 .PHONY: run-cfs

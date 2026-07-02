@@ -35,13 +35,14 @@ installed from distribution packages.
   until they are ready.
 - **`devshell.sh`:** a host-side helper that builds the same image and runs a
   command inside a privileged container with the nested stack started — e.g.
-  `./devshell.sh make test-smoke` to run the routing smoke test, or
+  `./devshell.sh make test-e2e` to run the fast-path end-to-end test, or
   `./devshell.sh` for an interactive shell. Use `./devshell.sh exec <cmd>` to run
   in an already-running session.
 
 Inside the container, `make run-cfs` rebuilds and restarts the snapshotter after
-editing code, and `make test-smoke` checks that `ctr` and Docker pulls route to
-cfs. See [docs/devcontainer.md](docs/devcontainer.md) for the full workflow.
+editing code, and `make test-e2e` checks that a Docker run is served from a
+composefs mount with no layer fetch. See
+[docs/devcontainer.md](docs/devcontainer.md) for the full workflow.
 
 ## Contributing
 
