@@ -7,12 +7,14 @@ daemon (`containerd-cfs-grpc`) that serves the containerd Snapshots gRPC API on 
 unix socket. containerd — and Docker, which uses the same containerd — is pointed
 at it through one `proxy_plugins` entry.
 
-> **Status:** the snapshotter is a remote-snapshotter stub. It answers the
-> unpacker's per-layer handshake as if the image content were already present
-> locally, so a pull routed to cfs downloads no layers (`ctr` and `docker`
-> still fetch the image metadata: index, manifest, config, etc.), and it
-> serves every snapshot as one flat overlay whose base layer is a stand-in
-> rootfs (`-stub-rootfs`) — enough to run containers, against stand-in content.
+> **Status:** the snapshotter is a remote-snapshotter stub backed by a local
+> knarr image store. It answers the unpacker's per-layer handshake for chains
+> present in that store, so a pull of an image staged out of band downloads
+> no layers (`ctr` and `docker` still fetch the image metadata: index,
+> manifest, config, etc.); chains the store does not cover fail closed — the
+> snapshotter never fetches or unpacks content itself. Every snapshot is
+> served as one flat overlay whose base layer is a stand-in rootfs
+> (`-stub-rootfs`) — enough to run containers, against stand-in content.
 > Content-addressed composefs mounts of real image content land in a later
 > change.
 
@@ -27,7 +29,14 @@ sudo ./bin/containerd-cfs-grpc -stub-rootfs <dir> &
 base layer in place of real image content (the devcontainer builds one — see
 `.devcontainer/scripts/make-stub-rootfs.sh`). The other defaults (socket
 `/run/containerd-cfs-grpc/containerd-cfs-grpc.sock`, root
-`/var/lib/containerd-cfs-grpc`) match the config below. See `-help` for flags.
+`/var/lib/containerd-cfs-grpc`, knarr root `/var/lib/knarr`) match the config
+below. See `-help` for flags.
+
+Set `-knarr-root` to the shared knarr image store root. Images must be pulled
+into that store by digest out of band before containerd prepares their layer
+chains through cfs. If a chain digest is not present in the local index,
+`Prepare` returns a failed-precondition error naming the chainID and the
+required out-of-band pull.
 
 ## 2. Configure containerd
 
@@ -81,12 +90,14 @@ sudo ctr image pull --snapshotter cfs docker.io/library/busybox:latest
 docker pull busybox
 ```
 
-Both complete through cfs with zero layer downloads — only the image
-metadata (index, manifest, config, etc.) is fetched: the snapshotter answers the
-unpacker's per-layer handshake as if the layer chain were already present
-locally. `ctr snapshots --snapshotter cfs ls` then lists the committed chain
-snapshots, confirming both clients reached cfs through the proxy, and
-`docker run` serves the stand-in rootfs.
+When the image is already present in the knarr store, both complete through
+cfs with zero layer downloads — only the image metadata (index, manifest,
+config, etc.) is fetched: the snapshotter answers the unpacker's per-layer
+handshake from the store's index. `ctr snapshots --snapshotter cfs ls` then
+lists the committed chain snapshots, confirming both clients reached cfs
+through the proxy, and `docker run` serves the stand-in rootfs. An image
+absent from the store fails closed rather than silently unpacking into a
+different rootfs shape.
 
 ## Quick test without editing config
 

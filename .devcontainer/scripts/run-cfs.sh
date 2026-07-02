@@ -15,6 +15,7 @@ CONTAINERD_SOCKET=/run/containerd/containerd.sock
 CFS_LOG_LEVEL="${CFS_LOG_LEVEL:-trace}"
 CFS_ROOT=/var/lib/containerd-cfs-grpc
 CFS_ROOT_IMG=/var/tmp/cfs-root.img
+CFS_KNARR_ROOT="${CFS_KNARR_ROOT:-/var/lib/knarr}"
 CFS_PIDFILE="${LOG_DIR}/containerd-cfs-grpc.pid"
 CFS_LOGFILE="${LOG_DIR}/containerd-cfs-grpc.log"
 CFS_STATE_FILE="${LOG_DIR}/containerd-cfs-grpc.env"
@@ -169,7 +170,7 @@ main() {
 	if [ ! -e "${stub_rootfs}/hello" ] || [ ! -e "${stub_rootfs}/bin/sh" ]; then
 		"${ROOT_DIR}/.devcontainer/scripts/make-stub-rootfs.sh" "${stub_rootfs}"
 	fi
-	new_state="${CFS_LOG_LEVEL} ${stub_rootfs}"
+	new_state="${CFS_LOG_LEVEL} ${stub_rootfs} ${CFS_KNARR_ROOT}"
 	old_hash="$(file_hash "${CONTAINERD_CFS_GRPC_BIN}")"
 	old_state="$(cat "${CFS_STATE_FILE}" 2>/dev/null || true)"
 	make -C "${ROOT_DIR}" build
@@ -187,7 +188,7 @@ main() {
 			"${CFS_SOCKET}" \
 			"${CFS_LOGFILE}" \
 			"${CONTAINERD_CFS_GRPC_BIN}" -log-level "${CFS_LOG_LEVEL}" \
-			-stub-rootfs "${stub_rootfs}"
+			-stub-rootfs "${stub_rootfs}" -knarr-root "${CFS_KNARR_ROOT}"
 		printf '%s\n' "${new_state}" >"${CFS_STATE_FILE}"
 	fi
 	wait_for cfs-snapshotter test -S "${CFS_SOCKET}"

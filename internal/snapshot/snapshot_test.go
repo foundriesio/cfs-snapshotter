@@ -5,6 +5,7 @@ package snapshot
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -12,6 +13,7 @@ import (
 	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/containerd/containerd/v2/core/snapshots"
 	"github.com/containerd/errdefs"
+	"github.com/opencontainers/go-digest"
 )
 
 func TestOptFieldsExposesLabels(t *testing.T) {
@@ -28,13 +30,13 @@ func TestOptFieldsExposesLabels(t *testing.T) {
 }
 
 func TestNewSnapshotterRejectsEmptyRoot(t *testing.T) {
-	if _, err := NewSnapshotter(context.Background(), "", ""); !errdefs.IsInvalidArgument(err) {
+	if _, err := NewSnapshotter(context.Background(), "", t.TempDir(), t.TempDir()); !errdefs.IsInvalidArgument(err) {
 		t.Fatalf("NewSnapshotter(%q) error = %v, want invalid argument", "", err)
 	}
 }
 
 func TestNewSnapshotterAcceptsValidRoot(t *testing.T) {
-	sn, err := NewSnapshotter(context.Background(), t.TempDir(), t.TempDir())
+	sn, err := NewSnapshotter(context.Background(), t.TempDir(), t.TempDir(), t.TempDir())
 	if err != nil {
 		t.Fatalf("NewSnapshotter() error = %v", err)
 	}
@@ -50,24 +52,43 @@ func TestNewSnapshotterAcceptsValidRoot(t *testing.T) {
 // its Close with t.Cleanup.
 func newTestSnapshotter(t *testing.T) snapshots.Snapshotter {
 	t.Helper()
-	sn, err := NewSnapshotter(context.Background(), t.TempDir(), t.TempDir())
+	return newTestSnapshotterWithEngine(t, defaultTestEngine())
+}
+
+// defaultTestEngine covers the single-layer image imageChain commits for
+// seed "img".
+func defaultTestEngine() *fakeEngine {
+	return fakeEngineForImages(testImageInfo(digest.FromString("img-root"), digest.FromString("img")))
+}
+
+func newTestSnapshotterWithEngine(t *testing.T, engine engineAPI) snapshots.Snapshotter {
+	t.Helper()
+	sn, err := newSnapshotter(context.Background(), t.TempDir(), t.TempDir(), engine)
 	if err != nil {
 		t.Fatalf("NewSnapshotter() error = %v", err)
 	}
-	t.Cleanup(func() { _ = sn.Close() })
+	t.Cleanup(func() {
+		if err := sn.Close(); err != nil {
+			t.Errorf("Close() error = %v", err)
+		}
+	})
 	return sn
 }
 
-// imageChain commits an intermediate virtual snapshot named name, the way a
-// pull's unpack handshake would, for tests to layer snapshots over: the stub
-// refuses snapshots with no image in their ancestry.
-func imageChain(t *testing.T, ctx context.Context, sn snapshots.Snapshotter, name string) {
+// imageChain commits an intermediate virtual snapshot the way a pull's unpack
+// handshake would, for tests to layer snapshots over: the snapshotter refuses
+// snapshots with no image in their ancestry. The committed name is the
+// chainID of a single layer whose diffID derives from seed, so it resolves in
+// an engine covering that layer — newTestSnapshotter's covers seed "img".
+func imageChain(t *testing.T, ctx context.Context, sn snapshots.Snapshotter, seed string) string {
 	t.Helper()
+	name := chainIDs(digest.FromString(seed))[0].String()
 	if _, err := sn.Prepare(ctx, "extract-"+name, "", snapshots.WithLabels(map[string]string{
 		"containerd.io/snapshot.ref": name,
 	})); !errdefs.IsAlreadyExists(err) {
 		t.Fatalf("image chain handshake error = %v, want already exists", err)
 	}
+	return name
 }
 
 // TestLifecycle covers the active → committed transition and that Walk lists the
@@ -75,9 +96,9 @@ func imageChain(t *testing.T, ctx context.Context, sn snapshots.Snapshotter, nam
 func TestLifecycle(t *testing.T) {
 	ctx := context.Background()
 	sn := newTestSnapshotter(t)
-	imageChain(t, ctx, sn, "img")
+	img := imageChain(t, ctx, sn, "img")
 
-	if _, err := sn.Prepare(ctx, "active", "img"); err != nil {
+	if _, err := sn.Prepare(ctx, "active", img); err != nil {
 		t.Fatalf("Prepare() error = %v", err)
 	}
 	if info, err := sn.Stat(ctx, "active"); err != nil {
@@ -106,7 +127,7 @@ func TestLifecycle(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Walk() error = %v", err)
 	}
-	want := map[string]bool{"img": true, "committed": true}
+	want := map[string]bool{img: true, "committed": true}
 	if len(walked) != len(want) {
 		t.Fatalf("Walk() listed %v, want the chain and the committed snapshot", walked)
 	}
@@ -115,6 +136,20 @@ func TestLifecycle(t *testing.T) {
 			t.Fatalf("Walk() listed unexpected %q", name)
 		}
 	}
+
+	viewMounts, err := sn.View(ctx, "view", "committed")
+	if err != nil {
+		t.Fatalf("View() error = %v", err)
+	}
+	if len(viewMounts) != 1 {
+		t.Fatalf("View() returned %d mounts, want 1: %v", len(viewMounts), viewMounts)
+	}
+	if got := viewMounts[0].Options[0]; got != "ro" {
+		t.Fatalf("View() mount ro flag = %q, want ro", got)
+	}
+	if err := sn.Remove(ctx, "view"); err != nil {
+		t.Fatalf("Remove(view) error = %v", err)
+	}
 }
 
 // TestParentResolution covers descending from a committed parent and the error
@@ -122,9 +157,9 @@ func TestLifecycle(t *testing.T) {
 func TestParentResolution(t *testing.T) {
 	ctx := context.Background()
 	sn := newTestSnapshotter(t)
-	imageChain(t, ctx, sn, "img")
+	img := imageChain(t, ctx, sn, "img")
 
-	if _, err := sn.Prepare(ctx, "base", "img"); err != nil {
+	if _, err := sn.Prepare(ctx, "base", img); err != nil {
 		t.Fatalf("Prepare(base) error = %v", err)
 	}
 	if err := sn.Commit(ctx, "base-committed", "base"); err != nil {
@@ -144,16 +179,125 @@ func TestParentResolution(t *testing.T) {
 	}
 }
 
+func TestPrepareTarget(t *testing.T) {
+	ctx := context.Background()
+	diffIDs := []digest.Digest{
+		digest.FromString("target-layer-1"),
+		digest.FromString("target-layer-2"),
+	}
+	targets := chainIDs(diffIDs...)
+	sn := newTestSnapshotterWithEngine(t, fakeEngineForImages(testImageInfo(digest.FromString("target-root"), diffIDs...)))
+	target1 := targets[0].String()
+	target2 := targets[1].String()
+
+	mounts, err := sn.Prepare(ctx, "extract-1", "", snapshots.WithLabels(map[string]string{
+		intermediateSnapshotLabel: target1,
+	}))
+	if !errdefs.IsAlreadyExists(err) {
+		t.Fatalf("Prepare(extract-1) error = %v, want already exists", err)
+	}
+	if mounts != nil {
+		t.Fatalf("Prepare(extract-1) mounts = %v, want nil", mounts)
+	}
+
+	info, err := sn.Stat(ctx, target1)
+	if err != nil {
+		t.Fatalf("Stat(target1) error = %v", err)
+	}
+	if info.Kind != snapshots.KindCommitted {
+		t.Fatalf("Stat(target1).Kind = %v, want %v", info.Kind, snapshots.KindCommitted)
+	}
+	if info.Parent != "" {
+		t.Fatalf("Stat(target1).Parent = %q, want empty", info.Parent)
+	}
+	if got := info.Labels[intermediateSnapshotLabel]; got != target1 {
+		t.Fatalf("Stat(target1).Labels[%q] = %q, want %q", intermediateSnapshotLabel, got, target1)
+	}
+
+	if _, err := sn.Prepare(ctx, "extract-2", target1, snapshots.WithLabels(map[string]string{
+		intermediateSnapshotLabel: target2,
+	})); !errdefs.IsAlreadyExists(err) {
+		t.Fatalf("Prepare(extract-2) error = %v, want already exists", err)
+	}
+	info, err = sn.Stat(ctx, target2)
+	if err != nil {
+		t.Fatalf("Stat(target2) error = %v", err)
+	}
+	if info.Parent != target1 {
+		t.Fatalf("Stat(target2).Parent = %q, want %q", info.Parent, target1)
+	}
+
+	filter := fmt.Sprintf(`labels."containerd.io/snapshot.ref"==%s,parent==%q`, target2, target1)
+	var walked []snapshots.Info
+	if err := sn.Walk(ctx, func(_ context.Context, info snapshots.Info) error {
+		walked = append(walked, info)
+		return nil
+	}, filter); err != nil {
+		t.Fatalf("Walk(%q) error = %v", filter, err)
+	}
+	if len(walked) != 1 {
+		t.Fatalf("Walk(%q) yielded %d records, want 1: %v", filter, len(walked), walked)
+	}
+	if walked[0].Name != target2 {
+		t.Fatalf("Walk(%q)[0].Name = %q, want %q", filter, walked[0].Name, target2)
+	}
+
+	if _, err := sn.Prepare(ctx, "extract-1b", "", snapshots.WithLabels(map[string]string{
+		intermediateSnapshotLabel: target1,
+	})); !errdefs.IsAlreadyExists(err) {
+		t.Fatalf("Prepare(extract-1b) error = %v, want already exists", err)
+	}
+	if _, err := sn.Stat(ctx, "extract-1b"); !errdefs.IsNotFound(err) {
+		t.Fatalf("Stat(extract-1b) error = %v, want not found", err)
+	}
+
+	mounts, err = sn.Prepare(ctx, "active", target2)
+	if err != nil {
+		t.Fatalf("Prepare(active) error = %v", err)
+	}
+	if len(mounts) != 1 {
+		t.Fatalf("Prepare(active) returned %d mounts, want 1: %v", len(mounts), mounts)
+	}
+	if mounts[0].Type != "overlay" {
+		t.Fatalf("Prepare(active) mount type = %q, want %q", mounts[0].Type, "overlay")
+	}
+}
+
+func TestPrepareTargetMissingChainFailsClosed(t *testing.T) {
+	ctx := context.Background()
+	sn := newTestSnapshotterWithEngine(t, fakeEngineForImages())
+	target := digest.FromString("missing-target").String()
+
+	mounts, err := sn.Prepare(ctx, "extract", "", snapshots.WithLabels(map[string]string{
+		intermediateSnapshotLabel: target,
+	}))
+	if !errdefs.IsFailedPrecondition(err) {
+		t.Fatalf("Prepare() error = %v, want failed precondition", err)
+	}
+	if mounts != nil {
+		t.Fatalf("Prepare() mounts = %v, want nil", mounts)
+	}
+	if !strings.Contains(err.Error(), target) {
+		t.Fatalf("Prepare() error %q does not name target %s", err, target)
+	}
+	if _, err := sn.Stat(ctx, target); !errdefs.IsNotFound(err) {
+		t.Fatalf("Stat(target) error = %v, want not found", err)
+	}
+	if _, err := sn.Stat(ctx, "extract"); !errdefs.IsNotFound(err) {
+		t.Fatalf("Stat(extract) error = %v, want not found", err)
+	}
+}
+
 // TestPrepareAppliesOptions covers that a successful snapshot option is recorded
 // and a failing option surfaces its error.
 func TestPrepareAppliesOptions(t *testing.T) {
 	ctx := context.Background()
 	sn := newTestSnapshotter(t)
 
-	imageChain(t, ctx, sn, "img")
+	img := imageChain(t, ctx, sn, "img")
 	const labelKey = "containerd.io/snapshot/cfs.test"
 	opt := snapshots.WithLabels(map[string]string{labelKey: "applied"})
-	if _, err := sn.Prepare(ctx, "labeled", "img", opt); err != nil {
+	if _, err := sn.Prepare(ctx, "labeled", img, opt); err != nil {
 		t.Fatalf("Prepare() with option error = %v", err)
 	}
 	info, err := sn.Stat(ctx, "labeled")
@@ -179,9 +323,9 @@ func TestPrepareAppliesOptions(t *testing.T) {
 func TestUpdateRoundTrip(t *testing.T) {
 	ctx := context.Background()
 	sn := newTestSnapshotter(t)
-	imageChain(t, ctx, sn, "img")
+	img := imageChain(t, ctx, sn, "img")
 
-	if _, err := sn.Prepare(ctx, "k", "img"); err != nil {
+	if _, err := sn.Prepare(ctx, "k", img); err != nil {
 		t.Fatalf("Prepare() error = %v", err)
 	}
 	if err := sn.Commit(ctx, "n", "k"); err != nil {
@@ -212,9 +356,9 @@ func TestUpdateRoundTrip(t *testing.T) {
 func TestUsage(t *testing.T) {
 	ctx := context.Background()
 	sn := newTestSnapshotter(t)
-	imageChain(t, ctx, sn, "img")
+	img := imageChain(t, ctx, sn, "img")
 
-	if _, err := sn.Prepare(ctx, "k", "img"); err != nil {
+	if _, err := sn.Prepare(ctx, "k", img); err != nil {
 		t.Fatalf("Prepare() error = %v", err)
 	}
 	if _, err := sn.Usage(ctx, "k"); err != nil {
@@ -227,14 +371,18 @@ func TestUsage(t *testing.T) {
 func TestRemove(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
-	sn, err := NewSnapshotter(ctx, root, t.TempDir())
+	sn, err := newSnapshotter(ctx, root, t.TempDir(), defaultTestEngine())
 	if err != nil {
 		t.Fatalf("NewSnapshotter() error = %v", err)
 	}
-	t.Cleanup(func() { _ = sn.Close() })
+	t.Cleanup(func() {
+		if err := sn.Close(); err != nil {
+			t.Errorf("Close() error = %v", err)
+		}
+	})
 
-	imageChain(t, ctx, sn, "img")
-	if _, err := sn.Prepare(ctx, "k", "img"); err != nil {
+	img := imageChain(t, ctx, sn, "img")
+	if _, err := sn.Prepare(ctx, "k", img); err != nil {
 		t.Fatalf("Prepare() error = %v", err)
 	}
 	if err := sn.Remove(ctx, "k"); err != nil {
@@ -246,7 +394,7 @@ func TestRemove(t *testing.T) {
 	// The chain's materialized data plane belongs to the chain record and
 	// survives its child; removing the chain drops it, children first as
 	// the garbage collector would.
-	if err := sn.Remove(ctx, "img"); err != nil {
+	if err := sn.Remove(ctx, img); err != nil {
 		t.Fatalf("Remove(img) error = %v", err)
 	}
 
@@ -265,12 +413,12 @@ func TestPersistence(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
 
-	sn, err := NewSnapshotter(ctx, root, t.TempDir())
+	sn, err := newSnapshotter(ctx, root, t.TempDir(), defaultTestEngine())
 	if err != nil {
 		t.Fatalf("NewSnapshotter() error = %v", err)
 	}
-	imageChain(t, ctx, sn, "img")
-	if _, err := sn.Prepare(ctx, "active", "img"); err != nil {
+	img := imageChain(t, ctx, sn, "img")
+	if _, err := sn.Prepare(ctx, "active", img); err != nil {
 		t.Fatalf("Prepare() error = %v", err)
 	}
 	if err := sn.Commit(ctx, "committed", "active"); err != nil {
@@ -280,11 +428,15 @@ func TestPersistence(t *testing.T) {
 		t.Fatalf("Close() error = %v", err)
 	}
 
-	reopened, err := NewSnapshotter(ctx, root, t.TempDir())
+	reopened, err := newSnapshotter(ctx, root, t.TempDir(), defaultTestEngine())
 	if err != nil {
 		t.Fatalf("NewSnapshotter() reopen error = %v", err)
 	}
-	t.Cleanup(func() { _ = reopened.Close() })
+	t.Cleanup(func() {
+		if err := reopened.Close(); err != nil {
+			t.Errorf("Close() error = %v", err)
+		}
+	})
 	if info, err := reopened.Stat(ctx, "committed"); err != nil {
 		t.Fatalf("Stat(committed) after reopen error = %v", err)
 	} else if info.Kind != snapshots.KindCommitted {
@@ -301,7 +453,7 @@ func TestPersistence(t *testing.T) {
 func TestPrepareIntermediateSnapshotAnswersAlreadyExists(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
-	sn, err := NewSnapshotter(ctx, root, t.TempDir())
+	sn, err := newSnapshotter(ctx, root, t.TempDir(), defaultTestEngine())
 	if err != nil {
 		t.Fatalf("NewSnapshotter() error = %v", err)
 	}
@@ -311,7 +463,7 @@ func TestPrepareIntermediateSnapshotAnswersAlreadyExists(t *testing.T) {
 		}
 	}()
 
-	const name = "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+	name := chainIDs(digest.FromString("img"))[0].String()
 	labels := map[string]string{
 		"containerd.io/snapshot.ref": name,
 		"other":                      "kept",
@@ -371,15 +523,26 @@ func TestOverlayMountsComposeContainerFlow(t *testing.T) {
 		t.Fatalf("write stand-in: %v", err)
 	}
 
-	if _, err := NewSnapshotter(ctx, t.TempDir(), standIn+"/missing"); !errdefs.IsInvalidArgument(err) {
+	// Image A is a single layer; image B extends it with a second layer, so
+	// their chains share A's prefix.
+	diffA := digest.FromString("overlay-layer-a")
+	diffB := digest.FromString("overlay-layer-b")
+	chains := chainIDs(diffA, diffB)
+	nameA, nameB := chains[0].String(), chains[1].String()
+	engine := fakeEngineForImages(
+		testImageInfo(digest.FromString("overlay-root-a"), diffA),
+		testImageInfo(digest.FromString("overlay-root-b"), diffA, diffB),
+	)
+
+	if _, err := newSnapshotter(ctx, t.TempDir(), standIn+"/missing", engine); !errdefs.IsInvalidArgument(err) {
 		t.Fatalf("missing rootfs dir error = %v, want invalid argument", err)
 	}
-	if _, err := NewSnapshotter(ctx, t.TempDir(), ""); !errdefs.IsInvalidArgument(err) {
+	if _, err := newSnapshotter(ctx, t.TempDir(), "", engine); !errdefs.IsInvalidArgument(err) {
 		t.Fatalf("empty rootfs error = %v, want invalid argument (the stand-in is required)", err)
 	}
 
 	root := t.TempDir()
-	sn, err := NewSnapshotter(ctx, root, standIn)
+	sn, err := newSnapshotter(ctx, root, standIn, engine)
 	if err != nil {
 		t.Fatalf("NewSnapshotter() error = %v", err)
 	}
@@ -389,7 +552,6 @@ func TestOverlayMountsComposeContainerFlow(t *testing.T) {
 		}
 	}()
 
-	const nameA = "sha256:2222222222222222222222222222222222222222222222222222222222222222"
 	if _, err := sn.Prepare(ctx, "extract-1 "+nameA, "", snapshots.WithLabels(map[string]string{
 		"containerd.io/snapshot.ref": nameA,
 	})); !errdefs.IsAlreadyExists(err) {
@@ -469,7 +631,6 @@ func TestOverlayMountsComposeContainerFlow(t *testing.T) {
 	// their own chain and never stack A's materialized image beneath it —
 	// a flattened image carries no whiteout markers, so a lower under it
 	// would shine through deletions.
-	const nameB = "sha256:3333333333333333333333333333333333333333333333333333333333333333"
 	if _, err := sn.Prepare(ctx, "extract-2 "+nameB, nameA, snapshots.WithLabels(map[string]string{
 		"containerd.io/snapshot.ref": nameB,
 	})); !errdefs.IsAlreadyExists(err) {

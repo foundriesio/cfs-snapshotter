@@ -13,9 +13,9 @@
 // as a stand-in for the image content — is the base lower. The snapshot's
 // own upper receives its writes. Content-addressed composefs materialization
 // later keeps this exact shape, only putting the real image where the
-// stand-in link points. Until then the implementation is a remote-snapshotter
-// stub: every unpack handshake is answered as if the content were already
-// present locally (see the calling contract below).
+// stand-in link points. The unpack handshake is answered from the local knarr
+// store — fail-closed for chains it does not cover — while the data plane
+// remains a stand-in (see the calling contract below).
 //
 // # Calling contract
 //
@@ -42,15 +42,16 @@
 // committed snapshot the unpacker actually wants. A snapshotter that can
 // produce that snapshot without the caller fetching anything answers
 // ErrAlreadyExists, which skips the fetch/apply/Commit round for that layer.
-// This stub always answers that way, so a pull completes with zero layer
-// fetches (the caller still downloads the image metadata: index, manifest,
-// config, etc.) — but
-// the committed records carry no image content. The mounts the
-// container flow receives are instead overlays whose base lower is a
-// stand-in rootfs (the daemon's -stub-rootfs flag), so the whole lifecycle
-// through `docker run` can be exercised, against stand-in content that is
-// the same for every image. Materializing real image content behind the
-// handshake is what replaces this stub.
+// This snapshotter answers that way exactly when the chain is present in the
+// local knarr store (see bridge.go), so a pull of an image staged out of
+// band completes with zero layer fetches (the caller still downloads the
+// image metadata: index, manifest, config, etc.). A chain the store does not
+// cover fails closed with a failed-precondition error naming the required
+// out-of-band pull; the snapshotter never fetches content itself. The mounts
+// the container flow receives are still overlays whose base lower is a
+// stand-in rootfs (the daemon's -stub-rootfs flag), the same for every
+// image. Materializing the store's real content behind the committed records
+// is what replaces the remaining stub.
 //
 // Container creation (the docker daemon, via containerd) prepares two
 // snapshots on top of the image's full chain:
@@ -83,6 +84,7 @@ import (
 	"github.com/containerd/containerd/v2/core/snapshots/storage"
 	"github.com/containerd/errdefs"
 	"github.com/containerd/log"
+	"github.com/foundriesio/knarr/pkg/knarr"
 
 	"github.com/containerd/continuity/fs"
 )
@@ -102,6 +104,11 @@ type snapshotter struct {
 	root string
 	// ms is the bolt-backed metadata store holding snapshot records.
 	ms *storage.MetaStore
+	// engine is the local knarr store; bridge indexes its images by layer
+	// chain digest so the unpack handshake answers only for chains whose
+	// content is actually present.
+	engine engineAPI
+	bridge *bridge
 	// stubRootfs names the read-only directory standing in for materialized
 	// image content: e.g. `docker run --rm <image> /hello` with a static
 	// /hello in the directory. Chain snapshots materialize their data plane
@@ -117,8 +124,17 @@ var _ snapshots.Snapshotter = (*snapshotter)(nil)
 // directory, creating it, the metadata store, and the snapshots directory
 // beneath it as needed. stubRootfs must name an existing directory: the
 // stand-in tree serving as the base lower of every snapshot overlay (see the
-// package comment).
-func NewSnapshotter(ctx context.Context, root, stubRootfs string) (snapshots.Snapshotter, error) {
+// package comment). knarrRoot names the shared knarr store whose images the
+// unpack handshake is answered from.
+func NewSnapshotter(ctx context.Context, root, stubRootfs, knarrRoot string) (snapshots.Snapshotter, error) {
+	engine, err := knarr.New(knarr.Config{Root: knarrRoot})
+	if err != nil {
+		return nil, fmt.Errorf("create knarr engine: %w", err)
+	}
+	return newSnapshotter(ctx, root, stubRootfs, engine)
+}
+
+func newSnapshotter(ctx context.Context, root, stubRootfs string, engine engineAPI) (snapshots.Snapshotter, error) {
 	if root == "" {
 		return nil, fmt.Errorf("cfs snapshotter: root directory must not be empty: %w", errdefs.ErrInvalidArgument)
 	}
@@ -135,7 +151,7 @@ func NewSnapshotter(ctx context.Context, root, stubRootfs string) (snapshots.Sna
 	if err := os.Mkdir(filepath.Join(root, "snapshots"), 0700); err != nil && !os.IsExist(err) {
 		return nil, fmt.Errorf("cfs snapshotter: create snapshots dir: %w", err)
 	}
-	return &snapshotter{root: root, ms: ms, stubRootfs: stubRootfs}, nil
+	return &snapshotter{root: root, ms: ms, engine: engine, bridge: newBridge(engine), stubRootfs: stubRootfs}, nil
 }
 
 // optFields renders the snapshot info fields the given opts set. An Opt
@@ -253,9 +269,10 @@ func (s *snapshotter) Mounts(ctx context.Context, key string) (_ []mount.Mount, 
 
 // Prepare records a new active snapshot under key, descending from parent,
 // and returns its mounts. Both call shapes from the package contract land
-// here, and the snapshot.ref label decides the work: a handshake Prepare
-// needs only a metadata record — created and committed virtually in one
-// transaction, no directory ever provisioned — and is answered with
+// here, and the snapshot.ref label decides the work: a handshake Prepare is
+// resolved against the local image store and — when the store covers the
+// chain — needs only a metadata record, created and committed virtually in
+// one transaction, no directory ever provisioned, answered with
 // ErrAlreadyExists instead of mounts. Everything else gets a directory-backed
 // active snapshot and overlay mounts composing the stand-in rootfs, the
 // uppers of its committed ancestors, and its own upper (see mounts).
@@ -281,6 +298,15 @@ func (s *snapshotter) Prepare(ctx context.Context, key, parent string, opts ...s
 		// looked at. This answer, repeated per layer, is how a pull against
 		// pre-fetched content completes with zero layer downloads; the caller
 		// still fetches the image metadata (index, manifest, config, etc.).
+		// The claim must be true before it is recorded: a chain the local
+		// image store cannot cover fails closed instead — the snapshotter
+		// never fetches or unpacks missing content as a fallback.
+		if _, err := s.bridge.resolve(ctx, name); err != nil {
+			if errdefs.IsNotFound(err) {
+				return nil, fmt.Errorf("layer chain %s is not in the local image store; pull the image by digest out of band before running: %w", name, errdefs.ErrFailedPrecondition)
+			}
+			return nil, fmt.Errorf("resolve layer chain %s: %w", name, err)
+		}
 		return nil, s.createAndCommitIntermediateVirtualSnapshot(ctx, key, parent, name, base.Labels, opts)
 	}
 
@@ -297,9 +323,9 @@ func (s *snapshotter) Prepare(ctx context.Context, key, parent string, opts ...s
 // skips fetching and applying the layer. The snapshot is virtual: nothing
 // ever mounts an intermediate snapshot, so no directory is provisioned, and
 // a concurrent handshake that loses the commit race rolls back whole,
-// leaving nothing to clean up. In this stub the record only claims the chain
-// exists; the stub's replacement verifies the content really is present
-// locally before answering.
+// leaving nothing to clean up. The caller has already resolved the chain
+// against the local image store, so the record's claim is backed by present
+// content.
 func (s *snapshotter) createAndCommitIntermediateVirtualSnapshot(ctx context.Context, key, parent, name string, labels map[string]string, opts []snapshots.Opt) error {
 	err := s.ms.WithTransaction(ctx, true, func(ctx context.Context) error {
 		if _, err := storage.CreateSnapshot(ctx, snapshots.KindActive, key, parent, opts...); err != nil {
@@ -317,7 +343,7 @@ func (s *snapshotter) createAndCommitIntermediateVirtualSnapshot(ctx context.Con
 		"key":    key,
 		"name":   name,
 		"parent": parent,
-	}).Info("stub-committed intermediate virtual snapshot")
+	}).Info("committed intermediate virtual snapshot")
 	return fmt.Errorf("intermediate virtual snapshot %q: %w", name, errdefs.ErrAlreadyExists)
 }
 
