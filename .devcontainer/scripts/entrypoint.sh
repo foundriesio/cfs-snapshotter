@@ -13,7 +13,6 @@ CONTAINERD_CFS_GRPC_BIN="${ROOT_DIR}/bin/containerd-cfs-grpc"
 CFS_SOCKET=/run/containerd-cfs-grpc/containerd-cfs-grpc.sock
 CONTAINERD_SOCKET=/run/containerd/containerd.sock
 CFS_LOG_LEVEL="${CFS_LOG_LEVEL:-trace}"
-CFS_STUB_ROOTFS="${CFS_STUB_ROOTFS:-/tmp/cfs-stub-rootfs}"
 CFS_ROOT=/var/lib/containerd-cfs-grpc
 CFS_ROOT_IMG=/var/tmp/cfs-root.img
 EROFS_ROOT=/var/lib/containerd/io.containerd.snapshotter.v1.erofs
@@ -119,16 +118,10 @@ start_runtime_daemons() {
 
 	make -C "${ROOT_DIR}" build
 	setup_real_filesystems
-	# The snapshotter requires a stand-in rootfs; build the default one when
-	# the caller does not supply a directory.
-	if [ ! -e "${CFS_STUB_ROOTFS}/hello" ] || [ ! -e "${CFS_STUB_ROOTFS}/bin/sh" ]; then
-		"${ROOT_DIR}/.devcontainer/scripts/make-stub-rootfs.sh" "${CFS_STUB_ROOTFS}"
-	fi
 	rm -f "${CFS_SOCKET}"
 	start_daemon containerd-cfs-grpc "${LOG_DIR}/containerd-cfs-grpc.pid" "${LOG_DIR}/containerd-cfs-grpc.log" \
-		"${CONTAINERD_CFS_GRPC_BIN}" -log-level "${CFS_LOG_LEVEL}" \
-		-stub-rootfs "${CFS_STUB_ROOTFS}" -knarr-root "${KNARR_ROOT}"
-	printf '%s\n' "${CFS_LOG_LEVEL} ${CFS_STUB_ROOTFS} ${KNARR_ROOT}" >"${CFS_STATE_FILE}"
+		"${CONTAINERD_CFS_GRPC_BIN}" -log-level "${CFS_LOG_LEVEL}" -knarr-root "${KNARR_ROOT}"
+	printf '%s\n' "${CFS_LOG_LEVEL} ${KNARR_ROOT}" >"${CFS_STATE_FILE}"
 	wait_for cfs-snapshotter test -S "${CFS_SOCKET}"
 
 	# Enable the built-in erofs snapshotter only when the kernel supports

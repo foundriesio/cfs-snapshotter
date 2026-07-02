@@ -14,11 +14,19 @@ import (
 	"github.com/opencontainers/image-spec/identity"
 )
 
+// testObjectsDir is the knarr object directory the fake engine reports; it
+// appears as the data-only lower in expected overlay specs.
+const testObjectsDir = "/knarr/objects/sha256"
+
 type fakeEngine struct {
 	listFunc    func(context.Context) ([]knarr.Image, error)
 	inspectFunc func(context.Context, string) (*knarr.ImageInfo, error)
 	mountFunc   func(context.Context, string, string, ...knarr.MountOption) error
 	unmountFunc func(context.Context, string) error
+}
+
+func (f *fakeEngine) ObjectsDir() (string, error) {
+	return testObjectsDir, nil
 }
 
 func (f *fakeEngine) List(ctx context.Context) ([]knarr.Image, error) {

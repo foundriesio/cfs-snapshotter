@@ -7,12 +7,14 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
-	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/containerd/containerd/v2/core/snapshots"
 	"github.com/containerd/errdefs"
+	"github.com/foundriesio/knarr/pkg/knarr"
 	"github.com/opencontainers/go-digest"
 )
 
@@ -30,13 +32,13 @@ func TestOptFieldsExposesLabels(t *testing.T) {
 }
 
 func TestNewSnapshotterRejectsEmptyRoot(t *testing.T) {
-	if _, err := NewSnapshotter(context.Background(), "", t.TempDir(), t.TempDir()); !errdefs.IsInvalidArgument(err) {
+	if _, err := NewSnapshotter(context.Background(), "", t.TempDir()); !errdefs.IsInvalidArgument(err) {
 		t.Fatalf("NewSnapshotter(%q) error = %v, want invalid argument", "", err)
 	}
 }
 
 func TestNewSnapshotterAcceptsValidRoot(t *testing.T) {
-	sn, err := NewSnapshotter(context.Background(), t.TempDir(), t.TempDir(), t.TempDir())
+	sn, err := NewSnapshotter(context.Background(), t.TempDir(), t.TempDir())
 	if err != nil {
 		t.Fatalf("NewSnapshotter() error = %v", err)
 	}
@@ -52,18 +54,14 @@ func TestNewSnapshotterAcceptsValidRoot(t *testing.T) {
 // its Close with t.Cleanup.
 func newTestSnapshotter(t *testing.T) snapshots.Snapshotter {
 	t.Helper()
-	return newTestSnapshotterWithEngine(t, defaultTestEngine())
-}
-
-// defaultTestEngine covers the single-layer image imageChain commits for
-// seed "img".
-func defaultTestEngine() *fakeEngine {
-	return fakeEngineForImages(testImageInfo(digest.FromString("img-root"), digest.FromString("img")))
+	// An empty store resolves every parent chain to "not materialized", so
+	// these lifecycle snapshots take the placeholder-bind path.
+	return newTestSnapshotterWithEngine(t, fakeEngineForImages())
 }
 
 func newTestSnapshotterWithEngine(t *testing.T, engine engineAPI) snapshots.Snapshotter {
 	t.Helper()
-	sn, err := newSnapshotter(context.Background(), t.TempDir(), t.TempDir(), engine)
+	sn, err := newSnapshotter(context.Background(), t.TempDir(), engine)
 	if err != nil {
 		t.Fatalf("NewSnapshotter() error = %v", err)
 	}
@@ -75,30 +73,13 @@ func newTestSnapshotterWithEngine(t *testing.T, engine engineAPI) snapshots.Snap
 	return sn
 }
 
-// imageChain commits an intermediate virtual snapshot the way a pull's unpack
-// handshake would, for tests to layer snapshots over: the snapshotter refuses
-// snapshots with no image in their ancestry. The committed name is the
-// chainID of a single layer whose diffID derives from seed, so it resolves in
-// an engine covering that layer — newTestSnapshotter's covers seed "img".
-func imageChain(t *testing.T, ctx context.Context, sn snapshots.Snapshotter, seed string) string {
-	t.Helper()
-	name := chainIDs(digest.FromString(seed))[0].String()
-	if _, err := sn.Prepare(ctx, "extract-"+name, "", snapshots.WithLabels(map[string]string{
-		"containerd.io/snapshot.ref": name,
-	})); !errdefs.IsAlreadyExists(err) {
-		t.Fatalf("image chain handshake error = %v, want already exists", err)
-	}
-	return name
-}
-
 // TestLifecycle covers the active → committed transition and that Walk lists the
-// committed snapshots.
+// committed snapshot.
 func TestLifecycle(t *testing.T) {
 	ctx := context.Background()
 	sn := newTestSnapshotter(t)
-	img := imageChain(t, ctx, sn, "img")
 
-	if _, err := sn.Prepare(ctx, "active", img); err != nil {
+	if _, err := sn.Prepare(ctx, "active", ""); err != nil {
 		t.Fatalf("Prepare() error = %v", err)
 	}
 	if info, err := sn.Stat(ctx, "active"); err != nil {
@@ -127,14 +108,8 @@ func TestLifecycle(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Walk() error = %v", err)
 	}
-	want := map[string]bool{img: true, "committed": true}
-	if len(walked) != len(want) {
-		t.Fatalf("Walk() listed %v, want the chain and the committed snapshot", walked)
-	}
-	for _, name := range walked {
-		if !want[name] {
-			t.Fatalf("Walk() listed unexpected %q", name)
-		}
+	if len(walked) != 1 || walked[0] != "committed" {
+		t.Fatalf("Walk() listed %v, want [committed]", walked)
 	}
 
 	viewMounts, err := sn.View(ctx, "view", "committed")
@@ -144,7 +119,7 @@ func TestLifecycle(t *testing.T) {
 	if len(viewMounts) != 1 {
 		t.Fatalf("View() returned %d mounts, want 1: %v", len(viewMounts), viewMounts)
 	}
-	if got := viewMounts[0].Options[0]; got != "ro" {
+	if got := viewMounts[0].Options[len(viewMounts[0].Options)-1]; got != "ro" {
 		t.Fatalf("View() mount ro flag = %q, want ro", got)
 	}
 	if err := sn.Remove(ctx, "view"); err != nil {
@@ -157,9 +132,8 @@ func TestLifecycle(t *testing.T) {
 func TestParentResolution(t *testing.T) {
 	ctx := context.Background()
 	sn := newTestSnapshotter(t)
-	img := imageChain(t, ctx, sn, "img")
 
-	if _, err := sn.Prepare(ctx, "base", img); err != nil {
+	if _, err := sn.Prepare(ctx, "base", ""); err != nil {
 		t.Fatalf("Prepare(base) error = %v", err)
 	}
 	if err := sn.Commit(ctx, "base-committed", "base"); err != nil {
@@ -251,15 +225,20 @@ func TestPrepareTarget(t *testing.T) {
 		t.Fatalf("Stat(extract-1b) error = %v, want not found", err)
 	}
 
-	mounts, err = sn.Prepare(ctx, "active", target2)
+	// An unlabeled scratch Prepare is unaffected by the target path and gets a
+	// placeholder bind of its own directory.
+	mounts, err = sn.Prepare(ctx, "active", "")
 	if err != nil {
 		t.Fatalf("Prepare(active) error = %v", err)
 	}
 	if len(mounts) != 1 {
 		t.Fatalf("Prepare(active) returned %d mounts, want 1: %v", len(mounts), mounts)
 	}
-	if mounts[0].Type != "overlay" {
-		t.Fatalf("Prepare(active) mount type = %q, want %q", mounts[0].Type, "overlay")
+	if mounts[0].Type != mountType {
+		t.Fatalf("Prepare(active) mount type = %q, want %q", mounts[0].Type, mountType)
+	}
+	if filepath.Base(mounts[0].Source) == "fs" {
+		t.Fatalf("Prepare(active) source = %q, want the snapshot dir, not an fs mount", mounts[0].Source)
 	}
 }
 
@@ -294,10 +273,9 @@ func TestPrepareAppliesOptions(t *testing.T) {
 	ctx := context.Background()
 	sn := newTestSnapshotter(t)
 
-	img := imageChain(t, ctx, sn, "img")
 	const labelKey = "containerd.io/snapshot/cfs.test"
 	opt := snapshots.WithLabels(map[string]string{labelKey: "applied"})
-	if _, err := sn.Prepare(ctx, "labeled", img, opt); err != nil {
+	if _, err := sn.Prepare(ctx, "labeled", "", opt); err != nil {
 		t.Fatalf("Prepare() with option error = %v", err)
 	}
 	info, err := sn.Stat(ctx, "labeled")
@@ -323,9 +301,8 @@ func TestPrepareAppliesOptions(t *testing.T) {
 func TestUpdateRoundTrip(t *testing.T) {
 	ctx := context.Background()
 	sn := newTestSnapshotter(t)
-	img := imageChain(t, ctx, sn, "img")
 
-	if _, err := sn.Prepare(ctx, "k", img); err != nil {
+	if _, err := sn.Prepare(ctx, "k", ""); err != nil {
 		t.Fatalf("Prepare() error = %v", err)
 	}
 	if err := sn.Commit(ctx, "n", "k"); err != nil {
@@ -356,9 +333,8 @@ func TestUpdateRoundTrip(t *testing.T) {
 func TestUsage(t *testing.T) {
 	ctx := context.Background()
 	sn := newTestSnapshotter(t)
-	img := imageChain(t, ctx, sn, "img")
 
-	if _, err := sn.Prepare(ctx, "k", img); err != nil {
+	if _, err := sn.Prepare(ctx, "k", ""); err != nil {
 		t.Fatalf("Prepare() error = %v", err)
 	}
 	if _, err := sn.Usage(ctx, "k"); err != nil {
@@ -371,7 +347,7 @@ func TestUsage(t *testing.T) {
 func TestRemove(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
-	sn, err := newSnapshotter(ctx, root, t.TempDir(), defaultTestEngine())
+	sn, err := NewSnapshotter(ctx, root, t.TempDir())
 	if err != nil {
 		t.Fatalf("NewSnapshotter() error = %v", err)
 	}
@@ -381,8 +357,7 @@ func TestRemove(t *testing.T) {
 		}
 	})
 
-	img := imageChain(t, ctx, sn, "img")
-	if _, err := sn.Prepare(ctx, "k", img); err != nil {
+	if _, err := sn.Prepare(ctx, "k", ""); err != nil {
 		t.Fatalf("Prepare() error = %v", err)
 	}
 	if err := sn.Remove(ctx, "k"); err != nil {
@@ -390,12 +365,6 @@ func TestRemove(t *testing.T) {
 	}
 	if _, err := sn.Stat(ctx, "k"); !errdefs.IsNotFound(err) {
 		t.Fatalf("Stat() after remove error = %v, want not found", err)
-	}
-	// The chain's materialized data plane belongs to the chain record and
-	// survives its child; removing the chain drops it, children first as
-	// the garbage collector would.
-	if err := sn.Remove(ctx, img); err != nil {
-		t.Fatalf("Remove(img) error = %v", err)
 	}
 
 	entries, err := os.ReadDir(root + "/snapshots")
@@ -413,12 +382,11 @@ func TestPersistence(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
 
-	sn, err := newSnapshotter(ctx, root, t.TempDir(), defaultTestEngine())
+	sn, err := NewSnapshotter(ctx, root, t.TempDir())
 	if err != nil {
 		t.Fatalf("NewSnapshotter() error = %v", err)
 	}
-	img := imageChain(t, ctx, sn, "img")
-	if _, err := sn.Prepare(ctx, "active", img); err != nil {
+	if _, err := sn.Prepare(ctx, "active", ""); err != nil {
 		t.Fatalf("Prepare() error = %v", err)
 	}
 	if err := sn.Commit(ctx, "committed", "active"); err != nil {
@@ -428,7 +396,7 @@ func TestPersistence(t *testing.T) {
 		t.Fatalf("Close() error = %v", err)
 	}
 
-	reopened, err := newSnapshotter(ctx, root, t.TempDir(), defaultTestEngine())
+	reopened, err := NewSnapshotter(ctx, root, t.TempDir())
 	if err != nil {
 		t.Fatalf("NewSnapshotter() reopen error = %v", err)
 	}
@@ -444,222 +412,356 @@ func TestPersistence(t *testing.T) {
 	}
 }
 
-// TestPrepareIntermediateSnapshotAnswersAlreadyExists exercises the unpack
-// handshake: a Prepare carrying the snapshot.ref label must be answered with
-// ErrAlreadyExists after committing an intermediate virtual snapshot under
-// the requested name with the caller's labels, a repeat handshake must not
-// leave an orphan active snapshot behind, and a Prepare without the label
-// must keep taking the normal mount path.
-func TestPrepareIntermediateSnapshotAnswersAlreadyExists(t *testing.T) {
+// TestPrepareOverImageReturnsWritableOverlay covers that an active snapshot
+// over a materialized image mounts the image's metadata read-only at the
+// chain snapshot's fs directory and returns a single writable overlay mount
+// spec for the consumer to execute, with the knarr object directory as the
+// data-only lower and verity required.
+func TestPrepareOverImageReturnsWritableOverlay(t *testing.T) {
 	ctx := context.Background()
-	root := t.TempDir()
-	sn, err := newSnapshotter(ctx, root, t.TempDir(), defaultTestEngine())
-	if err != nil {
-		t.Fatalf("NewSnapshotter() error = %v", err)
-	}
-	defer func() {
-		if err := sn.Close(); err != nil {
-			t.Errorf("Close() error = %v", err)
-		}
-	}()
+	sn, engine, root, leaf := newBackedSnapshotter(t, notMounted)
+	var calls []mountCall
+	recordMounts(engine, &calls)
 
-	name := chainIDs(digest.FromString("img"))[0].String()
-	labels := map[string]string{
-		"containerd.io/snapshot.ref": name,
-		"other":                      "kept",
-	}
-	if _, err := sn.Prepare(ctx, "extract-1 "+name, "", snapshots.WithLabels(labels)); !errdefs.IsAlreadyExists(err) {
-		t.Fatalf("handshake Prepare error = %v, want already exists", err)
-	}
-	info, err := sn.Stat(ctx, name)
+	mounts, err := sn.Prepare(ctx, "container", leaf)
 	if err != nil {
-		t.Fatalf("Stat(%q) error = %v", name, err)
+		t.Fatalf("Prepare() error = %v", err)
 	}
-	if info.Kind != snapshots.KindCommitted || info.Labels["other"] != "kept" {
-		t.Fatalf("intermediate snapshot info = %+v, want committed with caller labels", info)
+	if len(calls) != 1 {
+		t.Fatalf("engine Mount calls = %d, want 1", len(calls))
 	}
-
-	// A repeat handshake for the same name must also answer already-exists
-	// and must not leak its temporary active snapshot.
-	if _, err := sn.Prepare(ctx, "extract-2 "+name, "", snapshots.WithLabels(labels)); !errdefs.IsAlreadyExists(err) {
-		t.Fatalf("repeat handshake Prepare error = %v, want already exists", err)
+	c := calls[0]
+	if c.ref != root.String() {
+		t.Fatalf("mount ref = %s, want %s", c.ref, root)
 	}
-	if _, err := sn.Stat(ctx, "extract-2 "+name); !errdefs.IsNotFound(err) {
-		t.Fatalf("superseded active snapshot error = %v, want not found", err)
+	if filepath.Base(c.target) != "fs" {
+		t.Fatalf("mount target = %s, want a .../fs directory", c.target)
 	}
-
-	// Handshake records are metadata-only: no snapshot directory may have
-	// been provisioned for them.
-	entries, err := os.ReadDir(root + "/snapshots")
+	if c.opts.UpperDir != "" || c.opts.WorkDir != "" {
+		t.Fatalf("image mount set overlay dirs: %+v, want read-only", c.opts)
+	}
+	if !c.opts.MetadataOnly {
+		t.Fatalf("image mount opts = %+v, want MetadataOnly", c.opts)
+	}
+	id, _, err := sn.snapshotInfo(ctx, "container")
 	if err != nil {
-		t.Fatalf("read snapshots dir: %v", err)
+		t.Fatalf("snapshotInfo(container) error = %v", err)
 	}
-	if len(entries) != 0 {
-		t.Fatalf("snapshots dir has %d entries after handshakes, want none", len(entries))
+	dir := sn.getSnapshotDir(id)
+	want := []string{
+		"workdir=" + filepath.Join(dir, "work"),
+		"upperdir=" + filepath.Join(dir, "upper"),
+		"lowerdir=" + c.target + "::" + testObjectsDir,
+		"redirect_dir=on",
+		"metacopy=on",
+		"verity=require",
 	}
-
-	// Without the label the stub must stay out of the way.
-	mounts, err := sn.Prepare(ctx, "container-1", name)
-	if err != nil {
-		t.Fatalf("plain Prepare error = %v", err)
+	if len(mounts) != 1 || mounts[0].Type != "overlay" {
+		t.Fatalf("mounts = %v, want a single overlay spec", mounts)
 	}
-	if len(mounts) == 0 {
-		t.Fatal("plain Prepare returned no mounts")
+	if !slices.Equal(mounts[0].Options, want) {
+		t.Fatalf("overlay options = %v, want %v", mounts[0].Options, want)
 	}
 }
 
-// TestOverlayMountsComposeContainerFlow walks docker's container flow through
-// the overlay data plane: the image chain snapshot stays virtual until a
-// descendant needs it, materializes as a stand-in link at first use, writes
-// into the init layer's upper resurface as a lower of the container prepared
-// on the committed init, the walk stops at the nearest image so a longer
-// image's containers never stack a shorter prefix image beneath it, and a
-// scratch snapshot (no image in its ancestry) is refused. Misconfigured stand-in options
-// are rejected at construction.
-func TestOverlayMountsComposeContainerFlow(t *testing.T) {
+// TestViewOverImageReturnsReadOnlyOverlay covers that a view over a
+// materialized image with no intermediate layers is a read-only flat overlay:
+// the metadata mount alone carries no file data, so even a plain view needs
+// the object directory attached as its data-only lower.
+func TestViewOverImageReturnsReadOnlyOverlay(t *testing.T) {
 	ctx := context.Background()
-	standIn := t.TempDir()
-	if err := os.WriteFile(standIn+"/hello", []byte("hi"), 0o755); err != nil {
-		t.Fatalf("write stand-in: %v", err)
-	}
+	sn, engine, root, leaf := newBackedSnapshotter(t, notMounted)
+	var calls []mountCall
+	recordMounts(engine, &calls)
 
-	// Image A is a single layer; image B extends it with a second layer, so
-	// their chains share A's prefix.
-	diffA := digest.FromString("overlay-layer-a")
-	diffB := digest.FromString("overlay-layer-b")
-	chains := chainIDs(diffA, diffB)
-	nameA, nameB := chains[0].String(), chains[1].String()
-	engine := fakeEngineForImages(
-		testImageInfo(digest.FromString("overlay-root-a"), diffA),
-		testImageInfo(digest.FromString("overlay-root-b"), diffA, diffB),
-	)
-
-	if _, err := newSnapshotter(ctx, t.TempDir(), standIn+"/missing", engine); !errdefs.IsInvalidArgument(err) {
-		t.Fatalf("missing rootfs dir error = %v, want invalid argument", err)
-	}
-	if _, err := newSnapshotter(ctx, t.TempDir(), "", engine); !errdefs.IsInvalidArgument(err) {
-		t.Fatalf("empty rootfs error = %v, want invalid argument (the stand-in is required)", err)
-	}
-
-	root := t.TempDir()
-	sn, err := newSnapshotter(ctx, root, standIn, engine)
+	mounts, err := sn.View(ctx, "view", leaf)
 	if err != nil {
-		t.Fatalf("NewSnapshotter() error = %v", err)
+		t.Fatalf("View() error = %v", err)
 	}
-	defer func() {
-		if err := sn.Close(); err != nil {
-			t.Errorf("Close() error = %v", err)
-		}
-	}()
-
-	if _, err := sn.Prepare(ctx, "extract-1 "+nameA, "", snapshots.WithLabels(map[string]string{
-		"containerd.io/snapshot.ref": nameA,
-	})); !errdefs.IsAlreadyExists(err) {
-		t.Fatalf("handshake Prepare error = %v, want already exists", err)
+	if len(calls) != 1 {
+		t.Fatalf("engine Mount calls = %d, want 1", len(calls))
 	}
-
-	// The handshake stays a pure metadata operation: no data plane exists
-	// until a descendant snapshot needs the image.
-	if entries, err := os.ReadDir(root + "/snapshots"); err != nil || len(entries) != 0 {
-		t.Fatalf("snapshots dir = %v entries, %v; want none after the handshake", len(entries), err)
+	if calls[0].ref != root.String() {
+		t.Fatalf("mount ref = %s, want %s", calls[0].ref, root)
 	}
-
-	// The init layer: preparing it materializes the chain's data plane, and
-	// its own upper starts empty over that base.
-	imounts, err := sn.Prepare(ctx, "c1-init", nameA)
-	if err != nil {
-		t.Fatalf("init Prepare error = %v", err)
+	if !calls[0].opts.MetadataOnly {
+		t.Fatalf("image mount opts = %+v, want MetadataOnly", calls[0].opts)
 	}
-	chainFS := optionValue(t, imounts[0], "lowerdir")
-	if chainFS == standIn || !strings.HasSuffix(chainFS, "/fs") {
-		t.Fatalf("init lowerdir = %q, want a chain snapshot fs entry", chainFS)
+	want := []string{
+		"lowerdir=" + calls[0].target + "::" + testObjectsDir,
+		"redirect_dir=on",
+		"metacopy=on",
+		"verity=require",
 	}
-	if target, err := os.Readlink(chainFS); err != nil || target != standIn {
-		t.Fatalf("chain fs -> %q, %v; want a symlink to the stand-in", target, err)
+	if len(mounts) != 1 || mounts[0].Type != "overlay" {
+		t.Fatalf("mounts = %v, want a single overlay spec", mounts)
 	}
-	initUpper := optionValue(t, imounts[0], "upperdir")
-	if entries, err := os.ReadDir(initUpper); err != nil || len(entries) != 0 {
-		t.Fatalf("init upper = %v entries, %v; want empty", len(entries), err)
-	}
-
-	// Docker writes its runtime files through the mounted overlay; they land
-	// in the init snapshot's upper. Simulated at the directory level because
-	// executing the overlay needs privileges.
-	if err := os.MkdirAll(initUpper+"/etc", 0o755); err != nil {
-		t.Fatalf("mkdir in init upper: %v", err)
-	}
-	if err := os.WriteFile(initUpper+"/etc/hostname", []byte("c1"), 0o644); err != nil {
-		t.Fatalf("write into init upper: %v", err)
-	}
-	if err := sn.Commit(ctx, "c1-init-committed", "c1-init"); err != nil {
-		t.Fatalf("Commit init error = %v", err)
-	}
-
-	// The container rootfs on the committed init: the init's upper stacks as
-	// the nearest lower over the already-materialized chain.
-	cmounts, err := sn.Prepare(ctx, "c1", "c1-init-committed")
-	if err != nil {
-		t.Fatalf("container Prepare error = %v", err)
-	}
-	if got, want := optionValue(t, cmounts[0], "lowerdir"), initUpper+":"+chainFS; got != want {
-		t.Fatalf("container lowerdir = %q, want %q", got, want)
-	}
-
-	// A view of the committed init composes the same lowers read-only.
-	vmounts, err := sn.View(ctx, "view-1", "c1-init-committed")
-	if err != nil {
-		t.Fatalf("View error = %v", err)
-	}
-	if vmounts[0].Options[0] != "ro" {
-		t.Fatalf("view options = %v, want ro first", vmounts[0].Options)
-	}
-	if got, want := optionValue(t, vmounts[0], "lowerdir"), initUpper+":"+chainFS; got != want {
-		t.Fatalf("view lowerdir = %q, want %q", got, want)
-	}
-
-	// A container prepared directly on the chain (ctr: no init layer)
-	// composes the materialized chain alone — same treatment as the init.
-	dmounts, err := sn.Prepare(ctx, "ctr-style-container", nameA)
-	if err != nil {
-		t.Fatalf("ctr-style Prepare error = %v", err)
-	}
-	if got := optionValue(t, dmounts[0], "lowerdir"); got != chainFS {
-		t.Fatalf("ctr-style lowerdir = %q, want the chain fs %q", got, chainFS)
-	}
-
-	// A longer image extending image A's chain: its containers must stop at
-	// their own chain and never stack A's materialized image beneath it —
-	// a flattened image carries no whiteout markers, so a lower under it
-	// would shine through deletions.
-	if _, err := sn.Prepare(ctx, "extract-2 "+nameB, nameA, snapshots.WithLabels(map[string]string{
-		"containerd.io/snapshot.ref": nameB,
-	})); !errdefs.IsAlreadyExists(err) {
-		t.Fatalf("extending handshake Prepare error = %v, want already exists", err)
-	}
-	bmounts, err := sn.Prepare(ctx, "b-container", nameB)
-	if err != nil {
-		t.Fatalf("extended-image container Prepare error = %v", err)
-	}
-	blower := optionValue(t, bmounts[0], "lowerdir")
-	if strings.Contains(blower, ":") || blower == chainFS || !strings.HasSuffix(blower, "/fs") {
-		t.Fatalf("extended-image lowerdir = %q, want exactly one fs entry that is not image A's %q", blower, chainFS)
-	}
-
-	// No image in the ancestry: the stub serves only image-backed
-	// snapshots, so a scratch snapshot is refused loudly at Prepare.
-	if _, err := sn.Prepare(ctx, "scratch", ""); !errdefs.IsInvalidArgument(err) {
-		t.Fatalf("scratch Prepare error = %v, want invalid argument", err)
+	if !slices.Equal(mounts[0].Options, want) {
+		t.Fatalf("overlay options = %v, want %v", mounts[0].Options, want)
 	}
 }
 
-// optionValue extracts a key=value mount option, failing the test when absent.
-func optionValue(t *testing.T, m mount.Mount, key string) string {
+// TestMountsReusesExistingMount covers that a second mounts request for an
+// already-mounted snapshot does not mount the image again.
+func TestMountsReusesExistingMount(t *testing.T) {
+	ctx := context.Background()
+	sn, engine, _, leaf := newBackedSnapshotter(t, alwaysMounted)
+	var calls []mountCall
+	recordMounts(engine, &calls)
+
+	if _, err := sn.Prepare(ctx, "container", leaf); err != nil {
+		t.Fatalf("Prepare() error = %v", err)
+	}
+	if _, err := sn.Mounts(ctx, "container"); err != nil {
+		t.Fatalf("Mounts() error = %v", err)
+	}
+	if len(calls) != 0 {
+		t.Fatalf("engine Mount calls = %d, want 0 for an already-mounted snapshot", len(calls))
+	}
+}
+
+// TestPrepareRejectsIntermediateChain covers that a snapshot cannot be layered
+// over an intermediate layer chain that is not a full image.
+func TestPrepareRejectsIntermediateChain(t *testing.T) {
+	ctx := context.Background()
+	diffIDs := []digest.Digest{digest.FromString("l1"), digest.FromString("l2")}
+	engine := fakeEngineForImages(testImageInfo(digest.FromString("img-root"), diffIDs...))
+	intermediate := chainIDs(diffIDs...)[0].String()
+	sn := newSnapshotterForTest(t, engine, notMounted)
+
+	if _, err := sn.Prepare(ctx, "container", intermediate); !errdefs.IsInvalidArgument(err) {
+		t.Fatalf("Prepare(intermediate) error = %v, want invalid argument", err)
+	}
+	if _, err := sn.Stat(ctx, "container"); !errdefs.IsNotFound(err) {
+		t.Fatalf("Stat(container) error = %v, want not found", err)
+	}
+}
+
+// TestPrepareOverCommittedInitLayer covers the flow docker uses to create a
+// container: an init snapshot prepared over the image chain, committed, and a
+// container snapshot prepared over the committed init layer. The container's
+// overlay spec must stack the init layer's upper directory over the image's
+// shared composefs mount.
+func TestPrepareOverCommittedInitLayer(t *testing.T) {
+	ctx := context.Background()
+	sn, engine, _, leaf := newBackedSnapshotter(t, notMounted)
+	var calls []mountCall
+	recordMounts(engine, &calls)
+
+	if _, err := sn.Prepare(ctx, "init-key", leaf); err != nil {
+		t.Fatalf("Prepare(init-key) error = %v", err)
+	}
+	if err := sn.Commit(ctx, "init", "init-key"); err != nil {
+		t.Fatalf("Commit(init) error = %v", err)
+	}
+	initID, _, err := sn.snapshotInfo(ctx, "init")
+	if err != nil {
+		t.Fatalf("snapshotInfo(init) error = %v", err)
+	}
+	initUpper := filepath.Join(sn.getSnapshotDir(initID), "upper")
+
+	calls = nil
+	mounts, err := sn.Prepare(ctx, "container", "init")
+	if err != nil {
+		t.Fatalf("Prepare(container) error = %v", err)
+	}
+	if len(calls) != 1 {
+		t.Fatalf("engine Mount calls = %d, want 1 (shared composefs mount)", len(calls))
+	}
+	chainFS := calls[0].target
+	id, _, err := sn.snapshotInfo(ctx, "container")
+	if err != nil {
+		t.Fatalf("snapshotInfo(container) error = %v", err)
+	}
+	dir := sn.getSnapshotDir(id)
+	want := []string{
+		"workdir=" + filepath.Join(dir, "work"),
+		"upperdir=" + filepath.Join(dir, "upper"),
+		"lowerdir=" + initUpper + ":" + chainFS + "::" + testObjectsDir,
+		"redirect_dir=on",
+		"metacopy=on",
+		"verity=require",
+	}
+	if len(mounts) != 1 || mounts[0].Type != "overlay" || !slices.Equal(mounts[0].Options, want) {
+		t.Fatalf("mounts = %v, want overlay with options %v", mounts, want)
+	}
+
+	// Mounts() must reproduce the same spec (and re-ensure the image
+	// mount) for recovery.
+	calls = nil
+	recovered, err := sn.Mounts(ctx, "container")
+	if err != nil {
+		t.Fatalf("Mounts(container) error = %v", err)
+	}
+	if len(calls) != 1 || !slices.Equal(recovered[0].Options, want) {
+		t.Fatalf("recovered mounts = %v (composefs mounts %d), want options %v", recovered, len(calls), want)
+	}
+}
+
+// TestRemoveUnmountsChainSnapshot covers that removing the chain snapshot
+// carrying the shared composefs mount tears that mount down first.
+func TestRemoveUnmountsChainSnapshot(t *testing.T) {
+	ctx := context.Background()
+	sn, engine, _, leaf := newBackedSnapshotter(t, alwaysMounted)
+	var unmounted []string
+	engine.unmountFunc = func(_ context.Context, target string) error {
+		unmounted = append(unmounted, target)
+		return nil
+	}
+
+	if err := sn.Remove(ctx, leaf); err != nil {
+		t.Fatalf("Remove() error = %v", err)
+	}
+	if len(unmounted) != 1 || filepath.Base(unmounted[0]) != "fs" {
+		t.Fatalf("Unmount targets = %v, want one .../fs", unmounted)
+	}
+	if _, err := sn.Stat(ctx, leaf); !errdefs.IsNotFound(err) {
+		t.Fatalf("Stat() after remove = %v, want not found", err)
+	}
+}
+
+// TestRemoveKeepsMountWhileChildrenExist covers that removing a chain snapshot
+// that still has children fails without touching the shared composefs mount
+// their overlay specs reference.
+func TestRemoveKeepsMountWhileChildrenExist(t *testing.T) {
+	ctx := context.Background()
+	sn, engine, _, leaf := newBackedSnapshotter(t, alwaysMounted)
+	var unmounted []string
+	engine.unmountFunc = func(_ context.Context, target string) error {
+		unmounted = append(unmounted, target)
+		return nil
+	}
+
+	if _, err := sn.Prepare(ctx, "container", leaf); err != nil {
+		t.Fatalf("Prepare() error = %v", err)
+	}
+	if err := sn.Remove(ctx, leaf); err == nil {
+		t.Fatal("Remove(leaf with child) error = nil, want failure")
+	}
+	if len(unmounted) != 0 {
+		t.Fatalf("Unmount targets = %v, want none while children exist", unmounted)
+	}
+	if _, err := sn.Stat(ctx, leaf); err != nil {
+		t.Fatalf("Stat(leaf) after failed remove = %v, want the record preserved", err)
+	}
+}
+
+// TestPrepareRollsBackOnMountFailure covers that a Prepare whose composefs
+// mount fails removes the snapshot record it created, so a retry of the same
+// key does not fail with already-exists.
+func TestPrepareRollsBackOnMountFailure(t *testing.T) {
+	ctx := context.Background()
+	sn, engine, _, leaf := newBackedSnapshotter(t, notMounted)
+	engine.mountFunc = func(context.Context, string, string, ...knarr.MountOption) error {
+		return errors.New("mount.composefs failed")
+	}
+
+	if _, err := sn.Prepare(ctx, "container", leaf); err == nil {
+		t.Fatal("Prepare() error = nil, want mount failure")
+	}
+	if _, err := sn.Stat(ctx, "container"); !errdefs.IsNotFound(err) {
+		t.Fatalf("Stat(container) after failed prepare = %v, want not found", err)
+	}
+	// A retry with the same key succeeds once the mount works again.
+	engine.mountFunc = func(context.Context, string, string, ...knarr.MountOption) error { return nil }
+	if _, err := sn.Prepare(ctx, "container", leaf); err != nil {
+		t.Fatalf("Prepare() retry error = %v", err)
+	}
+}
+
+// TestRemoveAbortsWhenUnmountFails covers that a failed unmount aborts the
+// remove and leaves the snapshot record in place.
+func TestRemoveAbortsWhenUnmountFails(t *testing.T) {
+	ctx := context.Background()
+	sn, engine, _, leaf := newBackedSnapshotter(t, alwaysMounted)
+	engine.unmountFunc = func(context.Context, string) error {
+		return errors.New("device busy")
+	}
+
+	if err := sn.Remove(ctx, leaf); err == nil {
+		t.Fatal("Remove() error = nil, want failure when unmount fails")
+	}
+	if _, err := sn.Stat(ctx, leaf); err != nil {
+		t.Fatalf("Stat() after failed remove = %v, want the record preserved", err)
+	}
+}
+
+// TestMountsFailsWhenBackingImageRemoved covers that recovering the mounts of a
+// snapshot whose backing image is gone fails rather than binding the snapshot
+// directory as the root filesystem.
+func TestMountsFailsWhenBackingImageRemoved(t *testing.T) {
+	ctx := context.Background()
+	sn, engine, _, leaf := newBackedSnapshotter(t, notMounted)
+	engine.mountFunc = func(context.Context, string, string, ...knarr.MountOption) error { return nil }
+	if _, err := sn.Prepare(ctx, "container", leaf); err != nil {
+		t.Fatalf("Prepare() error = %v", err)
+	}
+	// The backing image disappears from the store.
+	engine.listFunc = func(context.Context) ([]knarr.Image, error) { return nil, nil }
+	engine.inspectFunc = func(_ context.Context, ref string) (*knarr.ImageInfo, error) {
+		return nil, fmt.Errorf("removed %s: %w", ref, knarr.ErrNotFound)
+	}
+	if _, err := sn.Mounts(ctx, "container"); !errdefs.IsNotFound(err) {
+		t.Fatalf("Mounts() after image removal = %v, want not found", err)
+	}
+}
+
+type mountCall struct {
+	ref    string
+	target string
+	opts   knarr.MountOptions
+}
+
+func newSnapshotterForTest(t *testing.T, engine *fakeEngine, mounted func(string) (bool, error)) *snapshotter {
 	t.Helper()
-	for _, o := range m.Options {
-		if v, ok := strings.CutPrefix(o, key+"="); ok {
-			return v
-		}
+	sn, err := newSnapshotter(context.Background(), t.TempDir(), engine)
+	if err != nil {
+		t.Fatalf("newSnapshotter() error = %v", err)
 	}
-	t.Fatalf("mount options %v carry no %s", m.Options, key)
-	return ""
+	sn.mounted = mounted
+	t.Cleanup(func() {
+		if err := sn.Close(); err != nil {
+			t.Errorf("Close() error = %v", err)
+		}
+	})
+	return sn
 }
+
+// newBackedSnapshotter builds a snapshotter whose knarr store and metadata both
+// hold one two-layer image: the committed layer chain is seeded exactly as the
+// fast-path target prepares would during a pull. It returns the snapshotter, its
+// engine, the image root, and the leaf chain id a container is layered over.
+func newBackedSnapshotter(t *testing.T, mounted func(string) (bool, error)) (*snapshotter, *fakeEngine, digest.Digest, string) {
+	t.Helper()
+	ctx := context.Background()
+	diffIDs := []digest.Digest{digest.FromString("l1"), digest.FromString("l2")}
+	root := digest.FromString("img-root")
+	engine := fakeEngineForImages(testImageInfo(root, diffIDs...))
+	sn := newSnapshotterForTest(t, engine, mounted)
+
+	parent := ""
+	for i, chainID := range chainIDs(diffIDs...) {
+		_, err := sn.Prepare(ctx, fmt.Sprintf("seed-%d", i), parent, snapshots.WithLabels(map[string]string{
+			intermediateSnapshotLabel: chainID.String(),
+		}))
+		if !errdefs.IsAlreadyExists(err) {
+			t.Fatalf("seed target %s error = %v, want already exists", chainID, err)
+		}
+		parent = chainID.String()
+	}
+	return sn, engine, root, parent
+}
+
+func recordMounts(engine *fakeEngine, calls *[]mountCall) {
+	engine.mountFunc = func(_ context.Context, ref, target string, opts ...knarr.MountOption) error {
+		var mo knarr.MountOptions
+		for _, o := range opts {
+			o(&mo)
+		}
+		*calls = append(*calls, mountCall{ref: ref, target: target, opts: mo})
+		return nil
+	}
+}
+
+func notMounted(string) (bool, error)    { return false, nil }
+func alwaysMounted(string) (bool, error) { return true, nil }

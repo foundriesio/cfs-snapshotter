@@ -7,28 +7,26 @@ daemon (`containerd-cfs-grpc`) that serves the containerd Snapshots gRPC API on 
 unix socket. containerd — and Docker, which uses the same containerd — is pointed
 at it through one `proxy_plugins` entry.
 
-> **Status:** the snapshotter is a remote-snapshotter stub backed by a local
-> knarr image store. It answers the unpacker's per-layer handshake for chains
-> present in that store, so a pull of an image staged out of band downloads
-> no layers (`ctr` and `docker` still fetch the image metadata: index,
-> manifest, config, etc.); chains the store does not cover fail closed — the
-> snapshotter never fetches or unpacks content itself. Every snapshot is
-> served as one flat overlay whose base layer is a stand-in rootfs
-> (`-stub-rootfs`) — enough to run containers, against stand-in content.
-> Content-addressed composefs mounts of real image content land in a later
-> change.
+> **Status:** the snapshotter serves container root filesystems for images
+> already present in the local knarr store, indexed by layer chain digest.
+> Each image's EROFS metadata is mounted read-only once, at its chain
+> snapshot; containers get standard flat overlay mount specs combining their
+> writable upper (and any committed intermediate layers, such as docker's
+> init layer) with that shared mount and the knarr object directory as a
+> verity-enforced data-only lower, and `docker run` executes from it without
+> any layer entering containerd's content store (only the image metadata —
+> index, manifest, config, etc. — is fetched). Prepares for unknown chains
+> fail closed; the snapshotter does not fetch or unpack missing image
+> content as a fallback.
 
 ## 1. Build and start the daemon
 
 ```sh
 make build
-sudo ./bin/containerd-cfs-grpc -stub-rootfs <dir> &
+sudo ./bin/containerd-cfs-grpc &
 ```
 
-`-stub-rootfs` is required: a read-only directory served as every container's
-base layer in place of real image content (the devcontainer builds one — see
-`.devcontainer/scripts/make-stub-rootfs.sh`). The other defaults (socket
-`/run/containerd-cfs-grpc/containerd-cfs-grpc.sock`, root
+The defaults (socket `/run/containerd-cfs-grpc/containerd-cfs-grpc.sock`, root
 `/var/lib/containerd-cfs-grpc`, knarr root `/var/lib/knarr`) match the config
 below. See `-help` for flags.
 
@@ -95,7 +93,8 @@ cfs with zero layer downloads — only the image metadata (index, manifest,
 config, etc.) is fetched: the snapshotter answers the unpacker's per-layer
 handshake from the store's index. `ctr snapshots --snapshotter cfs ls` then
 lists the committed chain snapshots, confirming both clients reached cfs
-through the proxy, and `docker run` serves the stand-in rootfs. An image
+through the proxy, and `docker run` executes the image's real content from
+the store. An image
 absent from the store fails closed rather than silently unpacking into a
 different rootfs shape.
 
@@ -107,22 +106,3 @@ is unnecessary) and still routes to cfs:
 ```sh
 sudo ctr image pull --local --snapshotter cfs docker.io/library/busybox:latest
 ```
-
-## Inspecting a running container (devcontainer stub)
-
-The devcontainer's stand-in rootfs is a single static `/hello` binary — also
-linked as `/bin/sh` and `/bin/bash` — that prints a line and exits, so a plain
-`docker run` finishes immediately, leaving nothing to inspect. Setting
-`CFS_STUB_HOLD` in the container's environment makes it print and then block,
-keeping the container and its overlay mount up:
-
-```sh
-docker run --rm -d -e CFS_STUB_HOLD=1 --name cfs-hold <image> /hello
-pid="$(docker inspect -f '{{.State.Pid}}' cfs-hold)"
-cat "/proc/${pid}/mountinfo"   # or: findmnt -N "${pid}"
-docker stop cfs-hold           # clean shutdown, no SIGKILL wait
-```
-
-The stub rootfs has no real shell, so `docker exec cfs-hold sh` just runs the
-same greeter again rather than giving an interactive session — inspect the
-mount from the host via the container's PID as above.

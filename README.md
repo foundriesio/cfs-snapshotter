@@ -5,13 +5,12 @@ container rootfs from content-addressed, composefs-backed storage — using
 **composefs + EROFS + fs-verity** to mount a container's filesystem with a single
 `mount` syscall instead of unpacking and stacking layers.
 
-> **Status: early development.** The snapshotter runs as a remote-snapshotter
-> stub covering the full lifecycle: pulls routed to cfs download no layers
-> (`ctr` and `docker` still fetch the image metadata: index, manifest,
-> config, etc.),
-> and `docker run` serves a stand-in rootfs in place of image content. The
-> composefs/CAS backend that mounts real image content lands in a later
-> change.
+> **Status: early development.** The snapshotter serves images staged out of
+> band in a local [knarr](https://github.com/foundriesio/knarr) store: pulls
+> routed to cfs download no layers (`ctr` and `docker` still fetch the image
+> metadata: index, manifest, config, etc.), and `docker run` executes the
+> image's real content from a shared composefs-backed mount with fs-verity
+> enforced.
 
 ## Build and run
 

@@ -59,7 +59,7 @@ require_cfs_snapshots() {
 	echo "cfs recorded committed snapshots"
 }
 
-require_stub_commits() {
+require_intermediate_commits() {
 	if ! grep -q 'committed intermediate virtual snapshot' /var/log/cfs-devcontainer/containerd-cfs-grpc.log; then
 		echo "the daemon log records no committed intermediate snapshots" >&2
 		return 1
@@ -67,30 +67,20 @@ require_stub_commits() {
 	echo "handshakes were answered from the knarr-backed index (zero layer fetch)"
 }
 
-require_stub_run() {
+# The seeded image's own /hello prints "cfs hello ${SEED_NONCE}", so a
+# matching greeting proves the container executed the image's real content
+# served from the knarr store — not a leftover or a stand-in.
+require_real_run() {
 	local out
 	if ! out="$(docker run --rm "${SMOKE_IMAGE}" /hello)"; then
-		echo "docker run through the stub rootfs failed" >&2
+		echo "docker run over the materialized image failed" >&2
 		return 1
 	fi
-	if [ "${out}" != "hello from the cfs stub rootfs" ]; then
-		echo "docker run output ${out@Q}, want the stub rootfs greeting" >&2
+	if [ "${out}" != "cfs hello ${SEED_NONCE}" ]; then
+		echo "docker run output ${out@Q}, want the seeded image's greeting" >&2
 		return 1
 	fi
-	echo "docker run executed the stand-in rootfs end to end"
-}
-
-require_stub_shell_default() {
-	local out
-	if ! out="$(docker run --rm "${SMOKE_IMAGE}" /bin/sh)"; then
-		echo "docker run via a shell default path failed" >&2
-		return 1
-	fi
-	if [ "${out}" != "hello from the cfs stub rootfs" ]; then
-		echo "shell-path run output ${out@Q}, want the stub rootfs greeting" >&2
-		return 1
-	fi
-	echo "shell default paths resolve to the greeter"
+	echo "docker run executed the image's real content end to end"
 }
 
 trust_workspace() {
@@ -133,6 +123,8 @@ main() {
 	# pre-staged chain instead of fetching layers over the network.
 	local layout
 	layout="$(mktemp -d)/oci"
+	export SEED_NONCE="${SEED_NONCE:-smoke-$$-${RANDOM}}"
+	export SEED_RUNNABLE=1
 	SEED_KEEP_LAYOUT="${layout}" "${ROOT_DIR}/.devcontainer/scripts/seed-registry.sh" "${SMOKE_IMAGE}"
 	stage_out_of_band "${layout}"
 
@@ -141,11 +133,10 @@ main() {
 	require_cfs_snapshots
 	expect_pull_succeeds "docker pull" /tmp/cfs-docker-pull.log \
 		docker pull "${SMOKE_IMAGE}"
-	require_stub_commits
-	require_stub_run
-	require_stub_shell_default
+	require_intermediate_commits
+	require_real_run
 
-	echo "cfs served both pulls from the out-of-band knarr store; the container rootfs is still a stand-in — composefs materialization replaces it, after which 'docker run' serves real image content"
+	echo "cfs served both pulls from the out-of-band knarr store and docker run executed the image's real content"
 }
 
 main "$@"

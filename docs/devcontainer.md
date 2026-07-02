@@ -67,9 +67,9 @@ Reference release locations:
 Opening the devcontainer runs the image entrypoint. The entrypoint:
 
 - Starts Zot, `containerd`, and `dockerd`.
-- Builds the stand-in rootfs the stub serves
-  (`.devcontainer/scripts/make-stub-rootfs.sh`) and starts
-  `bin/containerd-cfs-grpc` with `-stub-rootfs` pointing at it, before
+- Provisions loop-backed ext4 filesystems for the knarr store (with
+  fs-verity enabled — knarr requires it) and the snapshotter root, and starts
+  `bin/containerd-cfs-grpc` with `-knarr-root` pointing at the store, before
   `containerd`, so containerd can register the `cfs` proxy snapshotter during
   startup.
 - Waits for `ctr version`, `docker version`, and `docker info`.
@@ -144,14 +144,6 @@ terminal, etc.):
 
 Both read `/var/log/cfs-devcontainer/containerd-cfs-grpc.log` (see Startup
 above) through `jq`.
-
-A plain `docker run` against the devcontainer's stand-in image content exits
-immediately once it prints its greeting, leaving nothing to inspect. Setting
-`CFS_STUB_HOLD` in the container's environment makes it print and then block
-instead, so the container and its overlay mount stay up for inspection from the
-host. See
-[docs/running.md](running.md#inspecting-a-running-container-devcontainer-stub)
-for the full example.
 
 ## Comparing Against The erofs Snapshotter
 
