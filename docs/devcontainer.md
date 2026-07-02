@@ -102,36 +102,37 @@ override it:
 CFS_LOG_LEVEL=debug make run-cfs
 ```
 
-## Smoke Test
+## End-to-End Test
 
 From the host, run a command inside the devcontainer with the nested daemon
 stack started:
 
 ```sh
-./devshell.sh make test-smoke
+./devshell.sh make test-e2e
 ```
 
-From an already-open devcontainer, run the smoke test:
+From an already-open devcontainer, run the fast-path end-to-end test:
 
 ```sh
-make test-smoke
+make test-e2e
 ```
 
-`make test-smoke` depends on `make run-cfs`, so it rebuilds and restarts the cfs
-proxy before checking Docker and containerd routing.
+`make test-e2e` depends on `make run-cfs`, so it rebuilds and restarts the cfs
+proxy before driving the test.
 
 Run:
 
 ```sh
-.devcontainer/scripts/smoke-test-cfs-routing.sh
+.devcontainer/scripts/e2e-fastpath.sh
 ```
 
-The smoke test prints the actual runtime versions, runs `make fmt`, `make vet`,
-`make test`, and `make build`, checks that containerd lists the `cfs` proxy
-snapshotter, seeds Zot with a tiny local OCI image, then verifies the stub end
-to end: both `ctr` and Docker pulls complete through cfs with zero layer
-fetches (the unpack handshakes are answered from the stub; only the image
-metadata is downloaded), and `docker run` executes the stand-in rootfs.
+The test builds the knarr CLI, seeds Zot with a multi-layer OCI image and pulls
+it into the knarr store by digest, then creates a container from it through
+Docker. It asserts that no layer blob entered containerd's content store, that
+the container root filesystem is a live composefs mount exposing the composed
+layer content, that writes land in the overlay upper while the image object stays
+sealed, that an unmaterialized image fails closed, that fs-verity rejects a write
+to a store object, and that the snapshotter recovers after a restart.
 
 ## Debugging Niceties
 

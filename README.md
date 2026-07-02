@@ -38,20 +38,24 @@ Inside the container:
 ```sh
 make run-cfs      # rebuild and restart the snapshotter after editing code
 make test         # unit tests
-make test-smoke   # end to end: ctr/docker pull and docker run through cfs
+make test-e2e     # end to end: stage with knarr, pull and docker run through cfs
 ```
 
-To test manually, drive the snapshotter with plain `docker` and `ctr`
-commands — both are preconfigured to use cfs, and any image from a regular
-remote registry works (busybox here) — then watch the snapshotter's logs.
+To test manually, stage an image into the knarr store out of band first — the
+snapshotter never pulls over the network — then drive it with plain `docker`
+and `ctr` commands (both are preconfigured to use cfs) and watch the logs.
 Layers are never downloaded; only the image metadata (index, manifest,
 config, etc.) is fetched:
 
 ```sh
+crane pull --platform=linux/amd64 --format=oci busybox /tmp/busybox
+knarr pull --from-dir /tmp/busybox \
+    "docker.io/library/busybox@$(jq -r '.manifests[0].digest' /tmp/busybox/index.json)"
+
 docker pull busybox
-docker run --rm busybox
+docker run --rm busybox echo hello    # real busybox, served from the knarr store
 ctr image pull docker.io/library/busybox:latest
-ctr run --rm docker.io/library/busybox:latest demo
+ctr run --rm docker.io/library/busybox:latest demo echo hello
 ctr snapshots ls                  # committed chain + container snapshots
 
 cfs-log           # pretty-print the snapshotter's log
