@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"time"
 
 	snapshotsapi "github.com/containerd/containerd/api/services/snapshots/v1"
 	"github.com/containerd/containerd/v2/contrib/snapshotservice"
@@ -101,7 +102,23 @@ func run(ctx context.Context, address, root string) error {
 	select {
 	case sig := <-sigCh:
 		log.G(ctx).WithField("signal", sig).Info("shutting down")
-		server.GracefulStop()
+		// GracefulStop waits for in-flight RPCs indefinitely; force a hard
+		// stop if it does not finish in time or a second signal arrives, so a
+		// stuck mount or store operation cannot wedge the shutdown.
+		done := make(chan struct{})
+		go func() {
+			server.GracefulStop()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+			log.G(ctx).Warn("graceful stop timed out; stopping hard")
+			server.Stop()
+		case sig := <-sigCh:
+			log.G(ctx).WithField("signal", sig).Warn("second signal; stopping hard")
+			server.Stop()
+		}
 		return nil
 	case err := <-errCh:
 		return err
