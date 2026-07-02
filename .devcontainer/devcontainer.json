@@ -25,6 +25,9 @@
     "--security-opt=apparmor=unconfined",
     "--cgroupns=host"
   ],
+  "mounts": [
+    "source=/work/go/src/github.com/foundriesio/knarr,target=/work/go/src/github.com/foundriesio/knarr,type=bind,consistency=cached"
+  ],
   "containerEnv": {
     "CFS_DEVCONTAINER": "1",
     "GOCACHE": "/tmp/cfs-gocache",

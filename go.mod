@@ -8,8 +8,16 @@ require (
 	github.com/containerd/continuity v0.5.0
 	github.com/containerd/errdefs v1.0.0
 	github.com/containerd/log v0.1.0
+	github.com/foundriesio/knarr v0.0.0-20260717133212-f853bf9988dc
 	golang.org/x/sys v0.47.0
 	google.golang.org/grpc v1.81.1
+)
+
+require (
+	github.com/docker/cli v29.4.3+incompatible // indirect
+	github.com/docker/docker-credential-helpers v0.9.3 // indirect
+	github.com/google/go-containerregistry v0.21.6 // indirect
+	github.com/klauspost/compress v1.19.0 // indirect
 )
 
 require (
@@ -23,8 +31,8 @@ require (
 	github.com/golang/groupcache v0.0.0-20241129210726-2c02b8208cf8 // indirect
 	github.com/moby/sys/mountinfo v0.7.2 // indirect
 	github.com/moby/sys/userns v0.1.0 // indirect
-	github.com/opencontainers/go-digest v1.0.0 // indirect
-	github.com/opencontainers/image-spec v1.1.1 // indirect
+	github.com/opencontainers/go-digest v1.0.0
+	github.com/opencontainers/image-spec v1.1.1
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/sirupsen/logrus v1.9.4 // indirect
 	go.etcd.io/bbolt v1.4.3 // indirect
