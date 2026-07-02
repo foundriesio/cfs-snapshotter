@@ -22,6 +22,7 @@ import (
 	"github.com/containerd/containerd/v2/core/snapshots/storage"
 	"github.com/containerd/errdefs"
 	"github.com/containerd/log"
+	"github.com/foundriesio/knarr/pkg/knarr"
 
 	"github.com/containerd/continuity/fs"
 )
@@ -42,16 +43,27 @@ type snapshotter struct {
 	// root is the snapshotter's root directory.
 	root string
 	// ms is the bolt-backed metadata store holding snapshot records.
-	ms *storage.MetaStore
+	ms     *storage.MetaStore
+	engine engineAPI
+	bridge *bridge
 }
 
 // Compile-time assertion that *snapshotter satisfies the containerd interface.
 var _ snapshots.Snapshotter = (*snapshotter)(nil)
 
 // NewSnapshotter returns a snapshots.Snapshotter rooted at the given directory.
-// The root directory must not be empty. It is created if it does not exist,
-// along with the metadata store and the snapshots directory beneath it.
-func NewSnapshotter(ctx context.Context, root string) (snapshots.Snapshotter, error) {
+func NewSnapshotter(ctx context.Context, root, knarrRoot string) (snapshots.Snapshotter, error) {
+	if root == "" {
+		return nil, fmt.Errorf("cfs snapshotter: root directory must not be empty: %w", errdefs.ErrInvalidArgument)
+	}
+	engine, err := knarr.New(knarr.Config{Root: knarrRoot})
+	if err != nil {
+		return nil, fmt.Errorf("create knarr engine: %w", err)
+	}
+	return newSnapshotter(ctx, root, engine)
+}
+
+func newSnapshotter(ctx context.Context, root string, engine engineAPI) (snapshots.Snapshotter, error) {
 	if root == "" {
 		return nil, fmt.Errorf("cfs snapshotter: root directory must not be empty: %w", errdefs.ErrInvalidArgument)
 	}
@@ -65,7 +77,7 @@ func NewSnapshotter(ctx context.Context, root string) (snapshots.Snapshotter, er
 	if err := os.Mkdir(filepath.Join(root, "snapshots"), 0700); err != nil && !os.IsExist(err) {
 		return nil, fmt.Errorf("cfs snapshotter: create snapshots dir: %w", err)
 	}
-	return &snapshotter{root: root, ms: ms}, nil
+	return &snapshotter{root: root, ms: ms, engine: engine, bridge: newBridge(engine)}, nil
 }
 
 // Stat returns the info for an active or committed snapshot by key. It is used
@@ -148,6 +160,12 @@ func (s *snapshotter) Prepare(ctx context.Context, key, parent string, opts ...s
 	target, ok := base.Labels[targetSnapshotLabel]
 	if !ok {
 		return s.createSnapshot(ctx, snapshots.KindActive, key, parent, opts)
+	}
+	if _, err := s.bridge.resolve(ctx, target); err != nil {
+		if errdefs.IsNotFound(err) {
+			return nil, fmt.Errorf("layer chain %s is not in the local image store; pull the image by digest out of band before running: %w", target, errdefs.ErrFailedPrecondition)
+		}
+		return nil, fmt.Errorf("resolve layer chain %s: %w", target, err)
 	}
 	return nil, s.prepareTarget(ctx, key, parent, target, base.Labels, opts)
 }

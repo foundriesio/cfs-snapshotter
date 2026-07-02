@@ -8,11 +8,10 @@ unix socket. containerd — and Docker, which uses the same containerd — is po
 at it through one `proxy_plugins` entry.
 
 > **Status:** the snapshotter tracks snapshot metadata and lifecycle (prepare,
-> commit, remove) and returns placeholder bind mounts. A pull routed to cfs now
-> completes: containerd extracts the layers into per-snapshot directories and
-> commits them. The mounts are not yet content-addressed composefs mounts and do
-> not compose a snapshot's parent chain, so a pulled image is not yet a usable
-> container rootfs; that materialization lands in a later change.
+> commit, remove), indexes images already present in the local knarr store by
+> layer chain digest, and returns placeholder bind mounts. Target-labeled
+> prepares for unknown chains fail closed; the snapshotter does not fetch or
+> unpack missing image content as a fallback.
 
 ## 1. Build and start the daemon
 
@@ -22,7 +21,14 @@ sudo ./bin/containerd-cfs-grpc &
 ```
 
 The defaults (socket `/run/containerd-cfs-grpc/containerd-cfs-grpc.sock`, root
-`/var/lib/containerd-cfs-grpc`) match the config below. See `-help` for flags.
+`/var/lib/containerd-cfs-grpc`, knarr root `/var/lib/knarr`) match the config
+below. See `-help` for flags.
+
+Set `-knarr-root` to the shared knarr image store root. Images must be pulled
+into that store by digest out of band before containerd prepares their layer
+chains through cfs. If a chain digest is not present in the local index,
+`Prepare` returns a failed-precondition error naming the chainID and the required
+out-of-band pull.
 
 ## 2. Configure containerd
 
@@ -76,10 +82,10 @@ sudo ctr image pull --snapshotter cfs docker.io/library/busybox:latest
 docker pull busybox
 ```
 
-Both fetch the image and unpack it through cfs: the snapshotter records the
-prepare/commit lifecycle and returns placeholder bind mounts that containerd
-extracts the layers into. `ctr snapshots --snapshotter cfs ls` then lists the
-committed snapshots, confirming both clients reached cfs through the proxy.
+Both clients reach cfs through the proxy. For images already present in the
+knarr store, the snapshotter records committed target snapshots for matching
+layer chains. For images not present in that store, the pull fails closed rather
+than silently unpacking into a different rootfs shape.
 
 ## Quick test without editing config
 

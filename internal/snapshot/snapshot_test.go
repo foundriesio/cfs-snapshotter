@@ -12,16 +12,17 @@ import (
 
 	"github.com/containerd/containerd/v2/core/snapshots"
 	"github.com/containerd/errdefs"
+	"github.com/opencontainers/go-digest"
 )
 
 func TestNewSnapshotterRejectsEmptyRoot(t *testing.T) {
-	if _, err := NewSnapshotter(context.Background(), ""); !errdefs.IsInvalidArgument(err) {
+	if _, err := NewSnapshotter(context.Background(), "", t.TempDir()); !errdefs.IsInvalidArgument(err) {
 		t.Fatalf("NewSnapshotter(%q) error = %v, want invalid argument", "", err)
 	}
 }
 
 func TestNewSnapshotterAcceptsValidRoot(t *testing.T) {
-	sn, err := NewSnapshotter(context.Background(), t.TempDir())
+	sn, err := NewSnapshotter(context.Background(), t.TempDir(), t.TempDir())
 	if err != nil {
 		t.Fatalf("NewSnapshotter() error = %v", err)
 	}
@@ -37,11 +38,20 @@ func TestNewSnapshotterAcceptsValidRoot(t *testing.T) {
 // its Close with t.Cleanup.
 func newTestSnapshotter(t *testing.T) snapshots.Snapshotter {
 	t.Helper()
-	sn, err := NewSnapshotter(context.Background(), t.TempDir())
+	return newTestSnapshotterWithEngine(t, &fakeEngine{})
+}
+
+func newTestSnapshotterWithEngine(t *testing.T, engine engineAPI) snapshots.Snapshotter {
+	t.Helper()
+	sn, err := newSnapshotter(context.Background(), t.TempDir(), engine)
 	if err != nil {
 		t.Fatalf("NewSnapshotter() error = %v", err)
 	}
-	t.Cleanup(func() { _ = sn.Close() })
+	t.Cleanup(func() {
+		if err := sn.Close(); err != nil {
+			t.Errorf("Close() error = %v", err)
+		}
+	})
 	return sn
 }
 
@@ -83,6 +93,20 @@ func TestLifecycle(t *testing.T) {
 	if len(walked) != 1 || walked[0] != "committed" {
 		t.Fatalf("Walk() listed %v, want [committed]", walked)
 	}
+
+	viewMounts, err := sn.View(ctx, "view", "committed")
+	if err != nil {
+		t.Fatalf("View() error = %v", err)
+	}
+	if len(viewMounts) != 1 {
+		t.Fatalf("View() returned %d mounts, want 1: %v", len(viewMounts), viewMounts)
+	}
+	if got := viewMounts[0].Options[len(viewMounts[0].Options)-1]; got != "ro" {
+		t.Fatalf("View() mount ro flag = %q, want ro", got)
+	}
+	if err := sn.Remove(ctx, "view"); err != nil {
+		t.Fatalf("Remove(view) error = %v", err)
+	}
 }
 
 // TestParentResolution covers descending from a committed parent and the error
@@ -113,9 +137,14 @@ func TestParentResolution(t *testing.T) {
 
 func TestPrepareTarget(t *testing.T) {
 	ctx := context.Background()
-	sn := newTestSnapshotter(t)
-	target1 := "sha256:" + strings.Repeat("11", 32)
-	target2 := "sha256:" + strings.Repeat("22", 32)
+	diffIDs := []digest.Digest{
+		digest.FromString("target-layer-1"),
+		digest.FromString("target-layer-2"),
+	}
+	targets := chainIDs(diffIDs...)
+	sn := newTestSnapshotterWithEngine(t, fakeEngineForImages(testImageInfo(digest.FromString("target-root"), diffIDs...)))
+	target1 := targets[0].String()
+	target2 := targets[1].String()
 
 	mounts, err := sn.Prepare(ctx, "extract-1", "", snapshots.WithLabels(map[string]string{
 		targetSnapshotLabel: target1,
@@ -187,6 +216,31 @@ func TestPrepareTarget(t *testing.T) {
 	}
 	if mounts[0].Type != mountType {
 		t.Fatalf("Prepare(active) mount type = %q, want %q", mounts[0].Type, mountType)
+	}
+}
+
+func TestPrepareTargetMissingChainFailsClosed(t *testing.T) {
+	ctx := context.Background()
+	sn := newTestSnapshotterWithEngine(t, fakeEngineForImages())
+	target := digest.FromString("missing-target").String()
+
+	mounts, err := sn.Prepare(ctx, "extract", "", snapshots.WithLabels(map[string]string{
+		targetSnapshotLabel: target,
+	}))
+	if !errdefs.IsFailedPrecondition(err) {
+		t.Fatalf("Prepare() error = %v, want failed precondition", err)
+	}
+	if mounts != nil {
+		t.Fatalf("Prepare() mounts = %v, want nil", mounts)
+	}
+	if !strings.Contains(err.Error(), target) {
+		t.Fatalf("Prepare() error %q does not name target %s", err, target)
+	}
+	if _, err := sn.Stat(ctx, target); !errdefs.IsNotFound(err) {
+		t.Fatalf("Stat(target) error = %v, want not found", err)
+	}
+	if _, err := sn.Stat(ctx, "extract"); !errdefs.IsNotFound(err) {
+		t.Fatalf("Stat(extract) error = %v, want not found", err)
 	}
 }
 
@@ -270,11 +324,15 @@ func TestUsage(t *testing.T) {
 func TestRemove(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
-	sn, err := NewSnapshotter(ctx, root)
+	sn, err := NewSnapshotter(ctx, root, t.TempDir())
 	if err != nil {
 		t.Fatalf("NewSnapshotter() error = %v", err)
 	}
-	t.Cleanup(func() { _ = sn.Close() })
+	t.Cleanup(func() {
+		if err := sn.Close(); err != nil {
+			t.Errorf("Close() error = %v", err)
+		}
+	})
 
 	if _, err := sn.Prepare(ctx, "k", ""); err != nil {
 		t.Fatalf("Prepare() error = %v", err)
@@ -301,7 +359,7 @@ func TestPersistence(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
 
-	sn, err := NewSnapshotter(ctx, root)
+	sn, err := NewSnapshotter(ctx, root, t.TempDir())
 	if err != nil {
 		t.Fatalf("NewSnapshotter() error = %v", err)
 	}
@@ -315,11 +373,15 @@ func TestPersistence(t *testing.T) {
 		t.Fatalf("Close() error = %v", err)
 	}
 
-	reopened, err := NewSnapshotter(ctx, root)
+	reopened, err := NewSnapshotter(ctx, root, t.TempDir())
 	if err != nil {
 		t.Fatalf("NewSnapshotter() reopen error = %v", err)
 	}
-	t.Cleanup(func() { _ = reopened.Close() })
+	t.Cleanup(func() {
+		if err := reopened.Close(); err != nil {
+			t.Errorf("Close() error = %v", err)
+		}
+	})
 	if info, err := reopened.Stat(ctx, "committed"); err != nil {
 		t.Fatalf("Stat(committed) after reopen error = %v", err)
 	} else if info.Kind != snapshots.KindCommitted {

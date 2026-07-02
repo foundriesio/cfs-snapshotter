@@ -13,6 +13,7 @@ CONTAINERD_CFS_GRPC_BIN="${ROOT_DIR}/bin/containerd-cfs-grpc"
 CFS_SOCKET=/run/containerd-cfs-grpc/containerd-cfs-grpc.sock
 CONTAINERD_SOCKET=/run/containerd/containerd.sock
 CFS_LOG_LEVEL="${CFS_LOG_LEVEL:-trace}"
+CFS_KNARR_ROOT="${CFS_KNARR_ROOT:-/var/lib/knarr}"
 CFS_PIDFILE="${LOG_DIR}/containerd-cfs-grpc.pid"
 CFS_LOGFILE="${LOG_DIR}/containerd-cfs-grpc.log"
 CFS_STATE_FILE="${LOG_DIR}/containerd-cfs-grpc.env"
@@ -136,9 +137,10 @@ main() {
 		"${LOG_DIR}"
 
 	git config --global --add safe.directory "${ROOT_DIR}" || true
-	local old_hash new_hash old_log_level
+	local old_hash new_hash old_state new_state
 	old_hash="$(file_hash "${CONTAINERD_CFS_GRPC_BIN}")"
-	old_log_level="$(cat "${CFS_STATE_FILE}" 2>/dev/null || true)"
+	old_state="$(cat "${CFS_STATE_FILE}" 2>/dev/null || true)"
+	new_state="$(printf 'log-level=%s\nknarr-root=%s\n' "${CFS_LOG_LEVEL}" "${CFS_KNARR_ROOT}")"
 	make -C "${ROOT_DIR}" build
 	new_hash="$(file_hash "${CONTAINERD_CFS_GRPC_BIN}")"
 
@@ -146,15 +148,15 @@ main() {
 		[ -S "${CFS_SOCKET}" ] &&
 		[ "${CFS_FORCE_RESTART:-0}" != "1" ] &&
 		[ "${old_hash}" = "${new_hash}" ] &&
-		[ "${old_log_level}" = "${CFS_LOG_LEVEL}" ]; then
+		[ "${old_state}" = "${new_state}" ]; then
 		echo "cfs snapshotter binary unchanged; keeping pid $(cat "${CFS_PIDFILE}")"
 	else
 		restart_daemon containerd-cfs-grpc \
 			"${CFS_PIDFILE}" \
 			"${CFS_SOCKET}" \
 			"${CFS_LOGFILE}" \
-			"${CONTAINERD_CFS_GRPC_BIN}" -log-level "${CFS_LOG_LEVEL}"
-		printf '%s\n' "${CFS_LOG_LEVEL}" >"${CFS_STATE_FILE}"
+			"${CONTAINERD_CFS_GRPC_BIN}" -log-level "${CFS_LOG_LEVEL}" -knarr-root "${CFS_KNARR_ROOT}"
+		printf '%s' "${new_state}" >"${CFS_STATE_FILE}"
 	fi
 	wait_for cfs-snapshotter test -S "${CFS_SOCKET}"
 
