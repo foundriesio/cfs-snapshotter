@@ -15,6 +15,9 @@ concurrency:
 
 env:
   GOLANGCI_LINT_VERSION: v2.12.2
+  # knarr is an internal module; the public proxy can't serve it, so builds
+  # resolve it directly over git using a token that can read the repo.
+  GOPRIVATE: github.com/foundriesio/knarr
 
 jobs:
   build-test:
@@ -33,6 +36,8 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
+      - name: Authenticate to the internal knarr module
+        run: git config --global url."https://x-access-token:${{ secrets.KNARR_TOKEN }}@github.com/foundriesio/".insteadOf "https://github.com/foundriesio/"
       - run: make vet
       - run: make test
       - run: make build
@@ -45,6 +50,8 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
+      - name: Authenticate to the internal knarr module
+        run: git config --global url."https://x-access-token:${{ secrets.KNARR_TOKEN }}@github.com/foundriesio/".insteadOf "https://github.com/foundriesio/"
       - name: install golangci-lint
         run: |
           curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/HEAD/install.sh \
@@ -56,6 +63,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: Authenticate to the internal knarr module
+        run: git config --global url."https://x-access-token:${{ secrets.KNARR_TOKEN }}@github.com/foundriesio/".insteadOf "https://github.com/foundriesio/"
+      # The devcontainer has no credentials for the internal knarr module, so
+      # pre-fetch it here into the module cache the container bind-mounts and
+      # reuses; the build inside then resolves knarr offline.
+      - name: Pre-fetch modules into the shared devcontainer cache
+        run: GOMODCACHE=/tmp/cfs-gomodcache go mod download
       # Builds the version-pinned devcontainer image and runs the smoke test
       # inside it: starts the nested zot/containerd/dockerd/cfs stack and checks
       # that ctr and Docker pulls route to the cfs proxy snapshotter.
