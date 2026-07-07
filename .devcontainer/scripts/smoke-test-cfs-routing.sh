@@ -10,6 +10,9 @@ require_cfs_devcontainer
 ROOT_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 CONTAINERD_SOCKET=/run/containerd/containerd.sock
 SMOKE_IMAGE=${SMOKE_IMAGE:-127.0.0.1:5000/cfs/smoke:latest}
+# The knarr CLI is built on the host and mounted here (the container has no
+# credentials for the internal module); used to stage images out of band.
+KNARR_BIN=${KNARR_BIN:-/opt/cfs-dev/bin/knarr}
 
 print_versions() {
 	echo "runtime versions:"
@@ -60,6 +63,22 @@ trust_workspace() {
 	git config --global --add safe.directory "${ROOT_DIR}" || true
 }
 
+require_knarr_cli() {
+	[ -x "${KNARR_BIN}" ] ||
+		{ echo "knarr CLI not found at ${KNARR_BIN}; devshell.sh builds it on the host" >&2; exit 1; }
+}
+
+# stage_out_of_band mirrors what an OTA agent does: the fast-path snapshotter
+# never pulls over the network, so the image is staged into the knarr store from
+# a local OCI layout before the container runtime pulls it.
+stage_out_of_band() {
+	local layout="$1" repo digest
+	repo="${SMOKE_IMAGE%:*}"
+	digest="$(jq -r '.manifests[0].digest' "${layout}/index.json")"
+	echo "staging ${repo}@${digest} into the knarr store out of band"
+	"${KNARR_BIN}" pull --from-dir "${layout}" "${repo}@${digest}"
+}
+
 main() {
 	trust_workspace
 	print_versions
@@ -73,7 +92,15 @@ main() {
 	docker version
 	docker info
 	require_cfs_plugin
-	"${ROOT_DIR}/.devcontainer/scripts/seed-registry.sh" "${SMOKE_IMAGE}"
+	require_knarr_cli
+
+	# Seed the registry and keep the OCI layout, stage it into the knarr store out
+	# of band, then let the runtimes pull: the fast-path snapshotter serves the
+	# pre-staged chain instead of fetching layers over the network.
+	local layout
+	layout="$(mktemp -d)/oci"
+	SEED_KEEP_LAYOUT="${layout}" "${ROOT_DIR}/.devcontainer/scripts/seed-registry.sh" "${SMOKE_IMAGE}"
+	stage_out_of_band "${layout}"
 
 	expect_pull_succeeds "ctr image pull" /tmp/cfs-ctr-pull.log \
 		ctr --address "${CONTAINERD_SOCKET}" image pull --plain-http --snapshotter cfs "${SMOKE_IMAGE}"
@@ -81,7 +108,7 @@ main() {
 	expect_pull_succeeds "docker pull" /tmp/cfs-docker-pull.log \
 		docker pull "${SMOKE_IMAGE}"
 
-	echo "future backend check: the pulled snapshots are placeholder bind mounts; composefs rootfs and 'docker run --rm ${SMOKE_IMAGE} true' land once mount materialization is implemented"
+	echo "cfs served both pulls from the out-of-band knarr store"
 }
 
 main "$@"

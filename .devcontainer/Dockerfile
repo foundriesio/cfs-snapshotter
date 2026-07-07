@@ -1,6 +1,33 @@
 # SPDX-License-Identifier: Apache-2.0
 
 ARG GO_VERSION=1.26
+
+# composefs-builder compiles the composefs tools from a pinned release. Tags are
+# mutable, so the build asserts the clone landed on the immutable commit the tag
+# resolves to; a moved tag fails the build rather than silently changing the tool
+# that defines the on-disk EROFS format.
+FROM debian:bookworm-slim AS composefs-builder
+
+ARG COMPOSEFS_VERSION=v1.0.8
+ARG COMPOSEFS_COMMIT=858ce1b38e1534c2602eb431124b5dca706bc746
+
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        ca-certificates git meson ninja-build pkg-config build-essential libssl-dev; \
+    rm -rf /var/lib/apt/lists/*
+
+RUN set -eux; \
+    multiarch="$(dpkg-architecture -qDEB_HOST_MULTIARCH)"; \
+    git clone --depth 1 --branch "${COMPOSEFS_VERSION}" \
+        https://github.com/containers/composefs.git /tmp/composefs; \
+    test "$(git -C /tmp/composefs rev-parse HEAD)" = "${COMPOSEFS_COMMIT}"; \
+    meson setup /tmp/composefs/build /tmp/composefs \
+        --prefix=/usr --libdir="/usr/lib/${multiarch}" \
+        -Dfuse=disabled -Dman=disabled; \
+    meson compile -C /tmp/composefs/build; \
+    DESTDIR=/out meson install -C /tmp/composefs/build
+
 FROM mcr.microsoft.com/devcontainers/go:${GO_VERSION}-bookworm
 
 ARG TARGETARCH
@@ -23,16 +50,23 @@ RUN set -eux; \
     apt-get install -y --no-install-recommends \
         ca-certificates \
         curl \
+        e2fsprogs \
         fuse3 \
         git \
         iproute2 \
         iptables \
         jq \
         kmod \
+        libssl3 \
         make \
         procps \
         util-linux; \
     rm -rf /var/lib/apt/lists/*
+
+# The composefs tools and their shared library, for mounting images and their
+# fs-verity enforcement at runtime.
+COPY --from=composefs-builder /out/ /
+RUN ldconfig
 
 RUN set -eux; \
     case "${TARGETARCH}${TARGETVARIANT}" in \
@@ -73,6 +107,12 @@ RUN set -eux; \
     golangci-lint --version; \
     test -x /opt/cni/bin/loopback; \
     rm -rf /tmp/cfs-install
+
+# crane: pull a registry image into a local OCI image layout, so the e2e can
+# feed a real-world image to `knarr pull --from-dir`. Copied from its official
+# static image rather than built from source.
+COPY --from=gcr.io/go-containerregistry/crane:v0.21.7 /ko-app/crane /opt/cfs-dev/bin/crane
+RUN command -v crane >/dev/null
 
 COPY config/ /tmp/cfs-devcontainer-config/
 
