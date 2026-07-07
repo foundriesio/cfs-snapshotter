@@ -28,7 +28,6 @@ DOCKER_NS=moby
 LAYER_COUNT=3
 KNARR_ROOT=/var/lib/knarr
 KNARR_BIN=/opt/cfs-dev/bin/knarr
-KNARR_SRC=/work/go/src/github.com/foundriesio/knarr
 CFS_LOG=/var/log/cfs-devcontainer/containerd-cfs-grpc.log
 # Real-world image for the registry round-trip check; needs network access to
 # its home registry (manifest and config only — layers must not be fetched).
@@ -82,11 +81,13 @@ manifest_digest() {
 		awk 'tolower($1) == "docker-content-digest:" {gsub(/\r/, "", $2); print $2}'
 }
 
-build_knarr() {
-	echo "building knarr CLI from ${KNARR_SRC}"
-	# -buildvcs=false: the bind-mounted source's .git is owned by the host user,
-	# which git inside the container refuses to read.
-	(cd "${KNARR_SRC}" && GOTOOLCHAIN=auto go build -buildvcs=false -o "${KNARR_BIN}" ./cmd/knarr)
+require_knarr() {
+	# The knarr CLI is built on the host from the pinned module and mounted at
+	# KNARR_BIN; the container has no credentials to fetch the internal module
+	# itself. Fail early with a clear message if the mount is missing.
+	[ -x "${KNARR_BIN}" ] ||
+		fail "knarr CLI not found at ${KNARR_BIN}; devshell.sh builds it on the host"
+	echo "using knarr CLI at ${KNARR_BIN}"
 }
 
 # chain_mount prints the newest shared image metadata mount: the snapshotter mounts
@@ -505,7 +506,7 @@ assert_restart_recovers() {
 main() {
 	work="$(mktemp -d)"
 	trap cleanup EXIT
-	build_knarr
+	require_knarr
 
 	echo "runtime versions:"
 	docker --version
