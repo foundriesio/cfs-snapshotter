@@ -161,6 +161,11 @@ main() {
 		/var/lib/docker \
 		"${LOG_DIR}"
 
+	if ! mountpoint -q "${CFS_KNARR_ROOT}" 2>/dev/null; then
+		echo "knarr store is not mounted at ${CFS_KNARR_ROOT}; the devcontainer entrypoint provisions it (fs-verity needs a real filesystem)" >&2
+		exit 1
+	fi
+
 	git config --global --add safe.directory "${ROOT_DIR}" || true
 	mount_loop_ext4 "${CFS_ROOT_IMG}" "${CFS_ROOT}"
 	local old_hash new_hash old_state new_state

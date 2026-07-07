@@ -18,31 +18,12 @@ CFS_ROOT=/var/lib/containerd-cfs-grpc
 CFS_ROOT_IMG=/var/tmp/cfs-root.img
 EROFS_ROOT=/var/lib/containerd/io.containerd.snapshotter.v1.erofs
 EROFS_ROOT_IMG=/var/tmp/erofs-root.img
+KNARR_ROOT=/var/lib/knarr
+KNARR_VERITY_IMG=/var/tmp/knarr-verity.img
+STORE_SIZE_MB="${STORE_SIZE_MB:-512}"
 CFS_STATE_FILE="${LOG_DIR}/containerd-cfs-grpc.env"
 REGISTRY_URL=http://127.0.0.1:5000
 
-
-# mount_loop_ext4 mounts a fresh loop-backed ext4 filesystem at dir, so overlay
-# upper and work directories live on a real filesystem: the snapshotter's
-# overlay uppers cannot live on the container's own overlayfs, since overlayfs
-# cannot stack on overlayfs. A filesystem already mounted at dir is left as is.
-mount_loop_ext4() {
-	local img="$1" dir="$2"
-	if mountpoint -q "${dir}" 2>/dev/null; then
-		return 0
-	fi
-	local stale dev
-	stale="$(losetup -a 2>/dev/null | grep -F "${img}" | cut -d: -f1 || true)"
-	for dev in ${stale}; do
-		losetup -d "${dev}" 2>/dev/null || true
-	done
-	mkdir -p "${dir}"
-	dd if=/dev/zero of="${img}" bs=1M count=1024 status=none
-	mkfs.ext4 -q -F "${img}"
-	dev="$(losetup --find --show "${img}")"
-	mount "${dev}" "${dir}"
-	echo "snapshotter root at ${dir} (loop ext4)"
-}
 
 wait_for() {
 	local name="$1"
@@ -75,6 +56,41 @@ start_daemon() {
 	echo "$!" >"${pidfile}"
 }
 
+# mount_loop_ext4 mounts a fresh loop-backed ext4 filesystem at dir, enabling the
+# fs-verity feature when the third argument is "verity" (which requires a
+# 4096-byte block size). A filesystem already mounted at dir is left as is.
+mount_loop_ext4() {
+	local img="$1" dir="$2" verity="${3:-}"
+	if mountpoint -q "${dir}" 2>/dev/null; then
+		return 0
+	fi
+	local stale dev
+	stale="$(losetup -a 2>/dev/null | grep -F "${img}" | cut -d: -f1 || true)"
+	for dev in ${stale}; do
+		losetup -d "${dev}" 2>/dev/null || true
+	done
+	mkdir -p "${dir}"
+	dd if=/dev/zero of="${img}" bs=1M count="${STORE_SIZE_MB}" status=none
+	if [ -n "${verity}" ]; then
+		mkfs.ext4 -q -F -b 4096 -O verity "${img}"
+	else
+		mkfs.ext4 -q -F "${img}"
+	fi
+	dev="$(losetup --find --show "${img}")"
+	mount "${dev}" "${dir}"
+}
+
+# setup_real_filesystems backs the knarr store and the snapshotter root with real
+# filesystems. fs-verity needs a real backing filesystem the container overlay
+# cannot provide, and the snapshotter's writable composefs overlay upper cannot
+# live on the container's own overlayfs, since overlayfs cannot stack on
+# overlayfs.
+setup_real_filesystems() {
+	mount_loop_ext4 "${KNARR_VERITY_IMG}" "${KNARR_ROOT}" verity
+	mount_loop_ext4 "${CFS_ROOT_IMG}" "${CFS_ROOT}"
+	echo "knarr store at ${KNARR_ROOT} (ext4+verity); snapshotter root at ${CFS_ROOT} (ext4)"
+}
+
 start_runtime_daemons() {
 	mkdir -p \
 		/run/containerd \
@@ -102,7 +118,7 @@ start_runtime_daemons() {
 	wait_for zot curl -fsS "${REGISTRY_URL}/v2/"
 
 	make -C "${ROOT_DIR}" build
-	mount_loop_ext4 "${CFS_ROOT_IMG}" "${CFS_ROOT}"
+	setup_real_filesystems
 	# The snapshotter requires a stand-in rootfs; build the default one when
 	# the caller does not supply a directory.
 	if [ ! -e "${CFS_STUB_ROOTFS}/hello" ] || [ ! -e "${CFS_STUB_ROOTFS}/bin/sh" ]; then
@@ -110,8 +126,9 @@ start_runtime_daemons() {
 	fi
 	rm -f "${CFS_SOCKET}"
 	start_daemon containerd-cfs-grpc "${LOG_DIR}/containerd-cfs-grpc.pid" "${LOG_DIR}/containerd-cfs-grpc.log" \
-		"${CONTAINERD_CFS_GRPC_BIN}" -log-level "${CFS_LOG_LEVEL}" -stub-rootfs "${CFS_STUB_ROOTFS}"
-	printf '%s\n' "${CFS_LOG_LEVEL} ${CFS_STUB_ROOTFS}" >"${CFS_STATE_FILE}"
+		"${CONTAINERD_CFS_GRPC_BIN}" -log-level "${CFS_LOG_LEVEL}" \
+		-stub-rootfs "${CFS_STUB_ROOTFS}" -knarr-root "${KNARR_ROOT}"
+	printf '%s\n' "${CFS_LOG_LEVEL} ${CFS_STUB_ROOTFS} ${KNARR_ROOT}" >"${CFS_STATE_FILE}"
 	wait_for cfs-snapshotter test -S "${CFS_SOCKET}"
 
 	# Enable the built-in erofs snapshotter only when the kernel supports
