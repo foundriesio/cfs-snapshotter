@@ -63,9 +63,36 @@ func NewSnapshotter(ctx context.Context, root string) (snapshots.Snapshotter, er
 	return &snapshotter{root: root, ms: ms}, nil
 }
 
+// optFields renders the snapshot info fields the given opts set. An Opt
+// mutates an Info, so applying the opts to a zero Info exposes exactly what
+// the caller attached — in practice the labels, which carry the
+// remote-snapshotter protocol (the containerd.io/snapshot.ref target and the
+// containerd.io/snapshot/* chain labels) and are otherwise invisible until
+// they land in the metadata store.
+func optFields(opts []snapshots.Opt) log.Fields {
+	var info snapshots.Info
+	for _, opt := range opts {
+		if err := opt(&info); err != nil {
+			return log.Fields{"optserror": err.Error()}
+		}
+	}
+	fields := log.Fields{}
+	if info.Name != "" {
+		fields["optname"] = info.Name
+	}
+	if info.Parent != "" {
+		fields["optparent"] = info.Parent
+	}
+	if len(info.Labels) > 0 {
+		fields["labels"] = info.Labels
+	}
+	return fields
+}
+
 // Stat returns the info for an active or committed snapshot by key. It is used
 // for parent resolution, existence checks, and to discern the snapshot kind.
 func (s *snapshotter) Stat(ctx context.Context, key string) (info snapshots.Info, err error) {
+	log.G(ctx).WithField("key", key).Trace("cfs snapshotter: stat")
 	err = s.ms.WithTransaction(ctx, false, func(ctx context.Context) error {
 		_, info, _, err = storage.GetInfo(ctx, key)
 		return err
@@ -79,6 +106,12 @@ func (s *snapshotter) Stat(ctx context.Context, key string) (info snapshots.Info
 // Update modifies the labels and timestamps of an existing snapshot's info. The
 // fieldpaths, when given, restrict which fields are written.
 func (s *snapshotter) Update(ctx context.Context, info snapshots.Info, fieldpaths ...string) (_ snapshots.Info, err error) {
+	log.G(ctx).WithFields(log.Fields{
+		"name":       info.Name,
+		"kind":       info.Kind,
+		"labels":     info.Labels,
+		"fieldpaths": fieldpaths,
+	}).Trace("cfs snapshotter: update")
 	err = s.ms.WithTransaction(ctx, true, func(ctx context.Context) error {
 		info, err = storage.UpdateInfo(ctx, info, fieldpaths...)
 		return err
@@ -93,6 +126,7 @@ func (s *snapshotter) Update(ctx context.Context, info snapshots.Info, fieldpath
 // snapshot it is measured from the snapshot directory; for a committed snapshot
 // the usage recorded at commit time is returned.
 func (s *snapshotter) Usage(ctx context.Context, key string) (usage snapshots.Usage, err error) {
+	log.G(ctx).WithField("key", key).Trace("cfs snapshotter: usage")
 	var (
 		id   string
 		info snapshots.Info
@@ -117,6 +151,7 @@ func (s *snapshotter) Usage(ctx context.Context, key string) (usage snapshots.Us
 // Mounts returns the mounts for the snapshot identified by key. It can be used
 // to recover the mounts produced by a prior Prepare or View.
 func (s *snapshotter) Mounts(ctx context.Context, key string) (_ []mount.Mount, err error) {
+	log.G(ctx).WithField("key", key).Trace("cfs snapshotter: mounts")
 	var sn storage.Snapshot
 	err = s.ms.WithTransaction(ctx, false, func(ctx context.Context) error {
 		sn, err = storage.GetSnapshot(ctx, key)
@@ -134,18 +169,24 @@ func (s *snapshotter) Mounts(ctx context.Context, key string) (_ []mount.Mount, 
 // Prepare records a new active snapshot under key, descending from parent, and
 // returns its mounts.
 func (s *snapshotter) Prepare(ctx context.Context, key, parent string, opts ...snapshots.Opt) ([]mount.Mount, error) {
+	log.G(ctx).WithFields(log.Fields{"key": key, "parent": parent}).
+		WithFields(optFields(opts)).Trace("cfs snapshotter: prepare")
 	return s.createSnapshot(ctx, snapshots.KindActive, key, parent, opts)
 }
 
 // View records a new read-only snapshot under key, descending from parent, and
 // returns its mounts.
 func (s *snapshotter) View(ctx context.Context, key, parent string, opts ...snapshots.Opt) ([]mount.Mount, error) {
+	log.G(ctx).WithFields(log.Fields{"key": key, "parent": parent}).
+		WithFields(optFields(opts)).Trace("cfs snapshotter: view")
 	return s.createSnapshot(ctx, snapshots.KindView, key, parent, opts)
 }
 
 // Commit moves the active snapshot identified by key to a committed snapshot
 // named name, recording its disk usage.
 func (s *snapshotter) Commit(ctx context.Context, name, key string, opts ...snapshots.Opt) error {
+	log.G(ctx).WithFields(log.Fields{"name": name, "key": key}).
+		WithFields(optFields(opts)).Trace("cfs snapshotter: commit")
 	return s.ms.WithTransaction(ctx, true, func(ctx context.Context) error {
 		id, _, _, err := storage.GetInfo(ctx, key)
 		if err != nil {
@@ -166,6 +207,7 @@ func (s *snapshotter) Commit(ctx context.Context, name, key string, opts ...snap
 // and the snapshot directory. The directory is renamed out of the way inside
 // the transaction so a failure can restore it.
 func (s *snapshotter) Remove(ctx context.Context, key string) (err error) {
+	log.G(ctx).WithField("key", key).Trace("cfs snapshotter: remove")
 	var (
 		renamed, path string
 		restore       bool
@@ -207,6 +249,7 @@ func (s *snapshotter) Remove(ctx context.Context, key string) (err error) {
 
 // Walk invokes fn for each committed snapshot matching the given filters.
 func (s *snapshotter) Walk(ctx context.Context, fn snapshots.WalkFunc, filters ...string) error {
+	log.G(ctx).WithField("filters", filters).Trace("cfs snapshotter: walk")
 	return s.ms.WithTransaction(ctx, false, func(ctx context.Context) error {
 		return storage.WalkInfo(ctx, fn, filters...)
 	})
@@ -297,6 +340,7 @@ func (s *snapshotter) mounts(sn storage.Snapshot) []mount.Mount {
 // Close releases the snapshotter's metadata store. It is safe to call on an
 // already-closed snapshotter.
 func (s *snapshotter) Close() error {
+	log.L.Trace("cfs snapshotter: close")
 	if s.ms == nil {
 		return nil
 	}
