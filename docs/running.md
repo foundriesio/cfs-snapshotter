@@ -7,21 +7,26 @@ daemon (`containerd-cfs-grpc`) that serves the containerd Snapshots gRPC API on 
 unix socket. containerd — and Docker, which uses the same containerd — is pointed
 at it through one `proxy_plugins` entry.
 
-> **Status:** the snapshotter tracks snapshot metadata and lifecycle (prepare,
-> commit, remove) and returns placeholder bind mounts. A pull routed to cfs now
-> completes: containerd extracts the layers into per-snapshot directories and
-> commits them. The mounts are not yet content-addressed composefs mounts and do
-> not compose a snapshot's parent chain, so a pulled image is not yet a usable
-> container rootfs; that materialization lands in a later change.
+> **Status:** the snapshotter is a remote-snapshotter stub. It answers the
+> unpacker's per-layer handshake as if the image content were already present
+> locally, so a pull routed to cfs downloads no layers (`ctr` and `docker`
+> still fetch the image metadata: index, manifest, config, etc.), and it
+> serves every snapshot as one flat overlay whose base layer is a stand-in
+> rootfs (`-stub-rootfs`) — enough to run containers, against stand-in content.
+> Content-addressed composefs mounts of real image content land in a later
+> change.
 
 ## 1. Build and start the daemon
 
 ```sh
 make build
-sudo ./bin/containerd-cfs-grpc &
+sudo ./bin/containerd-cfs-grpc -stub-rootfs <dir> &
 ```
 
-The defaults (socket `/run/containerd-cfs-grpc/containerd-cfs-grpc.sock`, root
+`-stub-rootfs` is required: a read-only directory served as every container's
+base layer in place of real image content (the devcontainer builds one — see
+`.devcontainer/scripts/make-stub-rootfs.sh`). The other defaults (socket
+`/run/containerd-cfs-grpc/containerd-cfs-grpc.sock`, root
 `/var/lib/containerd-cfs-grpc`) match the config below. See `-help` for flags.
 
 ## 2. Configure containerd
@@ -76,10 +81,12 @@ sudo ctr image pull --snapshotter cfs docker.io/library/busybox:latest
 docker pull busybox
 ```
 
-Both fetch the image and unpack it through cfs: the snapshotter records the
-prepare/commit lifecycle and returns placeholder bind mounts that containerd
-extracts the layers into. `ctr snapshots --snapshotter cfs ls` then lists the
-committed snapshots, confirming both clients reached cfs through the proxy.
+Both complete through cfs with zero layer downloads — only the image
+metadata (index, manifest, config, etc.) is fetched: the snapshotter answers the
+unpacker's per-layer handshake as if the layer chain were already present
+locally. `ctr snapshots --snapshotter cfs ls` then lists the committed chain
+snapshots, confirming both clients reached cfs through the proxy, and
+`docker run` serves the stand-in rootfs.
 
 ## Quick test without editing config
 

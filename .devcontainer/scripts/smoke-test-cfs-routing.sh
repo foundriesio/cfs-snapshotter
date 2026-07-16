@@ -64,6 +64,32 @@ require_stub_commits() {
 	echo "handshakes were answered from the stub (zero layer fetch)"
 }
 
+require_stub_run() {
+	local out
+	if ! out="$(docker run --rm "${SMOKE_IMAGE}" /hello)"; then
+		echo "docker run through the stub rootfs failed" >&2
+		return 1
+	fi
+	if [ "${out}" != "hello from the cfs stub rootfs" ]; then
+		echo "docker run output ${out@Q}, want the stub rootfs greeting" >&2
+		return 1
+	fi
+	echo "docker run executed the stand-in rootfs end to end"
+}
+
+require_stub_shell_default() {
+	local out
+	if ! out="$(docker run --rm "${SMOKE_IMAGE}" /bin/sh)"; then
+		echo "docker run via a shell default path failed" >&2
+		return 1
+	fi
+	if [ "${out}" != "hello from the cfs stub rootfs" ]; then
+		echo "shell-path run output ${out@Q}, want the stub rootfs greeting" >&2
+		return 1
+	fi
+	echo "shell default paths resolve to the greeter"
+}
+
 trust_workspace() {
 	git config --global --add safe.directory "${ROOT_DIR}" || true
 }
@@ -89,8 +115,10 @@ main() {
 	expect_pull_succeeds "docker pull" /tmp/cfs-docker-pull.log \
 		docker pull "${SMOKE_IMAGE}"
 	require_stub_commits
+	require_stub_run
+	require_stub_shell_default
 
-	echo "future backend check: the handshake answers are a stub committing metadata-only records and the container rootfs is still a placeholder bind; composefs materialization from a knarr store replaces both, after which 'docker run --rm ${SMOKE_IMAGE} true' serves real image content"
+	echo "future backend check: the handshake answers and the container rootfs are a stub; composefs materialization from a knarr store replaces both, after which 'docker run' serves real image content"
 }
 
 main "$@"

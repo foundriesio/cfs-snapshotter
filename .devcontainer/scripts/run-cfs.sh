@@ -13,6 +13,8 @@ CONTAINERD_CFS_GRPC_BIN="${ROOT_DIR}/bin/containerd-cfs-grpc"
 CFS_SOCKET=/run/containerd-cfs-grpc/containerd-cfs-grpc.sock
 CONTAINERD_SOCKET=/run/containerd/containerd.sock
 CFS_LOG_LEVEL="${CFS_LOG_LEVEL:-trace}"
+CFS_ROOT=/var/lib/containerd-cfs-grpc
+CFS_ROOT_IMG=/var/tmp/cfs-root.img
 CFS_PIDFILE="${LOG_DIR}/containerd-cfs-grpc.pid"
 CFS_LOGFILE="${LOG_DIR}/containerd-cfs-grpc.log"
 CFS_STATE_FILE="${LOG_DIR}/containerd-cfs-grpc.env"
@@ -124,6 +126,29 @@ restart_containerd_for_proxy_registration() {
 	wait_for containerd ctr --address "${CONTAINERD_SOCKET}" version
 }
 
+
+# mount_loop_ext4 mounts a fresh loop-backed ext4 filesystem at dir, so overlay
+# upper and work directories live on a real filesystem: the snapshotter's
+# overlay uppers cannot live on the container's own overlayfs, since overlayfs
+# cannot stack on overlayfs. A filesystem already mounted at dir is left as is.
+mount_loop_ext4() {
+	local img="$1" dir="$2"
+	if mountpoint -q "${dir}" 2>/dev/null; then
+		return 0
+	fi
+	local stale dev
+	stale="$(losetup -a 2>/dev/null | grep -F "${img}" | cut -d: -f1 || true)"
+	for dev in ${stale}; do
+		losetup -d "${dev}" 2>/dev/null || true
+	done
+	mkdir -p "${dir}"
+	dd if=/dev/zero of="${img}" bs=1M count=1024 status=none
+	mkfs.ext4 -q -F "${img}"
+	dev="$(losetup --find --show "${img}")"
+	mount "${dev}" "${dir}"
+	echo "snapshotter root at ${dir} (loop ext4)"
+}
+
 main() {
 	require_root
 
@@ -136,9 +161,17 @@ main() {
 		"${LOG_DIR}"
 
 	git config --global --add safe.directory "${ROOT_DIR}" || true
-	local old_hash new_hash old_log_level
+	mount_loop_ext4 "${CFS_ROOT_IMG}" "${CFS_ROOT}"
+	local old_hash new_hash old_state new_state
+	# The snapshotter requires a stand-in rootfs; build the default one when
+	# the caller does not supply a directory.
+	local stub_rootfs="${CFS_STUB_ROOTFS:-/tmp/cfs-stub-rootfs}"
+	if [ ! -e "${stub_rootfs}/hello" ] || [ ! -e "${stub_rootfs}/bin/sh" ]; then
+		"${ROOT_DIR}/.devcontainer/scripts/make-stub-rootfs.sh" "${stub_rootfs}"
+	fi
+	new_state="${CFS_LOG_LEVEL} ${stub_rootfs}"
 	old_hash="$(file_hash "${CONTAINERD_CFS_GRPC_BIN}")"
-	old_log_level="$(cat "${CFS_STATE_FILE}" 2>/dev/null || true)"
+	old_state="$(cat "${CFS_STATE_FILE}" 2>/dev/null || true)"
 	make -C "${ROOT_DIR}" build
 	new_hash="$(file_hash "${CONTAINERD_CFS_GRPC_BIN}")"
 
@@ -146,15 +179,16 @@ main() {
 		[ -S "${CFS_SOCKET}" ] &&
 		[ "${CFS_FORCE_RESTART:-0}" != "1" ] &&
 		[ "${old_hash}" = "${new_hash}" ] &&
-		[ "${old_log_level}" = "${CFS_LOG_LEVEL}" ]; then
+		[ "${old_state}" = "${new_state}" ]; then
 		echo "cfs snapshotter binary unchanged; keeping pid $(cat "${CFS_PIDFILE}")"
 	else
 		restart_daemon containerd-cfs-grpc \
 			"${CFS_PIDFILE}" \
 			"${CFS_SOCKET}" \
 			"${CFS_LOGFILE}" \
-			"${CONTAINERD_CFS_GRPC_BIN}" -log-level "${CFS_LOG_LEVEL}"
-		printf '%s\n' "${CFS_LOG_LEVEL}" >"${CFS_STATE_FILE}"
+			"${CONTAINERD_CFS_GRPC_BIN}" -log-level "${CFS_LOG_LEVEL}" \
+			-stub-rootfs "${stub_rootfs}"
+		printf '%s\n' "${new_state}" >"${CFS_STATE_FILE}"
 	fi
 	wait_for cfs-snapshotter test -S "${CFS_SOCKET}"
 

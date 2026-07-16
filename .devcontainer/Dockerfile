@@ -23,6 +23,7 @@ RUN set -eux; \
     apt-get install -y --no-install-recommends \
         ca-certificates \
         curl \
+        e2fsprogs \
         fuse3 \
         git \
         iproute2 \

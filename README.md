@@ -5,9 +5,13 @@ container rootfs from content-addressed, composefs-backed storage — using
 **composefs + EROFS + fs-verity** to mount a container's filesystem with a single
 `mount` syscall instead of unpacking and stacking layers.
 
-> **Status: early development.** The snapshotter skeleton builds and runs as a
-> containerd proxy snapshotter, but its methods are currently stubs that return
-> `not implemented`; the composefs/CAS backend lands in a later change.
+> **Status: early development.** The snapshotter runs as a remote-snapshotter
+> stub covering the full lifecycle: pulls routed to cfs download no layers
+> (`ctr` and `docker` still fetch the image metadata: index, manifest,
+> config, etc.),
+> and `docker run` serves a stand-in rootfs in place of image content. The
+> composefs/CAS backend that mounts real image content lands in a later
+> change.
 
 ## Build and run
 
@@ -40,8 +44,9 @@ installed from distribution packages.
   in an already-running session.
 
 Inside the container, `make run-cfs` rebuilds and restarts the snapshotter after
-editing code, and `make test-smoke` checks that `ctr` and Docker pulls route to
-cfs. See [docs/devcontainer.md](docs/devcontainer.md) for the full workflow.
+editing code, and `make test-smoke` verifies the stub end to end — pulls route
+to cfs with zero layer fetches and `docker run` executes the stand-in rootfs.
+See [docs/devcontainer.md](docs/devcontainer.md) for the full workflow.
 
 ## Contributing
 
