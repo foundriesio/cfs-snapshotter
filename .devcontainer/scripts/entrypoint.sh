@@ -13,8 +13,34 @@ CONTAINERD_CFS_GRPC_BIN="${ROOT_DIR}/bin/containerd-cfs-grpc"
 CFS_SOCKET=/run/containerd-cfs-grpc/containerd-cfs-grpc.sock
 CONTAINERD_SOCKET=/run/containerd/containerd.sock
 CFS_LOG_LEVEL="${CFS_LOG_LEVEL:-trace}"
+CFS_STUB_ROOTFS="${CFS_STUB_ROOTFS:-/tmp/cfs-stub-rootfs}"
+CFS_ROOT=/var/lib/containerd-cfs-grpc
+CFS_ROOT_IMG=/var/tmp/cfs-root.img
 CFS_STATE_FILE="${LOG_DIR}/containerd-cfs-grpc.env"
 REGISTRY_URL=http://127.0.0.1:5000
+
+
+# mount_loop_ext4 mounts a fresh loop-backed ext4 filesystem at dir, so overlay
+# upper and work directories live on a real filesystem: the snapshotter's
+# overlay uppers cannot live on the container's own overlayfs, since overlayfs
+# cannot stack on overlayfs. A filesystem already mounted at dir is left as is.
+mount_loop_ext4() {
+	local img="$1" dir="$2"
+	if mountpoint -q "${dir}" 2>/dev/null; then
+		return 0
+	fi
+	local stale dev
+	stale="$(losetup -a 2>/dev/null | grep -F "${img}" | cut -d: -f1 || true)"
+	for dev in ${stale}; do
+		losetup -d "${dev}" 2>/dev/null || true
+	done
+	mkdir -p "${dir}"
+	dd if=/dev/zero of="${img}" bs=1M count=1024 status=none
+	mkfs.ext4 -q -F "${img}"
+	dev="$(losetup --find --show "${img}")"
+	mount "${dev}" "${dir}"
+	echo "snapshotter root at ${dir} (loop ext4)"
+}
 
 wait_for() {
 	local name="$1"
@@ -74,10 +100,16 @@ start_runtime_daemons() {
 	wait_for zot curl -fsS "${REGISTRY_URL}/v2/"
 
 	make -C "${ROOT_DIR}" build
+	mount_loop_ext4 "${CFS_ROOT_IMG}" "${CFS_ROOT}"
+	# The snapshotter requires a stand-in rootfs; build the default one when
+	# the caller does not supply a directory.
+	if [ ! -e "${CFS_STUB_ROOTFS}/hello" ] || [ ! -e "${CFS_STUB_ROOTFS}/bin/sh" ]; then
+		"${ROOT_DIR}/.devcontainer/scripts/make-stub-rootfs.sh" "${CFS_STUB_ROOTFS}"
+	fi
 	rm -f "${CFS_SOCKET}"
 	start_daemon containerd-cfs-grpc "${LOG_DIR}/containerd-cfs-grpc.pid" "${LOG_DIR}/containerd-cfs-grpc.log" \
-		"${CONTAINERD_CFS_GRPC_BIN}" -log-level "${CFS_LOG_LEVEL}"
-	printf '%s\n' "${CFS_LOG_LEVEL}" >"${CFS_STATE_FILE}"
+		"${CONTAINERD_CFS_GRPC_BIN}" -log-level "${CFS_LOG_LEVEL}" -stub-rootfs "${CFS_STUB_ROOTFS}"
+	printf '%s\n' "${CFS_LOG_LEVEL} ${CFS_STUB_ROOTFS}" >"${CFS_STATE_FILE}"
 	wait_for cfs-snapshotter test -S "${CFS_SOCKET}"
 
 	start_daemon containerd "${LOG_DIR}/containerd.pid" "${LOG_DIR}/containerd.log" \
