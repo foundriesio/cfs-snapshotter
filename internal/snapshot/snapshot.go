@@ -5,10 +5,13 @@
 // snapshotter.
 //
 // Snapshot metadata and lifecycle state live in a bolt-backed metadata store
-// under the root; each snapshot also owns a directory under root/snapshots. The
-// filesystem a snapshot mount exposes is a placeholder bind of that directory:
-// content-addressed composefs materialization replaces mounts and the
-// create-time directory step in a later change.
+// under the root; each directory-backed snapshot also owns a directory under
+// root/snapshots. The filesystem a snapshot mount exposes is a placeholder
+// bind of that directory: content-addressed composefs materialization
+// replaces mounts and the create-time directory step in a later change. Until
+// then the implementation is a remote-snapshotter stub: every unpack
+// handshake is answered as if the content were already present locally (see
+// the calling contract below).
 //
 // # Calling contract
 //
@@ -29,12 +32,15 @@
 //
 // The snapshot.ref label marks a Prepare as this handshake: it names the
 // committed snapshot the unpacker actually wants. A snapshotter that can
-// produce that snapshot without the caller fetching anything may answer
-// ErrAlreadyExists, which skips the fetch/apply/Commit round for that layer;
-// this placeholder implementation always takes the fetch path. Committed
-// layer snapshots are always named by the cumulative chainID of layers 1..i,
-// never by a single layer's digest, so the last handshake of a pull carries
-// the whole image's chainID.
+// produce that snapshot without the caller fetching anything answers
+// ErrAlreadyExists, which skips the fetch/apply/Commit round for that layer.
+// This implementation always answers that way — it is a stub of the remote
+// path: the committed records carry no image content, so the pull completes
+// with zero layer fetches and nothing stands behind the chain. Materializing
+// the real image content behind the handshake is what replaces this stub.
+// Committed layer snapshots are always named by the cumulative chainID of
+// layers 1..i, never by a single layer's digest, so the last handshake of a
+// pull carries the whole image's chainID.
 //
 // Container creation (the docker daemon, via containerd) prepares two
 // snapshots on top of the image's full chain:
@@ -69,6 +75,14 @@ import (
 
 	"github.com/containerd/continuity/fs"
 )
+
+// intermediateSnapshotLabel marks a Prepare call as the unpack handshake: its
+// value is the name (a cumulative chainID) under which the caller wants the
+// layer chain to exist as a committed snapshot. Such snapshots are
+// intermediate — they are only ever parents of other snapshots, never mounted
+// themselves — and virtual: pure metadata records with no directory behind
+// them.
+const intermediateSnapshotLabel = "containerd.io/snapshot.ref"
 
 // mountType and defaultMountOptions describe the placeholder mount returned for
 // a snapshot until composefs materialization lands.
@@ -110,7 +124,7 @@ func NewSnapshotter(ctx context.Context, root string) (snapshots.Snapshotter, er
 // optFields renders the snapshot info fields the given opts set. An Opt
 // mutates an Info, so applying the opts to a zero Info exposes exactly what
 // the caller attached — in practice the labels, which carry the
-// remote-snapshotter protocol (the containerd.io/snapshot.ref target and the
+// remote-snapshotter protocol (the containerd.io/snapshot.ref name and the
 // containerd.io/snapshot/* chain labels) and are otherwise invisible until
 // they land in the metadata store.
 func optFields(opts []snapshots.Opt) log.Fields {
@@ -225,12 +239,69 @@ func (s *snapshotter) Mounts(ctx context.Context, key string) (_ []mount.Mount, 
 // the unpacker's per-layer handshake (snapshot.ref label present, extract key,
 // mounts used only to apply one layer tar) and real writable snapshots — the
 // docker init layer and the container rootfs (no snapshot.ref, mounts actually
-// executed). This implementation serves both identically from the placeholder
-// bind; a remote fast path would branch on the label.
+// executed). The snapshot.ref label decides the shape of the work: a
+// handshake asks for an intermediate snapshot, which needs only a metadata
+// record — created and committed virtually in one transaction, no snapshot
+// directory ever provisioned — and is answered with ErrAlreadyExists instead
+// of mounts. Everything else gets a directory-backed active snapshot served
+// from the placeholder bind.
 func (s *snapshotter) Prepare(ctx context.Context, key, parent string, opts ...snapshots.Opt) ([]mount.Mount, error) {
 	log.G(ctx).WithFields(log.Fields{"key": key, "parent": parent}).
 		WithFields(optFields(opts)).Trace("cfs snapshotter: prepare")
+	var base snapshots.Info
+	for _, opt := range opts {
+		if err := opt(&base); err != nil {
+			return nil, fmt.Errorf("prepare options: %w", err)
+		}
+	}
+
+	if name, ok := base.Labels[intermediateSnapshotLabel]; ok {
+		// This Prepare is one step of the image-unpack handshake: while a
+		// pull walks the layers bottom-up, the unpacker prepares a throwaway
+		// snapshot per layer, labeled with the name (the cumulative chainID)
+		// it wants that layer chain to exist under, before fetching the
+		// layer. Committing the intermediate virtual snapshot under that name
+		// and answering ErrAlreadyExists tells the caller the chain is
+		// already present locally: it skips the layer's fetch, apply, and
+		// commit, and moves on to the next layer — the nil mounts are never
+		// looked at. This answer, repeated per layer, is how a pull completes
+		// with zero layer downloads against pre-fetched content.
+		return nil, s.createAndCommitIntermediateVirtualSnapshot(ctx, key, parent, name, base.Labels, opts)
+	}
+
 	return s.createSnapshot(ctx, snapshots.KindActive, key, parent, opts)
+}
+
+// createAndCommitIntermediateVirtualSnapshot answers the unpack handshake:
+// the intermediate snapshot the caller asks about is recorded as pure
+// metadata — the active snapshot and its commit under the requested name,
+// with the caller's labels and zero usage, in a single transaction — and
+// ErrAlreadyExists is reported so the caller skips fetching and applying the
+// layer. The snapshot is virtual: nothing ever mounts an intermediate
+// snapshot, so no directory is provisioned for it, and a concurrent handshake
+// that loses the commit race is rolled back whole, leaving no record to clean
+// up. In this stub the record only claims the layer chain exists — no content
+// stands behind it; the replacement of the stub verifies the content is
+// really present locally before answering.
+func (s *snapshotter) createAndCommitIntermediateVirtualSnapshot(ctx context.Context, key, parent, name string, labels map[string]string, opts []snapshots.Opt) error {
+	err := s.ms.WithTransaction(ctx, true, func(ctx context.Context) error {
+		if _, err := storage.CreateSnapshot(ctx, snapshots.KindActive, key, parent, opts...); err != nil {
+			return fmt.Errorf("create intermediate snapshot %q: %w", name, err)
+		}
+		if _, err := storage.CommitActive(ctx, key, name, snapshots.Usage{}, append(opts, snapshots.WithLabels(labels))...); err != nil {
+			return fmt.Errorf("commit intermediate snapshot %q: %w", name, err)
+		}
+		return nil
+	})
+	if err != nil && !errdefs.IsAlreadyExists(err) {
+		return err
+	}
+	log.G(ctx).WithFields(log.Fields{
+		"key":    key,
+		"name":   name,
+		"parent": parent,
+	}).Info("stub-committed intermediate virtual snapshot")
+	return fmt.Errorf("intermediate virtual snapshot %q: %w", name, errdefs.ErrAlreadyExists)
 }
 
 // View records a new read-only snapshot under key, descending from parent, and

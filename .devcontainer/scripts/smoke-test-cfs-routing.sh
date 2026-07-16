@@ -56,6 +56,14 @@ require_cfs_snapshots() {
 	echo "cfs recorded committed snapshots"
 }
 
+require_stub_commits() {
+	if ! grep -q 'stub-committed intermediate virtual snapshot' /var/log/cfs-devcontainer/containerd-cfs-grpc.log; then
+		echo "the daemon log records no stub-committed intermediate snapshots" >&2
+		return 1
+	fi
+	echo "handshakes were answered from the stub (zero layer fetch)"
+}
+
 trust_workspace() {
 	git config --global --add safe.directory "${ROOT_DIR}" || true
 }
@@ -80,8 +88,9 @@ main() {
 	require_cfs_snapshots
 	expect_pull_succeeds "docker pull" /tmp/cfs-docker-pull.log \
 		docker pull "${SMOKE_IMAGE}"
+	require_stub_commits
 
-	echo "future backend check: the pulled snapshots are placeholder bind mounts; composefs rootfs and 'docker run --rm ${SMOKE_IMAGE} true' land once mount materialization is implemented"
+	echo "future backend check: the handshake answers are a stub committing metadata-only records and the container rootfs is still a placeholder bind; composefs materialization from a knarr store replaces both, after which 'docker run --rm ${SMOKE_IMAGE} true' serves real image content"
 }
 
 main "$@"
