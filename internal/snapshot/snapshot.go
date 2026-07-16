@@ -9,6 +9,50 @@
 // filesystem a snapshot mount exposes is a placeholder bind of that directory:
 // content-addressed composefs materialization replaces mounts and the
 // create-time directory step in a later change.
+//
+// # Calling contract
+//
+// Two callers drive this interface, distinguishable by request shape.
+//
+// Image unpack (containerd's unpacker, on behalf of an image pull) walks the
+// layers bottom-up. For each layer i it asks whether the cumulative chain
+// 1..i already exists as a committed snapshot and, if not, prepares and
+// populates it:
+//
+//	Stat(chainID(1..i))                              -> ErrNotFound
+//	Prepare(key="<ns>/extract-<rnd> <chainID(1..i)>",
+//	        parent=chainID(1..i-1),
+//	        labels["containerd.io/snapshot.ref"]=chainID(1..i))
+//	  ... the caller fetches and applies the layer tar into the mounts ...
+//	Commit(name=chainID(1..i), key=<the extract key>)
+//	Stat(chainID(1..i))                              -> confirmation
+//
+// The snapshot.ref label marks a Prepare as this handshake: it names the
+// committed snapshot the unpacker actually wants. A snapshotter that can
+// produce that snapshot without the caller fetching anything may answer
+// ErrAlreadyExists, which skips the fetch/apply/Commit round for that layer;
+// this placeholder implementation always takes the fetch path. Committed
+// layer snapshots are always named by the cumulative chainID of layers 1..i,
+// never by a single layer's digest, so the last handshake of a pull carries
+// the whole image's chainID.
+//
+// Container creation (the docker daemon, via containerd) prepares two
+// snapshots on top of the image's full chain:
+//
+//	Prepare(key=<id>-init, parent=chainID(1..n))     -> mounts
+//	  ... docker seeds runtime files: /etc/hostname, /etc/hosts, ... ...
+//	Commit(name=<id>-init, key=<id>-init)
+//	Prepare(key=<id>, parent=<id>-init)              -> the rootfs mounts
+//
+// The committed init layer keeps those runtime files out of both the image
+// and the container's own diff. Neither call carries snapshot.ref: the
+// absence of that label is what separates a snapshot somebody will mount and
+// write to from unpack bookkeeping.
+//
+// Around both flows, Stat, Usage, and Walk serve size accounting,
+// parent-chain resolution, and the metadata garbage collector — Stat in
+// particular fires repeatedly per committed name — and Remove tears
+// snapshots down children-first.
 package snapshot
 
 import (
@@ -89,8 +133,12 @@ func optFields(opts []snapshots.Opt) log.Fields {
 	return fields
 }
 
-// Stat returns the info for an active or committed snapshot by key. It is used
-// for parent resolution, existence checks, and to discern the snapshot kind.
+// Stat returns the info for an active or committed snapshot by key. It is the
+// hottest read on the interface: the unpacker probes each chainID before its
+// Prepare handshake and confirms it after, usage accounting re-resolves every
+// chain member, and any parent-chain walk re-Stats each ancestor — so one
+// committed name is Stat'd many times over its life. It must stay a cheap
+// metadata lookup.
 func (s *snapshotter) Stat(ctx context.Context, key string) (info snapshots.Info, err error) {
 	log.G(ctx).WithField("key", key).Trace("cfs snapshotter: stat")
 	err = s.ms.WithTransaction(ctx, false, func(ctx context.Context) error {
@@ -104,7 +152,9 @@ func (s *snapshotter) Stat(ctx context.Context, key string) (info snapshots.Info
 }
 
 // Update modifies the labels and timestamps of an existing snapshot's info. The
-// fieldpaths, when given, restrict which fields are written.
+// fieldpaths, when given, restrict which fields are written. In practice the
+// caller is containerd's garbage collector flipping retention labels
+// (containerd.io/gc.*) on committed snapshots.
 func (s *snapshotter) Update(ctx context.Context, info snapshots.Info, fieldpaths ...string) (_ snapshots.Info, err error) {
 	log.G(ctx).WithFields(log.Fields{
 		"name":       info.Name,
@@ -124,7 +174,9 @@ func (s *snapshotter) Update(ctx context.Context, info snapshots.Info, fieldpath
 
 // Usage reports the disk usage of the snapshot identified by key. For an active
 // snapshot it is measured from the snapshot directory; for a committed snapshot
-// the usage recorded at commit time is returned.
+// the usage recorded at commit time is returned. After an unpack the caller
+// queries every member of the image's chain in turn to price the image, so a
+// Usage(chainID)+Stat(chainID) pair per layer is the normal post-pull pattern.
 func (s *snapshotter) Usage(ctx context.Context, key string) (usage snapshots.Usage, err error) {
 	log.G(ctx).WithField("key", key).Trace("cfs snapshotter: usage")
 	var (
@@ -148,8 +200,10 @@ func (s *snapshotter) Usage(ctx context.Context, key string) (usage snapshots.Us
 	return usage, nil
 }
 
-// Mounts returns the mounts for the snapshot identified by key. It can be used
-// to recover the mounts produced by a prior Prepare or View.
+// Mounts returns the mounts for the snapshot identified by key. Consumers
+// re-fetch mount specs rather than caching what Prepare returned — a runtime
+// typically calls Mounts just before starting a container — so the specs must
+// stay reproducible for the lifetime of the snapshot.
 func (s *snapshotter) Mounts(ctx context.Context, key string) (_ []mount.Mount, err error) {
 	log.G(ctx).WithField("key", key).Trace("cfs snapshotter: mounts")
 	var sn storage.Snapshot
@@ -167,7 +221,12 @@ func (s *snapshotter) Mounts(ctx context.Context, key string) (_ []mount.Mount, 
 }
 
 // Prepare records a new active snapshot under key, descending from parent, and
-// returns its mounts.
+// returns its mounts. Both call shapes from the package contract land here:
+// the unpacker's per-layer handshake (snapshot.ref label present, extract key,
+// mounts used only to apply one layer tar) and real writable snapshots — the
+// docker init layer and the container rootfs (no snapshot.ref, mounts actually
+// executed). This implementation serves both identically from the placeholder
+// bind; a remote fast path would branch on the label.
 func (s *snapshotter) Prepare(ctx context.Context, key, parent string, opts ...snapshots.Opt) ([]mount.Mount, error) {
 	log.G(ctx).WithFields(log.Fields{"key": key, "parent": parent}).
 		WithFields(optFields(opts)).Trace("cfs snapshotter: prepare")
@@ -175,7 +234,9 @@ func (s *snapshotter) Prepare(ctx context.Context, key, parent string, opts ...s
 }
 
 // View records a new read-only snapshot under key, descending from parent, and
-// returns its mounts.
+// returns its mounts. Views are how a caller inspects committed content
+// without creating a writable layer — containerd's differ and image export
+// use them; the container flows never do.
 func (s *snapshotter) View(ctx context.Context, key, parent string, opts ...snapshots.Opt) ([]mount.Mount, error) {
 	log.G(ctx).WithFields(log.Fields{"key": key, "parent": parent}).
 		WithFields(optFields(opts)).Trace("cfs snapshotter: view")
@@ -183,7 +244,11 @@ func (s *snapshotter) View(ctx context.Context, key, parent string, opts ...snap
 }
 
 // Commit moves the active snapshot identified by key to a committed snapshot
-// named name, recording its disk usage.
+// named name, recording its disk usage. The name encodes who is committing:
+// the unpacker commits an applied layer under its cumulative chainID, and the
+// docker daemon commits the seeded init layer under <container-id>-init so it
+// can parent the container rootfs on it. A committed snapshot is immutable
+// and exists to be a parent.
 func (s *snapshotter) Commit(ctx context.Context, name, key string, opts ...snapshots.Opt) error {
 	log.G(ctx).WithFields(log.Fields{"name": name, "key": key}).
 		WithFields(optFields(opts)).Trace("cfs snapshotter: commit")
@@ -205,7 +270,10 @@ func (s *snapshotter) Commit(ctx context.Context, name, key string, opts ...snap
 
 // Remove abandons the snapshot identified by key, dropping its metadata record
 // and the snapshot directory. The directory is renamed out of the way inside
-// the transaction so a failure can restore it.
+// the transaction so a failure can restore it. Removal is driven by
+// containerd's garbage collector children-first — a container's rootfs
+// snapshot goes before its init layer, and image chains unwind leaf-first
+// once no image references them.
 func (s *snapshotter) Remove(ctx context.Context, key string) (err error) {
 	log.G(ctx).WithField("key", key).Trace("cfs snapshotter: remove")
 	var (
@@ -247,7 +315,10 @@ func (s *snapshotter) Remove(ctx context.Context, key string) (err error) {
 	return nil
 }
 
-// Walk invokes fn for each committed snapshot matching the given filters.
+// Walk invokes fn for each committed snapshot matching the given filters. The
+// garbage collector uses it to enumerate what exists, so everything recorded
+// in the metadata store — including bookkeeping snapshots — must surface here
+// or it leaks.
 func (s *snapshotter) Walk(ctx context.Context, fn snapshots.WalkFunc, filters ...string) error {
 	log.G(ctx).WithField("filters", filters).Trace("cfs snapshotter: walk")
 	return s.ms.WithTransaction(ctx, false, func(ctx context.Context) error {
