@@ -12,6 +12,19 @@ import (
 	"github.com/containerd/errdefs"
 )
 
+func TestOptFieldsExposesLabels(t *testing.T) {
+	fields := optFields([]snapshots.Opt{snapshots.WithLabels(map[string]string{
+		"containerd.io/snapshot.ref": "sha256:abc",
+	})})
+	labels, ok := fields["labels"].(map[string]string)
+	if !ok || labels["containerd.io/snapshot.ref"] != "sha256:abc" {
+		t.Fatalf("optFields labels = %#v, want the attached label", fields["labels"])
+	}
+	if len(optFields(nil)) != 0 {
+		t.Fatalf("optFields(nil) = %#v, want empty", optFields(nil))
+	}
+}
+
 func TestNewSnapshotterRejectsEmptyRoot(t *testing.T) {
 	if _, err := NewSnapshotter(context.Background(), ""); !errdefs.IsInvalidArgument(err) {
 		t.Fatalf("NewSnapshotter(%q) error = %v, want invalid argument", "", err)
