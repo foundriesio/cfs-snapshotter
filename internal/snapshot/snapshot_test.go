@@ -258,3 +258,67 @@ func TestPersistence(t *testing.T) {
 		t.Fatalf("Stat(committed).Kind after reopen = %v, want %v", info.Kind, snapshots.KindCommitted)
 	}
 }
+
+// TestPrepareIntermediateSnapshotAnswersAlreadyExists exercises the unpack
+// handshake: a Prepare carrying the snapshot.ref label must be answered with
+// ErrAlreadyExists after committing an intermediate virtual snapshot under
+// the requested name with the caller's labels, a repeat handshake must not
+// leave an orphan active snapshot behind, and a Prepare without the label
+// must keep taking the normal mount path.
+func TestPrepareIntermediateSnapshotAnswersAlreadyExists(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	sn, err := NewSnapshotter(ctx, root)
+	if err != nil {
+		t.Fatalf("NewSnapshotter() error = %v", err)
+	}
+	defer func() {
+		if err := sn.Close(); err != nil {
+			t.Errorf("Close() error = %v", err)
+		}
+	}()
+
+	const name = "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+	labels := map[string]string{
+		"containerd.io/snapshot.ref": name,
+		"other":                      "kept",
+	}
+	if _, err := sn.Prepare(ctx, "extract-1 "+name, "", snapshots.WithLabels(labels)); !errdefs.IsAlreadyExists(err) {
+		t.Fatalf("handshake Prepare error = %v, want already exists", err)
+	}
+	info, err := sn.Stat(ctx, name)
+	if err != nil {
+		t.Fatalf("Stat(%q) error = %v", name, err)
+	}
+	if info.Kind != snapshots.KindCommitted || info.Labels["other"] != "kept" {
+		t.Fatalf("intermediate snapshot info = %+v, want committed with caller labels", info)
+	}
+
+	// A repeat handshake for the same name must also answer already-exists
+	// and must not leak its temporary active snapshot.
+	if _, err := sn.Prepare(ctx, "extract-2 "+name, "", snapshots.WithLabels(labels)); !errdefs.IsAlreadyExists(err) {
+		t.Fatalf("repeat handshake Prepare error = %v, want already exists", err)
+	}
+	if _, err := sn.Stat(ctx, "extract-2 "+name); !errdefs.IsNotFound(err) {
+		t.Fatalf("superseded active snapshot error = %v, want not found", err)
+	}
+
+	// Handshake records are metadata-only: no snapshot directory may have
+	// been provisioned for them.
+	entries, err := os.ReadDir(root + "/snapshots")
+	if err != nil {
+		t.Fatalf("read snapshots dir: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("snapshots dir has %d entries after handshakes, want none", len(entries))
+	}
+
+	// Without the label the stub must stay out of the way.
+	mounts, err := sn.Prepare(ctx, "container-1", name)
+	if err != nil {
+		t.Fatalf("plain Prepare error = %v", err)
+	}
+	if len(mounts) == 0 {
+		t.Fatal("plain Prepare returned no mounts")
+	}
+}
