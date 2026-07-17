@@ -10,6 +10,8 @@ snapshotter against a nested, version-pinned runtime stack:
 - Upstream runc.
 - CNI plugins.
 - Zot, used as a local test registry on `127.0.0.1:5000`.
+- erofs-utils built from source (Debian's package predates the tar mode that
+  containerd's built-in erofs snapshotter needs).
 - The locally built `bin/containerd-cfs-grpc`.
 
 The container is intentionally for development and conformance-style wiring
@@ -44,6 +46,7 @@ arguments:
     "RUNC_VERSION": "1.3.3",
     "CNI_PLUGINS_VERSION": "1.8.0",
     "ZOT_VERSION": "2.1.17",
+    "EROFS_UTILS_VERSION": "1.9.2",
     "GOLANGCI_LINT_VERSION": "2.6.2"
   }
 }
@@ -57,6 +60,7 @@ Reference release locations:
 - Docker static binaries: <https://docs.docker.com/engine/install/binaries/>
 - containerd release assets: <https://github.com/containerd/containerd/releases>
 - Zot release assets: <https://github.com/project-zot/zot/releases>
+- erofs-utils release tags: <https://github.com/erofs/erofs-utils/tags>
 
 ## Startup
 
@@ -148,6 +152,28 @@ instead, so the container and its overlay mount stay up for inspection from the
 host. See
 [docs/running.md](running.md#inspecting-a-running-container-devcontainer-stub)
 for the full example.
+
+## Comparing Against The erofs Snapshotter
+
+containerd's built-in erofs snapshotter is wired up as a reference point: it
+converts each layer to an EROFS blob at unpack time and mounts the result,
+which makes it a useful side-by-side comparison for cfs's snapshot and mount
+shapes. Ask for it explicitly (the devcontainer default is cfs):
+
+```sh
+ctr image pull --snapshotter=erofs docker.io/library/busybox:latest
+ctr run --rm --snapshotter=erofs docker.io/library/busybox:latest erofs-demo echo hello
+ctr snapshots --snapshotter erofs ls
+```
+
+Unlike cfs, these pulls download the layers: the erofs snapshotter is a local
+snapshotter, not a remote one, so no unpack handshake is answered and the
+transfer service fetches and converts every layer.
+
+This needs EROFS support in the host kernel. The entrypoint enables the erofs
+snapshotter only when `/proc/filesystems` lists erofs; on hosts without it
+(CI runners included) it prints a notice and leaves erofs out, and cfs is
+unaffected either way.
 
 ## Shutdown And Cleanup
 

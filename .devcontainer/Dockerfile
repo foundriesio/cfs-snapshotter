@@ -10,6 +10,7 @@ ARG CONTAINERD_VERSION=2.2.2
 ARG RUNC_VERSION=1.3.3
 ARG CNI_PLUGINS_VERSION=1.8.0
 ARG ZOT_VERSION=2.1.17
+ARG EROFS_UTILS_VERSION=1.9.2
 ARG GOLANGCI_LINT_VERSION=2.12.2
 
 ENV CFS_DEVCONTAINER=1
@@ -27,6 +28,8 @@ RUN set -eux; \
         >/etc/profile.d/cfs-devcontainer-log.sh; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
+        autoconf \
+        automake \
         ca-certificates \
         curl \
         e2fsprogs \
@@ -36,9 +39,12 @@ RUN set -eux; \
         iptables \
         jq \
         kmod \
+        libtool \
         make \
+        pkg-config \
         procps \
-        util-linux; \
+        util-linux \
+        uuid-dev; \
     rm -rf /var/lib/apt/lists/*
 
 RUN set -eux; \
@@ -68,6 +74,18 @@ RUN set -eux; \
     curl -fL --retry 3 --output zot \
         "https://github.com/project-zot/zot/releases/download/v${ZOT_VERSION}/zot-linux-${zot_arch}"; \
     install -m 0755 zot /opt/cfs-dev/bin/zot; \
+    # Debian's erofs-utils predates tar mode, which containerd's erofs differ
+    # requires, so build the pinned release from source.
+    curl -fL --retry 3 --output erofs-utils.tgz \
+        "https://github.com/erofs/erofs-utils/archive/refs/tags/v${EROFS_UTILS_VERSION}.tar.gz"; \
+    tar -xzf erofs-utils.tgz; \
+    cd "erofs-utils-${EROFS_UTILS_VERSION}"; \
+    ./autogen.sh; \
+    ./configure; \
+    make -j"$(nproc)"; \
+    install -m 0755 mkfs/mkfs.erofs dump/dump.erofs fsck/fsck.erofs /opt/cfs-dev/bin/; \
+    mkfs.erofs --help 2>&1 | grep -q -- --tar; \
+    cd ..; \
     curl -fL --retry 3 --output golangci-lint.tgz \
         "https://github.com/golangci/golangci-lint/releases/download/v${GOLANGCI_LINT_VERSION}/golangci-lint-${GOLANGCI_LINT_VERSION}-linux-${golangci_lint_arch}.tar.gz"; \
     tar -xzf golangci-lint.tgz; \
@@ -77,6 +95,7 @@ RUN set -eux; \
     ctr --help >/dev/null; \
     runc --version; \
     zot --version; \
+    mkfs.erofs --version; \
     golangci-lint --version; \
     test -x /opt/cni/bin/loopback; \
     rm -rf /tmp/cfs-install
@@ -87,6 +106,7 @@ RUN set -eux; \
     install -d /etc/containerd/certs.d /etc/docker /etc/zot; \
     cp -a /tmp/cfs-devcontainer-config/containerd-certs.d/. /etc/containerd/certs.d/; \
     install -m 0644 /tmp/cfs-devcontainer-config/containerd-config.toml /etc/containerd/config.toml; \
+    install -m 0644 /tmp/cfs-devcontainer-config/containerd-erofs-unpack.toml /etc/containerd/containerd-erofs-unpack.toml; \
     install -m 0644 /tmp/cfs-devcontainer-config/docker-daemon.json /etc/docker/daemon.json; \
     install -m 0644 /tmp/cfs-devcontainer-config/zot-config.json /etc/zot/config.json; \
     rm -rf /tmp/cfs-devcontainer-config
