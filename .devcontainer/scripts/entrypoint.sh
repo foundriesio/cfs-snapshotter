@@ -16,6 +16,8 @@ CFS_LOG_LEVEL="${CFS_LOG_LEVEL:-trace}"
 CFS_STUB_ROOTFS="${CFS_STUB_ROOTFS:-/tmp/cfs-stub-rootfs}"
 CFS_ROOT=/var/lib/containerd-cfs-grpc
 CFS_ROOT_IMG=/var/tmp/cfs-root.img
+EROFS_ROOT=/var/lib/containerd/io.containerd.snapshotter.v1.erofs
+EROFS_ROOT_IMG=/var/tmp/erofs-root.img
 CFS_STATE_FILE="${LOG_DIR}/containerd-cfs-grpc.env"
 REGISTRY_URL=http://127.0.0.1:5000
 
@@ -112,6 +114,19 @@ start_runtime_daemons() {
 	printf '%s\n' "${CFS_LOG_LEVEL} ${CFS_STUB_ROOTFS}" >"${CFS_STATE_FILE}"
 	wait_for cfs-snapshotter test -S "${CFS_SOCKET}"
 
+	# Enable the built-in erofs snapshotter only when the kernel supports
+	# EROFS: its unpack_config entry is resolved by the transfer service at
+	# containerd startup, so on a kernel without EROFS the entry would fail
+	# the whole transfer plugin and break every pull. Its overlay uppers also
+	# need a real filesystem, like the cfs root.
+	if grep -qw erofs /proc/filesystems; then
+		if ! grep -q 'snapshotter = "erofs"' /etc/containerd/config.toml; then
+			cat /etc/containerd/containerd-erofs-unpack.toml >>/etc/containerd/config.toml
+		fi
+		mount_loop_ext4 "${EROFS_ROOT_IMG}" "${EROFS_ROOT}"
+	else
+		echo "host kernel lacks EROFS; erofs snapshotter comparison disabled"
+	fi
 	start_daemon containerd "${LOG_DIR}/containerd.pid" "${LOG_DIR}/containerd.log" \
 		containerd --config /etc/containerd/config.toml
 	wait_for containerd ctr --address "${CONTAINERD_SOCKET}" version

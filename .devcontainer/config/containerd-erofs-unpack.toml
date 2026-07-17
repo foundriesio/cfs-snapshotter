@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: Apache-2.0
+
+# Appended to config.toml by the entrypoint only when the kernel supports
+# EROFS: the transfer service resolves every unpack_config entry at startup,
+# so an entry for a snapshotter the kernel cannot back would fail the whole
+# transfer plugin and break all pulls.
+
+[[plugins."io.containerd.transfer.v1.local".unpack_config]]
+  platform = "linux"
+  snapshotter = "erofs"
+  differ = "erofs"
