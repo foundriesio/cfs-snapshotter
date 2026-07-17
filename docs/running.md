@@ -96,3 +96,22 @@ is unnecessary) and still routes to cfs:
 ```sh
 sudo ctr image pull --local --snapshotter cfs docker.io/library/busybox:latest
 ```
+
+## Inspecting a running container (devcontainer stub)
+
+The devcontainer's stand-in rootfs is a single static `/hello` binary — also
+linked as `/bin/sh` and `/bin/bash` — that prints a line and exits, so a plain
+`docker run` finishes immediately, leaving nothing to inspect. Setting
+`CFS_STUB_HOLD` in the container's environment makes it print and then block,
+keeping the container and its overlay mount up:
+
+```sh
+docker run --rm -d -e CFS_STUB_HOLD=1 --name cfs-hold <image> /hello
+pid="$(docker inspect -f '{{.State.Pid}}' cfs-hold)"
+cat "/proc/${pid}/mountinfo"   # or: findmnt -N "${pid}"
+docker stop cfs-hold           # clean shutdown, no SIGKILL wait
+```
+
+The stub rootfs has no real shell, so `docker exec cfs-hold sh` just runs the
+same greeter again rather than giving an interactive session — inspect the
+mount from the host via the container's PID as above.

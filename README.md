@@ -25,28 +25,43 @@ with containerd via a `[proxy_plugins.cfs]` entry.
 
 ## Development and testing
 
-The repository ships a privileged devcontainer that runs the snapshotter against
-a nested, version-pinned runtime stack — Docker Engine, containerd, runc, CNI
-plugins, a local [Zot](https://github.com/project-zot/zot) registry on
-`127.0.0.1:5000`, and the locally built `bin/containerd-cfs-grpc`. Versions are
-controlled through build arguments in
-[`.devcontainer/devcontainer.json`](.devcontainer/devcontainer.json); nothing is
-installed from distribution packages.
+Develop and test inside the repository's privileged devcontainer: it runs a
+nested runtime stack — `dockerd`, `containerd`, `runc`, a local
+[Zot](https://github.com/project-zot/zot) registry on `127.0.0.1:5000` — with
+the locally built snapshotter already wired in. Get in either way:
 
-- **Editors / `devcontainer` CLI:** open the folder in a Dev Containers-aware
-  editor ("Reopen in Container") or run `devcontainer up`. The image entrypoint
-  starts Zot, `containerd`, `dockerd`, and the cfs proxy snapshotter and waits
-  until they are ready.
-- **`devshell.sh`:** a host-side helper that builds the same image and runs a
-  command inside a privileged container with the nested stack started — e.g.
-  `./devshell.sh make test-smoke` to run the routing smoke test, or
-  `./devshell.sh` for an interactive shell. Use `./devshell.sh exec <cmd>` to run
-  in an already-running session.
+- open the folder in a Dev Containers-aware editor ("Reopen in Container"), or
+- run `./devshell.sh` from the host (interactive shell; `./devshell.sh <cmd>`
+  runs one command, `./devshell.sh exec <cmd>` reuses the running session).
 
-Inside the container, `make run-cfs` rebuilds and restarts the snapshotter after
-editing code, and `make test-smoke` verifies the stub end to end — pulls route
-to cfs with zero layer fetches and `docker run` executes the stand-in rootfs.
-See [docs/devcontainer.md](docs/devcontainer.md) for the full workflow.
+Inside the container:
+
+```sh
+make run-cfs      # rebuild and restart the snapshotter after editing code
+make test         # unit tests
+make test-smoke   # end to end: ctr/docker pull and docker run through cfs
+```
+
+To test manually, drive the snapshotter with plain `docker` and `ctr`
+commands — both are preconfigured to use cfs, and any image from a regular
+remote registry works (busybox here) — then watch the snapshotter's logs.
+Layers are never downloaded; only the image metadata (index, manifest,
+config, etc.) is fetched:
+
+```sh
+docker pull busybox
+docker run --rm busybox
+ctr image pull docker.io/library/busybox:latest
+ctr run --rm docker.io/library/busybox:latest demo
+ctr snapshots ls                  # committed chain + container snapshots
+
+cfs-log           # pretty-print the snapshotter's log
+cfs-log-follow    # follow it live
+```
+
+See [docs/devcontainer.md](docs/devcontainer.md) for the full workflow —
+version knobs, startup details, cleanup — and
+[docs/running.md](docs/running.md) for configuring a general host.
 
 ## Contributing
 

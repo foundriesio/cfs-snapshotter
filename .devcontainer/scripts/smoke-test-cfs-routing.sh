@@ -47,7 +47,7 @@ expect_pull_succeeds() {
 
 require_cfs_snapshots() {
 	local snaps
-	snaps="$(ctr --address "${CONTAINERD_SOCKET}" snapshots --snapshotter cfs ls)"
+	snaps="$(ctr --address "${CONTAINERD_SOCKET}" snapshots ls)"
 	if ! grep -qi 'committed' <<<"${snaps}"; then
 		echo "cfs recorded no committed snapshots after pull" >&2
 		echo "${snaps}" >&2
@@ -110,7 +110,7 @@ main() {
 	"${ROOT_DIR}/.devcontainer/scripts/seed-registry.sh" "${SMOKE_IMAGE}"
 
 	expect_pull_succeeds "ctr image pull" /tmp/cfs-ctr-pull.log \
-		ctr --address "${CONTAINERD_SOCKET}" image pull --plain-http --snapshotter cfs "${SMOKE_IMAGE}"
+		ctr --address "${CONTAINERD_SOCKET}" image pull --plain-http "${SMOKE_IMAGE}"
 	require_cfs_snapshots
 	expect_pull_succeeds "docker pull" /tmp/cfs-docker-pull.log \
 		docker pull "${SMOKE_IMAGE}"
