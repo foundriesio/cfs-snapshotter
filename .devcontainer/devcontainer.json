@@ -28,7 +28,8 @@
     "CFS_DEVCONTAINER": "1",
     "GOCACHE": "/tmp/cfs-gocache",
     "GOMODCACHE": "/tmp/cfs-gomodcache",
-    "PATH": "/opt/cfs-dev/bin:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    "PATH": "/opt/cfs-dev/bin:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    "CONTAINERD_SNAPSHOTTER": "cfs"
   },
   "customizations": {
     "vscode": {

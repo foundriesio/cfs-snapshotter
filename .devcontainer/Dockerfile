@@ -14,11 +14,17 @@ ARG GOLANGCI_LINT_VERSION=2.12.2
 
 ENV CFS_DEVCONTAINER=1
 ENV PATH="/opt/cfs-dev/bin:${PATH}"
+ENV CONTAINERD_SNAPSHOTTER=cfs
 
 RUN set -eux; \
     install -d /opt/cfs-devcontainer; \
     printf 'cfs-snapshotter devcontainer\n' >/opt/cfs-devcontainer/.runtime-marker; \
     printf 'export PATH="/opt/cfs-dev/bin:${PATH}"\n' >/etc/profile.d/cfs-devcontainer-path.sh; \
+    printf '%s\n' \
+        'CFS_SNAPSHOTTER_LOG=/var/log/cfs-devcontainer/containerd-cfs-grpc.log' \
+        'cfs-log() { jq . "${CFS_SNAPSHOTTER_LOG}"; }' \
+        'cfs-log-follow() { tail -F "${CFS_SNAPSHOTTER_LOG}" | jq .; }' \
+        >/etc/profile.d/cfs-devcontainer-log.sh; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
         ca-certificates \

@@ -63,8 +63,11 @@ Reference release locations:
 Opening the devcontainer runs the image entrypoint. The entrypoint:
 
 - Starts Zot, `containerd`, and `dockerd`.
-- Builds and starts `bin/containerd-cfs-grpc` before `containerd`, so
-  containerd can register the `cfs` proxy snapshotter during startup.
+- Builds the stand-in rootfs the stub serves
+  (`.devcontainer/scripts/make-stub-rootfs.sh`) and starts
+  `bin/containerd-cfs-grpc` with `-stub-rootfs` pointing at it, before
+  `containerd`, so containerd can register the `cfs` proxy snapshotter during
+  startup.
 - Waits for `ctr version`, `docker version`, and `docker info`.
 - Runs the requested command, or the default `sleep infinity` command for an
   interactive devcontainer session.
@@ -121,16 +124,30 @@ Run:
 
 The smoke test prints the actual runtime versions, runs `make fmt`, `make vet`,
 `make test`, and `make build`, checks that containerd lists the `cfs` proxy
-snapshotter, seeds Zot with a tiny local OCI image, then verifies that both
-`ctr` and Docker route pulls to cfs.
+snapshotter, seeds Zot with a tiny local OCI image, then verifies the stub end
+to end: both `ctr` and Docker pulls complete through cfs with zero layer
+fetches (the unpack handshakes are answered from the stub; only the image
+metadata is downloaded), and `docker run` executes the stand-in rootfs.
 
-Current expected behavior: both pulls reach cfs and fail at `Prepare` with
-`not implemented`. That proves the routing is wired — both clients reach the cfs
-snapshotter through the proxy.
+## Debugging Niceties
 
-Future expected behavior: after the composefs backend exists, the pulls succeed
-and `docker run --rm 127.0.0.1:5000/cfs/smoke:latest true` runs through the cfs
-snapshotter.
+Two shell functions and an environment variable make interactive debugging
+easier from any login shell inside the devcontainer (`./devshell.sh`, a VS Code
+terminal, etc.):
+
+- `cfs-log` -- pretty-print the whole `containerd-cfs-grpc` daemon log.
+- `cfs-log-follow` -- tail and pretty-print the log as new entries arrive.
+
+Both read `/var/log/cfs-devcontainer/containerd-cfs-grpc.log` (see Startup
+above) through `jq`.
+
+A plain `docker run` against the devcontainer's stand-in image content exits
+immediately once it prints its greeting, leaving nothing to inspect. Setting
+`CFS_STUB_HOLD` in the container's environment makes it print and then block
+instead, so the container and its overlay mount stay up for inspection from the
+host. See
+[docs/running.md](running.md#inspecting-a-running-container-devcontainer-stub)
+for the full example.
 
 ## Shutdown And Cleanup
 

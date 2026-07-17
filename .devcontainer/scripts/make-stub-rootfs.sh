@@ -5,6 +5,14 @@
 # static /hello binary that prints and exits, which is enough for
 # `docker run --rm <image> /hello` to exercise the whole container lifecycle.
 #
+# Setting CFS_STUB_HOLD in the container's environment makes it print and then
+# block instead of exiting, so the container (and its overlay mount) stays up
+# for inspection from the host:
+#   docker run --rm -d -e CFS_STUB_HOLD=1 --name cfs-hold <image> /hello
+#   pid="$(docker inspect -f '{{.State.Pid}}' cfs-hold)"
+#   cat "/proc/${pid}/mountinfo"   # or: findmnt -N "${pid}"
+#   docker stop cfs-hold
+#
 #   .devcontainer/scripts/make-stub-rootfs.sh [dir]   # default /tmp/cfs-stub-rootfs
 set -euo pipefail
 
@@ -15,10 +23,23 @@ trap 'rm -rf "${SRC}"' EXIT
 cat >"${SRC}/main.go" <<'GO'
 package main
 
-import "os"
+import (
+	"os"
+	"time"
+)
 
 func main() {
 	os.Stdout.WriteString("hello from the cfs stub rootfs\n")
+	// Opt-in: block instead of exiting, so the container stays up for
+	// inspection. A plain SIGTERM (docker stop) still kills it -- Go
+	// installs no handler for it, so the default disposition applies.
+	// (A bare "select {}" would trip the runtime's deadlock detector,
+	// since nothing could ever wake it; a timer-based sleep does not.)
+	if os.Getenv("CFS_STUB_HOLD") != "" {
+		for {
+			time.Sleep(time.Hour)
+		}
+	}
 }
 GO
 cat >"${SRC}/go.mod" <<'GO'
