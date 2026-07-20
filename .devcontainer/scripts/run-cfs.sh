@@ -131,6 +131,8 @@ restart_containerd_for_proxy_registration() {
 # upper and work directories live on a real filesystem: the snapshotter's
 # overlay uppers cannot live on the container's own overlayfs, since overlayfs
 # cannot stack on overlayfs. A filesystem already mounted at dir is left as is.
+# The container's /dev is a plain tmpfs, so the loop node the kernel hands out
+# may not exist yet; create it before attaching.
 mount_loop_ext4() {
 	local img="$1" dir="$2"
 	if mountpoint -q "${dir}" 2>/dev/null; then
@@ -144,7 +146,9 @@ mount_loop_ext4() {
 	mkdir -p "${dir}"
 	dd if=/dev/zero of="${img}" bs=1M count=1024 status=none
 	mkfs.ext4 -q -F "${img}"
-	dev="$(losetup --find --show "${img}")"
+	dev="$(losetup -f)"
+	[ -e "${dev}" ] || mknod "${dev}" b 7 "${dev##*loop}"
+	losetup "${dev}" "${img}"
 	mount "${dev}" "${dir}"
 	echo "snapshotter root at ${dir} (loop ext4)"
 }
