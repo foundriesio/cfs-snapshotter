@@ -53,7 +53,10 @@ start_daemon() {
 	fi
 
 	echo "starting ${name}"
-	nohup "$@" >"${logfile}" 2>&1 &
+	# setsid puts each daemon in its own session so a SIGINT to the container's
+	# foreground process group (an interrupted docker run, a Ctrl-C in the
+	# devshell) does not take them all down together; nohup keeps SIGHUP/stdio.
+	setsid nohup "$@" >"${logfile}" 2>&1 &
 	echo "$!" >"${pidfile}"
 }
 
