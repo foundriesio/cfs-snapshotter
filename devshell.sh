@@ -59,6 +59,19 @@ run_new_container() {
 		run_flags+=(-t)
 	fi
 
+	# The container has no credentials for the internal knarr module, so build the
+	# knarr CLI on the host (which does) at the version cfs pins and mount the
+	# binary in, so the container has a knarr CLI matching the pinned module.
+	# Portable across setups and CI, unlike bind-mounting a checkout. Best-effort:
+	# a plain shell still opens when the CLI is not needed or cannot be built.
+	local knarr_version
+	if knarr_version="$(cd "${ROOT_DIR}" && go list -m -f '{{.Version}}' github.com/foundriesio/knarr 2>/dev/null)" &&
+		GOBIN=/tmp/cfs-knarr-bin GOTOOLCHAIN=auto GOPRIVATE=github.com/foundriesio go install "github.com/foundriesio/knarr/cmd/knarr@${knarr_version}"; then
+		run_flags+=(-v /tmp/cfs-knarr-bin/knarr:/opt/cfs-dev/bin/knarr:ro)
+	else
+		echo "warning: could not build the knarr CLI on the host; any e2e that needs it will fail" >&2
+	fi
+
 	"${DOCKER}" run "${run_flags[@]}" \
 		--label "${LABEL_DEVSHELL}=1" \
 		--label "${LABEL_WORKSPACE}=${ROOT_DIR}" \
