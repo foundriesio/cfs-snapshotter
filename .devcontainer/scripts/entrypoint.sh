@@ -15,17 +15,17 @@ CONTAINERD_SOCKET=/run/containerd/containerd.sock
 CFS_LOG_LEVEL="${CFS_LOG_LEVEL:-trace}"
 CFS_STUB_ROOTFS="${CFS_STUB_ROOTFS:-/tmp/cfs-stub-rootfs}"
 CFS_ROOT=/var/lib/containerd-cfs-grpc
-CFS_ROOT_IMG=/var/tmp/cfs-root.img
 EROFS_ROOT=/var/lib/containerd/io.containerd.snapshotter.v1.erofs
-EROFS_ROOT_IMG=/var/tmp/erofs-root.img
+SHARED_ROOT=/var/lib/cfs-shared-root
+SHARED_ROOT_IMG=/var/tmp/cfs-shared-root.img
 CFS_STATE_FILE="${LOG_DIR}/containerd-cfs-grpc.env"
 REGISTRY_URL=http://127.0.0.1:5000
 
 
-# mount_loop_ext4 mounts a fresh loop-backed ext4 filesystem at dir, so overlay
-# upper and work directories live on a real filesystem: the snapshotter's
-# overlay uppers cannot live on the container's own overlayfs, since overlayfs
-# cannot stack on overlayfs. A filesystem already mounted at dir is left as is.
+# mount_loop_ext4 mounts a fresh loop-backed ext4 filesystem at dir. A
+# filesystem already mounted at dir is left as is. The container's /dev is a
+# plain tmpfs, so the loop node the kernel hands out may not exist yet; create
+# it before attaching.
 mount_loop_ext4() {
 	local img="$1" dir="$2"
 	if mountpoint -q "${dir}" 2>/dev/null; then
@@ -39,9 +39,24 @@ mount_loop_ext4() {
 	mkdir -p "${dir}"
 	dd if=/dev/zero of="${img}" bs=1M count=1024 status=none
 	mkfs.ext4 -q -F "${img}"
-	dev="$(losetup --find --show "${img}")"
+	dev="$(losetup -f)"
+	[ -e "${dev}" ] || mknod "${dev}" b 7 "${dev##*loop}"
+	losetup "${dev}" "${img}"
 	mount "${dev}" "${dir}"
-	echo "snapshotter root at ${dir} (loop ext4)"
+	echo "loop-backed ext4 at ${dir}"
+}
+
+# bind_root binds a subdirectory of the shared loop-backed ext4 onto a
+# snapshotter root, giving its overlay upper/work dirs a real filesystem: they
+# cannot live on the container's own overlayfs (overlay cannot stack on
+# overlay). A filesystem already mounted at root is left as is.
+bind_root() {
+	local sub="$1" root="$2"
+	if mountpoint -q "${root}" 2>/dev/null; then
+		return 0
+	fi
+	mkdir -p "${SHARED_ROOT}/${sub}" "${root}"
+	mount --bind "${SHARED_ROOT}/${sub}" "${root}"
 }
 
 wait_for() {
@@ -102,7 +117,10 @@ start_runtime_daemons() {
 	wait_for zot curl -fsS "${REGISTRY_URL}/v2/"
 
 	make -C "${ROOT_DIR}" build
-	mount_loop_ext4 "${CFS_ROOT_IMG}" "${CFS_ROOT}"
+	# One loop-backed ext4 hosts every snapshotter root, bound in as
+	# subdirectories; loop nodes are scarce in the container's tmpfs /dev.
+	mount_loop_ext4 "${SHARED_ROOT_IMG}" "${SHARED_ROOT}"
+	bind_root cfs "${CFS_ROOT}"
 	# The snapshotter requires a stand-in rootfs; build the default one when
 	# the caller does not supply a directory.
 	if [ ! -e "${CFS_STUB_ROOTFS}/hello" ] || [ ! -e "${CFS_STUB_ROOTFS}/bin/sh" ]; then
@@ -123,7 +141,7 @@ start_runtime_daemons() {
 		if ! grep -q 'snapshotter = "erofs"' /etc/containerd/config.toml; then
 			cat /etc/containerd/containerd-erofs-unpack.toml >>/etc/containerd/config.toml
 		fi
-		mount_loop_ext4 "${EROFS_ROOT_IMG}" "${EROFS_ROOT}"
+		bind_root erofs "${EROFS_ROOT}"
 	else
 		echo "host kernel lacks EROFS; erofs snapshotter comparison disabled"
 	fi
