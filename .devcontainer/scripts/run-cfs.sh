@@ -14,7 +14,9 @@ CFS_SOCKET=/run/containerd-cfs-grpc/containerd-cfs-grpc.sock
 CONTAINERD_SOCKET=/run/containerd/containerd.sock
 CFS_LOG_LEVEL="${CFS_LOG_LEVEL:-trace}"
 CFS_ROOT=/var/lib/containerd-cfs-grpc
-CFS_ROOT_IMG=/var/tmp/cfs-root.img
+KNARR_ROOT=/var/lib/knarr
+SHARED_ROOT=/var/lib/cfs-shared-root
+SHARED_ROOT_IMG=/var/tmp/cfs-shared-root.img
 CFS_PIDFILE="${LOG_DIR}/containerd-cfs-grpc.pid"
 CFS_LOGFILE="${LOG_DIR}/containerd-cfs-grpc.log"
 CFS_STATE_FILE="${LOG_DIR}/containerd-cfs-grpc.env"
@@ -130,12 +132,10 @@ restart_containerd_for_proxy_registration() {
 }
 
 
-# mount_loop_ext4 mounts a fresh loop-backed ext4 filesystem at dir, so overlay
-# upper and work directories live on a real filesystem: the snapshotter's
-# overlay uppers cannot live on the container's own overlayfs, since overlayfs
-# cannot stack on overlayfs. A filesystem already mounted at dir is left as is.
-# The container's /dev is a plain tmpfs, so the loop node the kernel hands out
-# may not exist yet; create it before attaching.
+# mount_loop_ext4 mounts a fresh fs-verity-enabled loop-backed ext4 filesystem
+# at dir. A filesystem already mounted at dir is left as is. The container's
+# /dev is a plain tmpfs, so the loop node the kernel hands out may not exist
+# yet; create it before attaching.
 mount_loop_ext4() {
 	local img="$1" dir="$2"
 	if mountpoint -q "${dir}" 2>/dev/null; then
@@ -148,12 +148,25 @@ mount_loop_ext4() {
 	done
 	mkdir -p "${dir}"
 	dd if=/dev/zero of="${img}" bs=1M count=1024 status=none
-	mkfs.ext4 -q -F "${img}"
+	mkfs.ext4 -q -F -O verity -b 4096 "${img}"
 	dev="$(losetup -f)"
 	[ -e "${dev}" ] || mknod "${dev}" b 7 "${dev##*loop}"
 	losetup "${dev}" "${img}"
 	mount "${dev}" "${dir}"
-	echo "snapshotter root at ${dir} (loop ext4)"
+	echo "shared fs-verity ext4 at ${dir}"
+}
+
+# bind_root binds a subdirectory of the shared loop-backed ext4 onto a root
+# directory, giving overlay upper/work dirs and the knarr store a real
+# filesystem: they cannot live on the container's own overlayfs (overlay
+# cannot stack on overlay). A filesystem already mounted at root is left as is.
+bind_root() {
+	local sub="$1" root="$2"
+	if mountpoint -q "${root}" 2>/dev/null; then
+		return 0
+	fi
+	mkdir -p "${SHARED_ROOT}/${sub}" "${root}"
+	mount --bind "${SHARED_ROOT}/${sub}" "${root}"
 }
 
 main() {
@@ -165,10 +178,13 @@ main() {
 		/var/lib/containerd \
 		/var/lib/containerd-cfs-grpc \
 		/var/lib/docker \
+		/var/lib/knarr \
 		"${LOG_DIR}"
 
 	git config --global --add safe.directory "${ROOT_DIR}" || true
-	mount_loop_ext4 "${CFS_ROOT_IMG}" "${CFS_ROOT}"
+	mount_loop_ext4 "${SHARED_ROOT_IMG}" "${SHARED_ROOT}"
+	bind_root cfs "${CFS_ROOT}"
+	bind_root knarr "${KNARR_ROOT}"
 	local old_hash new_hash old_state new_state
 	# The snapshotter requires a stand-in rootfs; build the default one when
 	# the caller does not supply a directory.
@@ -176,7 +192,7 @@ main() {
 	if [ ! -e "${stub_rootfs}/hello" ] || [ ! -e "${stub_rootfs}/bin/sh" ]; then
 		"${ROOT_DIR}/.devcontainer/scripts/make-stub-rootfs.sh" "${stub_rootfs}"
 	fi
-	new_state="${CFS_LOG_LEVEL} ${stub_rootfs}"
+	new_state="${CFS_LOG_LEVEL} ${stub_rootfs} ${KNARR_ROOT}"
 	old_hash="$(file_hash "${CONTAINERD_CFS_GRPC_BIN}")"
 	old_state="$(cat "${CFS_STATE_FILE}" 2>/dev/null || true)"
 	make -C "${ROOT_DIR}" build
@@ -194,7 +210,7 @@ main() {
 			"${CFS_SOCKET}" \
 			"${CFS_LOGFILE}" \
 			"${CONTAINERD_CFS_GRPC_BIN}" -log-level "${CFS_LOG_LEVEL}" \
-			-stub-rootfs "${stub_rootfs}"
+			-stub-rootfs "${stub_rootfs}" -knarr-root "${KNARR_ROOT}"
 		printf '%s\n' "${new_state}" >"${CFS_STATE_FILE}"
 	fi
 	wait_for cfs-snapshotter test -S "${CFS_SOCKET}"

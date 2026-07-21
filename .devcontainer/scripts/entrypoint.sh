@@ -16,6 +16,7 @@ CFS_LOG_LEVEL="${CFS_LOG_LEVEL:-trace}"
 CFS_STUB_ROOTFS="${CFS_STUB_ROOTFS:-/tmp/cfs-stub-rootfs}"
 CFS_ROOT=/var/lib/containerd-cfs-grpc
 EROFS_ROOT=/var/lib/containerd/io.containerd.snapshotter.v1.erofs
+KNARR_ROOT=/var/lib/knarr
 SHARED_ROOT=/var/lib/cfs-shared-root
 SHARED_ROOT_IMG=/var/tmp/cfs-shared-root.img
 CFS_STATE_FILE="${LOG_DIR}/containerd-cfs-grpc.env"
@@ -38,12 +39,12 @@ mount_loop_ext4() {
 	done
 	mkdir -p "${dir}"
 	dd if=/dev/zero of="${img}" bs=1M count=1024 status=none
-	mkfs.ext4 -q -F "${img}"
+	mkfs.ext4 -q -F -O verity -b 4096 "${img}"
 	dev="$(losetup -f)"
 	[ -e "${dev}" ] || mknod "${dev}" b 7 "${dev##*loop}"
 	losetup "${dev}" "${img}"
 	mount "${dev}" "${dir}"
-	echo "loop-backed ext4 at ${dir}"
+	echo "shared fs-verity ext4 at ${dir}"
 }
 
 # bind_root binds a subdirectory of the shared loop-backed ext4 onto a
@@ -101,6 +102,7 @@ start_runtime_daemons() {
 		/var/lib/containerd-cfs-grpc \
 		/var/lib/cfs-dev-registry \
 		/var/lib/docker \
+		/var/lib/knarr \
 		"${LOG_DIR}"
 
 	echo "runtime versions:"
@@ -120,10 +122,11 @@ start_runtime_daemons() {
 	wait_for zot curl -fsS "${REGISTRY_URL}/v2/"
 
 	make -C "${ROOT_DIR}" build
-	# One loop-backed ext4 hosts every snapshotter root, bound in as
-	# subdirectories; loop nodes are scarce in the container's tmpfs /dev.
+	# One loop-backed ext4 with fs-verity hosts the knarr store and every
+	# snapshotter root; loop nodes are scarce in the container's tmpfs /dev.
 	mount_loop_ext4 "${SHARED_ROOT_IMG}" "${SHARED_ROOT}"
 	bind_root cfs "${CFS_ROOT}"
+	bind_root knarr "${KNARR_ROOT}"
 	# The snapshotter requires a stand-in rootfs; build the default one when
 	# the caller does not supply a directory.
 	if [ ! -e "${CFS_STUB_ROOTFS}/hello" ] || [ ! -e "${CFS_STUB_ROOTFS}/bin/sh" ]; then
@@ -131,8 +134,9 @@ start_runtime_daemons() {
 	fi
 	rm -f "${CFS_SOCKET}"
 	start_daemon containerd-cfs-grpc "${LOG_DIR}/containerd-cfs-grpc.pid" "${LOG_DIR}/containerd-cfs-grpc.log" \
-		"${CONTAINERD_CFS_GRPC_BIN}" -log-level "${CFS_LOG_LEVEL}" -stub-rootfs "${CFS_STUB_ROOTFS}"
-	printf '%s\n' "${CFS_LOG_LEVEL} ${CFS_STUB_ROOTFS}" >"${CFS_STATE_FILE}"
+		"${CONTAINERD_CFS_GRPC_BIN}" -log-level "${CFS_LOG_LEVEL}" -stub-rootfs "${CFS_STUB_ROOTFS}" \
+		-knarr-root "${KNARR_ROOT}"
+	printf '%s\n' "${CFS_LOG_LEVEL} ${CFS_STUB_ROOTFS} ${KNARR_ROOT}" >"${CFS_STATE_FILE}"
 	wait_for cfs-snapshotter test -S "${CFS_SOCKET}"
 
 	# Enable the built-in erofs snapshotter only when the kernel supports

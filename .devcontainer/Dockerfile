@@ -11,6 +11,8 @@ ARG RUNC_VERSION=1.3.3
 ARG CNI_PLUGINS_VERSION=1.8.0
 ARG ZOT_VERSION=2.1.17
 ARG EROFS_UTILS_VERSION=1.9.2
+ARG COMPOSEFS_VERSION=v1.0.8
+ARG COMPOSEFS_COMMIT=858ce1b38e1534c2602eb431124b5dca706bc746
 ARG GOLANGCI_LINT_VERSION=2.12.2
 
 ENV CFS_DEVCONTAINER=1
@@ -32,6 +34,7 @@ RUN set -eux; \
         automake \
         ca-certificates \
         curl \
+        dpkg-dev \
         e2fsprogs \
         fuse3 \
         git \
@@ -39,8 +42,11 @@ RUN set -eux; \
         iptables \
         jq \
         kmod \
+        libssl-dev \
         libtool \
         make \
+        meson \
+        ninja-build \
         pkg-config \
         procps \
         util-linux \
@@ -86,6 +92,14 @@ RUN set -eux; \
     install -m 0755 mkfs/mkfs.erofs dump/dump.erofs fsck/fsck.erofs /opt/cfs-dev/bin/; \
     mkfs.erofs --help 2>&1 | grep -q -- --tar; \
     cd ..; \
+    # knarr shells out to mkcomposefs and mount.composefs; build the pinned
+    # composefs release from source (Debian ships no composefs tools).
+    MULTIARCH="$(dpkg-architecture -qDEB_HOST_MULTIARCH)"; \
+    git clone --depth 1 --branch "${COMPOSEFS_VERSION}" https://github.com/containers/composefs.git /tmp/composefs; \
+    test "$(git -C /tmp/composefs rev-parse HEAD)" = "${COMPOSEFS_COMMIT}"; \
+    meson setup /tmp/composefs/build /tmp/composefs --prefix=/usr --libdir="/usr/lib/${MULTIARCH}" -Dfuse=disabled -Dman=disabled; \
+    meson compile -C /tmp/composefs/build; \
+    meson install -C /tmp/composefs/build; \
     curl -fL --retry 3 --output golangci-lint.tgz \
         "https://github.com/golangci/golangci-lint/releases/download/v${GOLANGCI_LINT_VERSION}/golangci-lint-${GOLANGCI_LINT_VERSION}-linux-${golangci_lint_arch}.tar.gz"; \
     tar -xzf golangci-lint.tgz; \
@@ -98,7 +112,7 @@ RUN set -eux; \
     mkfs.erofs --version; \
     golangci-lint --version; \
     test -x /opt/cni/bin/loopback; \
-    rm -rf /tmp/cfs-install
+    rm -rf /tmp/cfs-install /tmp/composefs
 
 COPY config/ /tmp/cfs-devcontainer-config/
 

@@ -11,6 +11,7 @@ CONTAINERD_SOCKET=${CONTAINERD_SOCKET:-/run/containerd/containerd.sock}
 REGISTRY_URL=${REGISTRY_URL:-http://127.0.0.1:5000}
 IMAGE_REF=${1:-127.0.0.1:5000/cfs/smoke:latest}
 SEED_NAMESPACE=${SEED_NAMESPACE:-cfs-seed}
+KNARR_BIN=${KNARR_BIN:-/opt/cfs-dev/bin/knarr}
 
 detect_architecture() {
 	local arch
@@ -94,6 +95,21 @@ EOF
 	tar -C "${oci}" -cf "${work}/smoke.oci.tar" .
 }
 
+# seed_knarr_store stages the just-built image in the local knarr store by
+# sideloading the OCI layout, pinned by its manifest digest. The devshell
+# mounts the knarr CLI in best-effort, so skip with a warning when it is
+# absent instead of failing the registry seeding.
+seed_knarr_store() {
+	local work="$1" repo="$2" digest
+	if [ ! -x "${KNARR_BIN}" ]; then
+		echo "warning: knarr CLI not found at ${KNARR_BIN}; skipping knarr store seeding" >&2
+		return 0
+	fi
+	digest="$(jq -r '.manifests[0].digest' "${work}/oci/index.json")"
+	"${KNARR_BIN}" pull --from-dir "${work}/oci" "${repo}@${digest}"
+	echo "seeded knarr store with ${repo}@${digest}"
+}
+
 main() {
 	wait_for_registry
 
@@ -110,6 +126,8 @@ main() {
 	ctr --address "${CONTAINERD_SOCKET}" --namespace "${SEED_NAMESPACE}" images push \
 		--plain-http \
 		"${IMAGE_REF}"
+
+	seed_knarr_store "${work}" "${IMAGE_REF%:*}"
 
 	echo "seeded ${IMAGE_REF}"
 }
