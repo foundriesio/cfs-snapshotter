@@ -42,6 +42,20 @@ exec_running_container() {
 	"${DOCKER}" exec "${exec_flags[@]}" -w /workspace "${container}" "$@"
 }
 
+# reconcile_cache_ownership hands the shared Go caches back to the host user.
+# The devcontainer runs as root (dockerd/containerd need it), so anything the
+# container writes into the host-bind-mounted /tmp/cfs-go{cache,modcache}
+# lands root-owned; the Go module cache in particular marks its directories
+# read-only, so a later host-side `go` invocation can't even delete its way
+# out of it, only reset ownership. Run as a trap so it still fires if the
+# devshell command fails or is interrupted.
+reconcile_cache_ownership() {
+	"${DOCKER}" run --rm --entrypoint "" \
+		-v /tmp/cfs-gocache:/tmp/cfs-gocache \
+		-v /tmp/cfs-gomodcache:/tmp/cfs-gomodcache \
+		"${IMAGE}" chown -R "$(id -u):$(id -g)" /tmp/cfs-gocache /tmp/cfs-gomodcache
+}
+
 run_new_container() {
 	if [ "$#" -eq 0 ]; then
 		set -- bash -il
@@ -50,6 +64,7 @@ run_new_container() {
 	mkdir -p /tmp/cfs-gocache /tmp/cfs-gomodcache
 
 	"${DOCKER}" build -f "${ROOT_DIR}/.devcontainer/Dockerfile" -t "${IMAGE}" "${ROOT_DIR}/.devcontainer"
+	trap reconcile_cache_ownership EXIT
 
 	local run_flags=(--rm --privileged)
 	if [ -t 0 ]; then
