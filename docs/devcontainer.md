@@ -12,7 +12,17 @@ snapshotter against a nested, version-pinned runtime stack:
 - Zot, used as a local test registry on `127.0.0.1:5000`.
 - erofs-utils built from source (Debian's package predates the tar mode that
   containerd's built-in erofs snapshotter needs).
+- composefs built from source (`mkcomposefs`, `mount.composefs`), which knarr
+  shells out to.
+- The knarr CLI for staging images into the store — see the note below.
 - The locally built `bin/containerd-cfs-grpc`.
+
+The knarr CLI is not baked into the image: the container has no credentials
+for the internal knarr module, so `./devshell.sh` builds it on the host at the
+exact version the snapshotter pins and mounts the binary at
+`/opt/cfs-dev/bin/knarr`. A container opened directly from an editor does not
+get it, and `make test-e2e` (which needs it) will fail there — use
+`./devshell.sh` for the e2e.
 
 The container is intentionally for development and conformance-style wiring
 checks only. It does not add Docker or container lifecycle behavior to
@@ -40,7 +50,7 @@ arguments:
 "build": {
   "dockerfile": "Dockerfile",
   "args": {
-    "GO_VERSION": "1.25",
+    "GO_VERSION": "1.26",
     "DOCKER_VERSION": "29.3.0",
     "CONTAINERD_VERSION": "2.2.2",
     "RUNC_VERSION": "1.3.3",
@@ -53,7 +63,9 @@ arguments:
 ```
 
 The Dockerfile downloads exact release artifacts and fails during build if a
-requested archive is missing or cannot be installed.
+requested archive is missing or cannot be installed. The composefs build is
+pinned by tag and commit through the Dockerfile's `COMPOSEFS_VERSION` and
+`COMPOSEFS_COMMIT` build arguments.
 
 Reference release locations:
 
@@ -67,8 +79,14 @@ Reference release locations:
 Opening the devcontainer runs the image entrypoint. The entrypoint:
 
 - Starts Zot, `containerd`, and `dockerd`.
-- Starts `bin/containerd-cfs-grpc` before `containerd`, so containerd can
-  register the `cfs` proxy snapshotter during startup.
+- Mounts one loop-backed, fs-verity-enabled ext4 filesystem and binds
+  subdirectories of it as the knarr store root (`/var/lib/knarr`) and the
+  snapshotter roots: the knarr store needs fs-verity, and the overlay
+  upper/work directories need a real filesystem (they cannot live on the
+  container's own overlayfs).
+- Starts `bin/containerd-cfs-grpc` with `-knarr-root /var/lib/knarr`, before
+  `containerd`, so containerd can register the `cfs` proxy snapshotter during
+  startup.
 - Waits for `ctr version`, `docker version`, and `docker info`.
 - Runs the requested command, or the default `sleep infinity` command for an
   interactive devcontainer session.
@@ -99,36 +117,42 @@ override it:
 CFS_LOG_LEVEL=debug make run-cfs
 ```
 
-## Smoke Test
+## End-To-End Test
 
-From the host, run a command inside the devcontainer with the nested daemon
+From the host, run the e2e inside the devcontainer with the nested daemon
 stack started:
 
 ```sh
 ./devshell.sh make test-e2e
 ```
 
-From an already-open devcontainer, run the smoke test:
+From an already-open devcontainer session (started via `./devshell.sh`, which
+provides the knarr CLI):
 
 ```sh
 make test-e2e
 ```
 
 `make test-e2e` depends on `make run-cfs`, so it rebuilds and restarts the cfs
-proxy before checking Docker and containerd routing.
+proxy first, then runs `.devcontainer/scripts/e2e-fastpath.sh`. The e2e seeds
+Zot with a runnable multi-layer OCI image
+(`.devcontainer/scripts/seed-registry.sh`), stages it in the knarr store with
+`knarr pull --from-dir` pinned by manifest digest, and then asserts the full
+data plane through Docker:
 
-Run:
-
-```sh
-.devcontainer/scripts/e2e-fastpath.sh
-```
-
-The smoke test prints the actual runtime versions, runs `make fmt`, `make vet`,
-`make test`, and `make build`, checks that containerd lists the `cfs` proxy
-snapshotter, seeds Zot with a tiny local OCI image, then verifies the stub end
-to end: both `ctr` and Docker pulls complete through cfs with zero layer
-fetches (the unpack handshakes are answered from the stub; only the image
-metadata is downloaded), and `docker run` executes the stand-in rootfs.
+- Pulls of an image the store does not hold — including one that reuses a held
+  image's layers under a different config — are declined at the snapshotter's
+  admission gate.
+- `docker pull` completes with zero layer fetches and `docker run` prints the
+  seeded program's output — real image content, served from the knarr store.
+- Concurrent containers share one EROFS image mount and each get their own
+  flat overlay rootfs.
+- An existing container recovers after the shared image mount is unmounted
+  and the snapshotter is restarted.
+- Removing the image tears down the chain mount and its loop device.
+- Tampering with a backing object in the store makes the container fail with
+  an I/O error — fs-verity rejects the modified content when overlayfs opens
+  the file.
 
 ## Debugging Niceties
 
@@ -142,12 +166,11 @@ terminal, etc.):
 Both read `/var/log/cfs-devcontainer/containerd-cfs-grpc.log` (see Startup
 above) through `jq`.
 
-A plain `docker run` against the devcontainer's stand-in image content exits
-immediately once it prints its greeting, leaving nothing to inspect. Setting
-`CFS_STUB_HOLD` in the container's environment makes it print and then block
-instead, so the container and its overlay mount stay up for inspection from the
-host. See
-[docs/running.md](running.md#inspecting-a-running-container-devcontainer-stub)
+A plain `docker run` of the seeded test image exits immediately once it
+prints its greeting, leaving nothing to inspect. Running its `/hello` binary
+with the `sleep` argument makes it block instead, so the container and its
+overlay mount stay up for inspection from the host. See
+[docs/running.md](running.md#inspecting-a-running-container-devcontainer)
 for the full example.
 
 ## Comparing Against The erofs Snapshotter

@@ -31,6 +31,11 @@ sudo ./bin/containerd-cfs-grpc -knarr-root /var/lib/knarr &
 `/run/containerd-cfs-grpc/containerd-cfs-grpc.sock`, root
 `/var/lib/containerd-cfs-grpc`) match the config below. See `-help` for flags.
 
+The snapshotter root hosts each container's overlay upper and work
+directories, so it must live on a regular filesystem (ext4, xfs, …) — overlay
+cannot stack on overlay. The knarr store's filesystem must support fs-verity
+(on ext4 that means `mkfs.ext4 -O verity -b 4096`).
+
 ## 2. Configure containerd
 
 Put this in `/etc/containerd/config.toml`, then `sudo systemctl restart containerd`:
@@ -138,21 +143,24 @@ prevent an unheld cached config from using an otherwise held rootfs. Rootfs
 digest and fs-verity enforcement remain active independently of this admission
 gate.
 
-## Inspecting a running container (devcontainer stub)
+## Inspecting a running container (devcontainer)
 
-The devcontainer's stand-in rootfs is a single static `/hello` binary — also
-linked as `/bin/sh` and `/bin/bash` — that prints a line and exits, so a plain
-`docker run` finishes immediately, leaving nothing to inspect. Setting
-`CFS_STUB_HOLD` in the container's environment makes it print and then block,
-keeping the container and its overlay mount up:
+The devcontainer's seeded test image contains a single static `/hello` binary
+that prints its greeting and exits, so a plain `docker run` finishes
+immediately, leaving nothing to inspect. Run it with the `sleep` argument to
+make it block until stopped, keeping the container and its mounts up:
 
 ```sh
-docker run --rm -d -e CFS_STUB_HOLD=1 --name cfs-hold <image> /hello
+docker run --rm -d --name cfs-hold <image> /hello sleep
 pid="$(docker inspect -f '{{.State.Pid}}' cfs-hold)"
 cat "/proc/${pid}/mountinfo"   # or: findmnt -N "${pid}"
 docker stop cfs-hold           # clean shutdown, no SIGKILL wait
 ```
 
-The stub rootfs has no real shell, so `docker exec cfs-hold sh` just runs the
-same greeter again rather than giving an interactive session — inspect the
-mount from the host via the container's PID as above.
+The container's root is one `overlay` mount whose `lowerdir` ends with the
+image's EROFS metadata mount followed by `::<knarr objects>` (a data-only
+layer) and `verity=require`; the shared EROFS mount itself appears in the
+host's mount table under the snapshotter root
+(`.../containerd-cfs-grpc/snapshots/<id>/fs`, fstype `erofs`, on a loop
+device). The test image has no shell, so inspect the mounts from the host via
+the container's PID as above.
