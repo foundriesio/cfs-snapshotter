@@ -39,7 +39,7 @@ Inside the container:
 ```sh
 make run-cfs      # rebuild and restart the snapshotter after editing code
 make test         # unit tests
-make test-smoke   # end to end: ctr/docker pull and docker run through cfs
+make test-e2e     # end to end: ctr/docker pull and docker run through cfs
 ```
 
 To test manually, drive the snapshotter with plain `docker` and `ctr`

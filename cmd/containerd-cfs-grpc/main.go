@@ -3,8 +3,8 @@
 // Command containerd-cfs-grpc is the cfs-snapshotter daemon: a containerd
 // remote (proxy) snapshotter exposed over a gRPC unix socket. containerd is
 // pointed at it via a [proxy_plugins.cfs] entry in its config.toml (see
-// docs/running.md). The snapshotter is currently a remote-snapshotter stub
-// serving a stand-in rootfs in place of image content — see internal/snapshot.
+// docs/running.md). Image content is served from composefs images in the local
+// knarr store.
 package main
 
 import (
@@ -38,7 +38,6 @@ var (
 	rootDir      = flag.String("root", defaultRootDir, "path to the root directory for this snapshotter")
 	knarrRoot    = flag.String("knarr-root", "/var/lib/knarr", "path to the shared knarr image store root")
 	logLevel     = flag.String("log-level", log.InfoLevel.String(), "logging level [trace, debug, info, warn, error, fatal, panic]")
-	stubRootfs   = flag.String("stub-rootfs", "", "read-only directory standing in for image content as the base lower of every snapshot overlay (required)")
 	printVersion = flag.Bool("version", false, "print the version and exit")
 )
 
@@ -60,15 +59,15 @@ func main() {
 	}
 
 	ctx := log.WithLogger(context.Background(), log.L)
-	if err := run(ctx, *address, *rootDir, *stubRootfs, *knarrRoot); err != nil {
+	if err := run(ctx, *address, *rootDir, *knarrRoot); err != nil {
 		log.G(ctx).WithError(err).Fatal("cfs-snapshotter exited with error")
 	}
 }
 
 // run builds the snapshotter, serves it over a gRPC unix socket, and blocks
 // until SIGINT/SIGTERM, then shuts down gracefully.
-func run(ctx context.Context, address, root, stubRootfs, knarrRoot string) error {
-	sn, err := snapshot.NewSnapshotter(ctx, root, stubRootfs, knarrRoot)
+func run(ctx context.Context, address, root, knarrRoot string) error {
+	sn, err := snapshot.NewSnapshotter(ctx, root, knarrRoot)
 	if err != nil {
 		return fmt.Errorf("create snapshotter: %w", err)
 	}

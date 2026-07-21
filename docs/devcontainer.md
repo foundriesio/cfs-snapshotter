@@ -67,11 +67,8 @@ Reference release locations:
 Opening the devcontainer runs the image entrypoint. The entrypoint:
 
 - Starts Zot, `containerd`, and `dockerd`.
-- Builds the stand-in rootfs the stub serves
-  (`.devcontainer/scripts/make-stub-rootfs.sh`) and starts
-  `bin/containerd-cfs-grpc` with `-stub-rootfs` pointing at it, before
-  `containerd`, so containerd can register the `cfs` proxy snapshotter during
-  startup.
+- Starts `bin/containerd-cfs-grpc` before `containerd`, so containerd can
+  register the `cfs` proxy snapshotter during startup.
 - Waits for `ctr version`, `docker version`, and `docker info`.
 - Runs the requested command, or the default `sleep infinity` command for an
   interactive devcontainer session.
@@ -108,22 +105,22 @@ From the host, run a command inside the devcontainer with the nested daemon
 stack started:
 
 ```sh
-./devshell.sh make test-smoke
+./devshell.sh make test-e2e
 ```
 
 From an already-open devcontainer, run the smoke test:
 
 ```sh
-make test-smoke
+make test-e2e
 ```
 
-`make test-smoke` depends on `make run-cfs`, so it rebuilds and restarts the cfs
+`make test-e2e` depends on `make run-cfs`, so it rebuilds and restarts the cfs
 proxy before checking Docker and containerd routing.
 
 Run:
 
 ```sh
-.devcontainer/scripts/smoke-test-cfs-routing.sh
+.devcontainer/scripts/e2e-fastpath.sh
 ```
 
 The smoke test prints the actual runtime versions, runs `make fmt`, `make vet`,

@@ -92,8 +92,6 @@ RUN set -eux; \
     install -m 0755 mkfs/mkfs.erofs dump/dump.erofs fsck/fsck.erofs /opt/cfs-dev/bin/; \
     mkfs.erofs --help 2>&1 | grep -q -- --tar; \
     cd ..; \
-    # knarr shells out to mkcomposefs and mount.composefs; build the pinned
-    # composefs release from source (Debian ships no composefs tools).
     MULTIARCH="$(dpkg-architecture -qDEB_HOST_MULTIARCH)"; \
     git clone --depth 1 --branch "${COMPOSEFS_VERSION}" https://github.com/containers/composefs.git /tmp/composefs; \
     test "$(git -C /tmp/composefs rev-parse HEAD)" = "${COMPOSEFS_COMMIT}"; \
