@@ -36,6 +36,7 @@ const (
 var (
 	address      = flag.String("address", defaultAddress, "address for the snapshotter's gRPC server")
 	rootDir      = flag.String("root", defaultRootDir, "path to the root directory for this snapshotter")
+	knarrRoot    = flag.String("knarr-root", "/var/lib/knarr", "path to the shared knarr image store root")
 	logLevel     = flag.String("log-level", log.InfoLevel.String(), "logging level [trace, debug, info, warn, error, fatal, panic]")
 	stubRootfs   = flag.String("stub-rootfs", "", "read-only directory standing in for image content as the base lower of every snapshot overlay (required)")
 	printVersion = flag.Bool("version", false, "print the version and exit")
@@ -59,15 +60,15 @@ func main() {
 	}
 
 	ctx := log.WithLogger(context.Background(), log.L)
-	if err := run(ctx, *address, *rootDir, *stubRootfs); err != nil {
+	if err := run(ctx, *address, *rootDir, *stubRootfs, *knarrRoot); err != nil {
 		log.G(ctx).WithError(err).Fatal("cfs-snapshotter exited with error")
 	}
 }
 
 // run builds the snapshotter, serves it over a gRPC unix socket, and blocks
 // until SIGINT/SIGTERM, then shuts down gracefully.
-func run(ctx context.Context, address, root, stubRootfs string) error {
-	sn, err := snapshot.NewSnapshotter(ctx, root, stubRootfs)
+func run(ctx context.Context, address, root, stubRootfs, knarrRoot string) error {
+	sn, err := snapshot.NewSnapshotter(ctx, root, stubRootfs, knarrRoot)
 	if err != nil {
 		return fmt.Errorf("create snapshotter: %w", err)
 	}

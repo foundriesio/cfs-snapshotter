@@ -5,6 +5,7 @@ package snapshot
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -12,6 +13,7 @@ import (
 	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/containerd/containerd/v2/core/snapshots"
 	"github.com/containerd/errdefs"
+	"github.com/foundriesio/knarr/pkg/knarr"
 )
 
 func TestOptFieldsExposesLabels(t *testing.T) {
@@ -28,13 +30,13 @@ func TestOptFieldsExposesLabels(t *testing.T) {
 }
 
 func TestNewSnapshotterRejectsEmptyRoot(t *testing.T) {
-	if _, err := NewSnapshotter(context.Background(), "", ""); !errdefs.IsInvalidArgument(err) {
+	if _, err := NewSnapshotter(context.Background(), "", "", t.TempDir()); !errdefs.IsInvalidArgument(err) {
 		t.Fatalf("NewSnapshotter(%q) error = %v, want invalid argument", "", err)
 	}
 }
 
 func TestNewSnapshotterAcceptsValidRoot(t *testing.T) {
-	sn, err := NewSnapshotter(context.Background(), t.TempDir(), t.TempDir())
+	sn, err := NewSnapshotter(context.Background(), t.TempDir(), t.TempDir(), t.TempDir())
 	if err != nil {
 		t.Fatalf("NewSnapshotter() error = %v", err)
 	}
@@ -46,15 +48,60 @@ func TestNewSnapshotterAcceptsValidRoot(t *testing.T) {
 	}
 }
 
+func TestNewSnapshotterRejectsMountOptionSeparators(t *testing.T) {
+	ctx := context.Background()
+	for _, sep := range []string{":", ","} {
+		t.Run("root "+sep, func(t *testing.T) {
+			engine := &fakeEngine{objectsDir: t.TempDir()}
+			if _, err := newSnapshotter(ctx, t.TempDir()+sep+"root", t.TempDir(), engine); !errdefs.IsInvalidArgument(err) {
+				t.Fatalf("newSnapshotter() root error = %v, want invalid argument", err)
+			}
+		})
+		t.Run("objects "+sep, func(t *testing.T) {
+			engine := &fakeEngine{objectsDir: t.TempDir() + sep + "objects"}
+			if _, err := newSnapshotter(ctx, t.TempDir(), t.TempDir(), engine); !errdefs.IsInvalidArgument(err) {
+				t.Fatalf("newSnapshotter() objects error = %v, want invalid argument", err)
+			}
+		})
+	}
+}
+
+func TestIsMountedTreatsMissingPathAsNotMounted(t *testing.T) {
+	sn, err := newSnapshotter(context.Background(), t.TempDir(), t.TempDir(), &fakeEngine{objectsDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("newSnapshotter() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := sn.Close(); err != nil {
+			t.Errorf("Close() error = %v", err)
+		}
+	})
+	sn.mounted = func(string) (bool, error) {
+		return false, fmt.Errorf("stat mount target: %w", os.ErrNotExist)
+	}
+
+	mounted, err := sn.isMounted("/missing")
+	if err != nil {
+		t.Fatalf("isMounted() error = %v", err)
+	}
+	if mounted {
+		t.Fatal("isMounted() = true, want false")
+	}
+}
+
 // newTestSnapshotter returns a snapshotter over a fresh temp root and registers
 // its Close with t.Cleanup.
 func newTestSnapshotter(t *testing.T) snapshots.Snapshotter {
 	t.Helper()
-	sn, err := NewSnapshotter(context.Background(), t.TempDir(), t.TempDir())
+	sn, err := NewSnapshotter(context.Background(), t.TempDir(), t.TempDir(), t.TempDir())
 	if err != nil {
 		t.Fatalf("NewSnapshotter() error = %v", err)
 	}
-	t.Cleanup(func() { _ = sn.Close() })
+	t.Cleanup(func() {
+		if err := sn.Close(); err != nil {
+			t.Errorf("Close() error = %v", err)
+		}
+	})
 	return sn
 }
 
@@ -227,11 +274,15 @@ func TestUsage(t *testing.T) {
 func TestRemove(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
-	sn, err := NewSnapshotter(ctx, root, t.TempDir())
+	sn, err := NewSnapshotter(ctx, root, t.TempDir(), t.TempDir())
 	if err != nil {
 		t.Fatalf("NewSnapshotter() error = %v", err)
 	}
-	t.Cleanup(func() { _ = sn.Close() })
+	t.Cleanup(func() {
+		if err := sn.Close(); err != nil {
+			t.Errorf("Close() error = %v", err)
+		}
+	})
 
 	imageChain(t, ctx, sn, "img")
 	if _, err := sn.Prepare(ctx, "k", "img"); err != nil {
@@ -265,7 +316,7 @@ func TestPersistence(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
 
-	sn, err := NewSnapshotter(ctx, root, t.TempDir())
+	sn, err := NewSnapshotter(ctx, root, t.TempDir(), t.TempDir())
 	if err != nil {
 		t.Fatalf("NewSnapshotter() error = %v", err)
 	}
@@ -280,11 +331,15 @@ func TestPersistence(t *testing.T) {
 		t.Fatalf("Close() error = %v", err)
 	}
 
-	reopened, err := NewSnapshotter(ctx, root, t.TempDir())
+	reopened, err := NewSnapshotter(ctx, root, t.TempDir(), t.TempDir())
 	if err != nil {
 		t.Fatalf("NewSnapshotter() reopen error = %v", err)
 	}
-	t.Cleanup(func() { _ = reopened.Close() })
+	t.Cleanup(func() {
+		if err := reopened.Close(); err != nil {
+			t.Errorf("Close() error = %v", err)
+		}
+	})
 	if info, err := reopened.Stat(ctx, "committed"); err != nil {
 		t.Fatalf("Stat(committed) after reopen error = %v", err)
 	} else if info.Kind != snapshots.KindCommitted {
@@ -301,7 +356,7 @@ func TestPersistence(t *testing.T) {
 func TestPrepareIntermediateSnapshotAnswersAlreadyExists(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
-	sn, err := NewSnapshotter(ctx, root, t.TempDir())
+	sn, err := NewSnapshotter(ctx, root, t.TempDir(), t.TempDir())
 	if err != nil {
 		t.Fatalf("NewSnapshotter() error = %v", err)
 	}
@@ -371,15 +426,15 @@ func TestOverlayMountsComposeContainerFlow(t *testing.T) {
 		t.Fatalf("write stand-in: %v", err)
 	}
 
-	if _, err := NewSnapshotter(ctx, t.TempDir(), standIn+"/missing"); !errdefs.IsInvalidArgument(err) {
+	if _, err := NewSnapshotter(ctx, t.TempDir(), standIn+"/missing", t.TempDir()); !errdefs.IsInvalidArgument(err) {
 		t.Fatalf("missing rootfs dir error = %v, want invalid argument", err)
 	}
-	if _, err := NewSnapshotter(ctx, t.TempDir(), ""); !errdefs.IsInvalidArgument(err) {
+	if _, err := NewSnapshotter(ctx, t.TempDir(), "", t.TempDir()); !errdefs.IsInvalidArgument(err) {
 		t.Fatalf("empty rootfs error = %v, want invalid argument (the stand-in is required)", err)
 	}
 
 	root := t.TempDir()
-	sn, err := NewSnapshotter(ctx, root, standIn)
+	sn, err := NewSnapshotter(ctx, root, standIn, t.TempDir())
 	if err != nil {
 		t.Fatalf("NewSnapshotter() error = %v", err)
 	}
@@ -489,6 +544,34 @@ func TestOverlayMountsComposeContainerFlow(t *testing.T) {
 	if _, err := sn.Prepare(ctx, "scratch", ""); !errdefs.IsInvalidArgument(err) {
 		t.Fatalf("scratch Prepare error = %v, want invalid argument", err)
 	}
+}
+
+// fakeEngine implements engineAPI over an empty store, so tests can build a
+// snapshotter without a knarr data root behind it.
+type fakeEngine struct {
+	objectsDir string
+}
+
+var _ engineAPI = (*fakeEngine)(nil)
+
+func (*fakeEngine) Inspect(_ context.Context, ref string) (*knarr.ImageInfo, error) {
+	return nil, fmt.Errorf("inspect %s: %w", ref, knarr.ErrNotFound)
+}
+
+func (*fakeEngine) ResolveChain(_ context.Context, chainID string) (*knarr.ImageInfo, error) {
+	return nil, fmt.Errorf("resolve chain %s: %w", chainID, knarr.ErrNotFound)
+}
+
+func (*fakeEngine) Mount(context.Context, string, string, ...knarr.MountOption) error {
+	return nil
+}
+
+func (*fakeEngine) Unmount(context.Context, string) error {
+	return nil
+}
+
+func (e *fakeEngine) ObjectsDir() (string, error) {
+	return e.objectsDir, nil
 }
 
 // optionValue extracts a key=value mount option, failing the test when absent.

@@ -8,6 +8,8 @@ require (
 	github.com/containerd/continuity v0.5.0
 	github.com/containerd/errdefs v1.0.0
 	github.com/containerd/log v0.1.0
+	github.com/foundriesio/knarr v0.0.0-20260721105658-d74e6fbf50aa
+	github.com/moby/sys/mountinfo v0.7.2
 	golang.org/x/sys v0.47.0
 	google.golang.org/grpc v1.82.1
 )
@@ -19,9 +21,12 @@ require (
 	github.com/containerd/errdefs/pkg v0.3.0 // indirect
 	github.com/containerd/ttrpc v1.2.8 // indirect
 	github.com/containerd/typeurl/v2 v2.2.3 // indirect
+	github.com/docker/cli v29.4.3+incompatible // indirect
+	github.com/docker/docker-credential-helpers v0.9.3 // indirect
 	github.com/gogo/protobuf v1.3.2 // indirect
 	github.com/golang/groupcache v0.0.0-20241129210726-2c02b8208cf8 // indirect
-	github.com/moby/sys/mountinfo v0.7.2 // indirect
+	github.com/google/go-containerregistry v0.21.6 // indirect
+	github.com/klauspost/compress v1.19.0 // indirect
 	github.com/moby/sys/userns v0.1.0 // indirect
 	github.com/opencontainers/go-digest v1.0.0 // indirect
 	github.com/opencontainers/image-spec v1.1.1 // indirect
