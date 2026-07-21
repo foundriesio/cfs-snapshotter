@@ -73,6 +73,7 @@ package snapshot
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -83,6 +84,8 @@ import (
 	"github.com/containerd/containerd/v2/core/snapshots/storage"
 	"github.com/containerd/errdefs"
 	"github.com/containerd/log"
+	"github.com/foundriesio/knarr/pkg/knarr"
+	"github.com/moby/sys/mountinfo"
 
 	"github.com/containerd/continuity/fs"
 )
@@ -102,40 +105,31 @@ type snapshotter struct {
 	root string
 	// ms is the bolt-backed metadata store holding snapshot records.
 	ms *storage.MetaStore
+	// engine provides access to images in the local knarr store.
+	engine engineAPI
 	// stubRootfs names the read-only directory standing in for materialized
 	// image content: e.g. `docker run --rm <image> /hello` with a static
 	// /hello in the directory. Chain snapshots materialize their data plane
 	// as a symlink to it — never a copy — so it is the same for every image:
 	// it simulates image content, it is not image content.
 	stubRootfs string
+	// mounted reports whether a path is a mount point; it is mountinfo.Mounted
+	// in production and is replaced in tests.
+	mounted func(string) (bool, error)
 }
 
 // Compile-time assertion that *snapshotter satisfies the containerd interface.
 var _ snapshots.Snapshotter = (*snapshotter)(nil)
 
-// NewSnapshotter returns a snapshots.Snapshotter rooted at the given
-// directory, creating it, the metadata store, and the snapshots directory
-// beneath it as needed. stubRootfs must name an existing directory: the
-// stand-in tree serving as the base lower of every snapshot overlay (see the
-// package comment).
-func NewSnapshotter(ctx context.Context, root, stubRootfs string) (snapshots.Snapshotter, error) {
-	if root == "" {
-		return nil, fmt.Errorf("cfs snapshotter: root directory must not be empty: %w", errdefs.ErrInvalidArgument)
-	}
-	if fi, err := os.Stat(stubRootfs); err != nil || !fi.IsDir() {
-		return nil, fmt.Errorf("cfs snapshotter: stub rootfs %q is not a directory: %w", stubRootfs, errdefs.ErrInvalidArgument)
-	}
-	if err := os.MkdirAll(root, 0700); err != nil {
-		return nil, fmt.Errorf("cfs snapshotter: create root: %w", err)
-	}
-	ms, err := storage.NewMetaStore(filepath.Join(root, "metadata.db"))
+// NewSnapshotter returns a snapshots.Snapshotter rooted at root, serving the
+// stand-in tree at stubRootfs while resolving images from the knarr store at
+// knarrRoot.
+func NewSnapshotter(ctx context.Context, root, stubRootfs, knarrRoot string) (snapshots.Snapshotter, error) {
+	engine, err := knarr.New(knarr.Config{Root: knarrRoot})
 	if err != nil {
-		return nil, fmt.Errorf("cfs snapshotter: open metadata store: %w", err)
+		return nil, fmt.Errorf("create knarr engine: %w", err)
 	}
-	if err := os.Mkdir(filepath.Join(root, "snapshots"), 0700); err != nil && !os.IsExist(err) {
-		return nil, fmt.Errorf("cfs snapshotter: create snapshots dir: %w", err)
-	}
-	return &snapshotter{root: root, ms: ms, stubRootfs: stubRootfs}, nil
+	return newSnapshotter(ctx, root, stubRootfs, engine)
 }
 
 // optFields renders the snapshot info fields the given opts set. An Opt
@@ -162,6 +156,56 @@ func optFields(opts []snapshots.Opt) log.Fields {
 		fields["labels"] = info.Labels
 	}
 	return fields
+}
+
+func newSnapshotter(ctx context.Context, root, stubRootfs string, engine engineAPI) (*snapshotter, error) {
+	if root == "" {
+		return nil, fmt.Errorf("cfs snapshotter: root directory must not be empty: %w", errdefs.ErrInvalidArgument)
+	}
+	if strings.ContainsAny(root, ":,") {
+		return nil, fmt.Errorf("cfs snapshotter: root directory must not contain ':' or ',' (paths under it become overlay mount options): %w", errdefs.ErrInvalidArgument)
+	}
+	if fi, err := os.Stat(stubRootfs); err != nil || !fi.IsDir() {
+		return nil, fmt.Errorf("cfs snapshotter: stub rootfs %q is not a directory: %w", stubRootfs, errdefs.ErrInvalidArgument)
+	}
+	objectsDir, err := engine.ObjectsDir()
+	if err != nil {
+		return nil, fmt.Errorf("cfs snapshotter: resolve knarr object directory: %w", err)
+	}
+	if strings.ContainsAny(objectsDir, ":,") {
+		return nil, fmt.Errorf("cfs snapshotter: knarr object directory must not contain ':' or ',' (it becomes an overlay mount option): %w", errdefs.ErrInvalidArgument)
+	}
+	if err := os.MkdirAll(root, 0700); err != nil {
+		return nil, fmt.Errorf("cfs snapshotter: create root: %w", err)
+	}
+	ms, err := storage.NewMetaStore(filepath.Join(root, "metadata.db"))
+	if err != nil {
+		return nil, fmt.Errorf("cfs snapshotter: open metadata store: %w", err)
+	}
+	if err := os.Mkdir(filepath.Join(root, "snapshots"), 0700); err != nil && !os.IsExist(err) {
+		return nil, fmt.Errorf("cfs snapshotter: create snapshots dir: %w", err)
+	}
+	return &snapshotter{
+		root:       root,
+		ms:         ms,
+		engine:     engine,
+		stubRootfs: stubRootfs,
+		mounted:    mountinfo.Mounted,
+	}, nil
+}
+
+// engineAPI is the subset of knarr.Engine the snapshotter uses: reading the
+// local store (Inspect, ResolveChain, ObjectsDir) and mounting from it (Mount,
+// Unmount). Pull, Publish, and Remove are deliberately excluded — content is
+// fetched, built, and deleted out of band, never by the snapshotter, which
+// only reads and mounts — so snapshotter code cannot casually reach for them.
+// The narrow surface is also the seam the tests fake.
+type engineAPI interface {
+	Inspect(ctx context.Context, ref string) (*knarr.ImageInfo, error)
+	ResolveChain(ctx context.Context, chainID string) (*knarr.ImageInfo, error)
+	Mount(ctx context.Context, ref, target string, opts ...knarr.MountOption) error
+	Unmount(ctx context.Context, target string) error
+	ObjectsDir() (string, error)
 }
 
 // Stat returns the info for an active or committed snapshot by key. It is the
@@ -595,4 +639,17 @@ func (s *snapshotter) Close() error {
 		return nil
 	}
 	return s.ms.Close()
+}
+
+// isMounted reports whether path is a mount point, treating a missing path as
+// not mounted.
+func (s *snapshotter) isMounted(path string) (bool, error) {
+	mounted, err := s.mounted(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, fmt.Errorf("check mount %s: %w", path, err)
+	}
+	return mounted, nil
 }
