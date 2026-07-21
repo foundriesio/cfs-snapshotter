@@ -132,32 +132,6 @@ func NewSnapshotter(ctx context.Context, root, stubRootfs, knarrRoot string) (sn
 	return newSnapshotter(ctx, root, stubRootfs, engine)
 }
 
-// optFields renders the snapshot info fields the given opts set. An Opt
-// mutates an Info, so applying the opts to a zero Info exposes exactly what
-// the caller attached — in practice the labels, which carry the
-// remote-snapshotter protocol (the containerd.io/snapshot.ref name and the
-// containerd.io/snapshot/* chain labels) and are otherwise invisible until
-// they land in the metadata store.
-func optFields(opts []snapshots.Opt) log.Fields {
-	var info snapshots.Info
-	for _, opt := range opts {
-		if err := opt(&info); err != nil {
-			return log.Fields{"optserror": err.Error()}
-		}
-	}
-	fields := log.Fields{}
-	if info.Name != "" {
-		fields["optname"] = info.Name
-	}
-	if info.Parent != "" {
-		fields["optparent"] = info.Parent
-	}
-	if len(info.Labels) > 0 {
-		fields["labels"] = info.Labels
-	}
-	return fields
-}
-
 func newSnapshotter(ctx context.Context, root, stubRootfs string, engine engineAPI) (*snapshotter, error) {
 	if root == "" {
 		return nil, fmt.Errorf("cfs snapshotter: root directory must not be empty: %w", errdefs.ErrInvalidArgument)
@@ -334,37 +308,6 @@ func (s *snapshotter) Prepare(ctx context.Context, key, parent string, opts ...s
 	return s.createSnapshot(ctx, snapshots.KindActive, key, parent, opts)
 }
 
-// createAndCommitIntermediateVirtualSnapshot answers the unpack handshake:
-// the snapshot the caller asks about is recorded as pure metadata — created
-// and committed under the requested name, with the caller's labels and zero
-// usage, in one transaction — and ErrAlreadyExists is reported so the caller
-// skips fetching and applying the layer. The snapshot is virtual: nothing
-// ever mounts an intermediate snapshot, so no directory is provisioned, and
-// a concurrent handshake that loses the commit race rolls back whole,
-// leaving nothing to clean up. In this stub the record only claims the chain
-// exists; the stub's replacement verifies the content really is present
-// locally before answering.
-func (s *snapshotter) createAndCommitIntermediateVirtualSnapshot(ctx context.Context, key, parent, name string, labels map[string]string, opts []snapshots.Opt) error {
-	err := s.ms.WithTransaction(ctx, true, func(ctx context.Context) error {
-		if _, err := storage.CreateSnapshot(ctx, snapshots.KindActive, key, parent, opts...); err != nil {
-			return fmt.Errorf("create intermediate snapshot %q: %w", name, err)
-		}
-		if _, err := storage.CommitActive(ctx, key, name, snapshots.Usage{}, append(opts, snapshots.WithLabels(labels))...); err != nil {
-			return fmt.Errorf("commit intermediate snapshot %q: %w", name, err)
-		}
-		return nil
-	})
-	if err != nil && !errdefs.IsAlreadyExists(err) {
-		return err
-	}
-	log.G(ctx).WithFields(log.Fields{
-		"key":    key,
-		"name":   name,
-		"parent": parent,
-	}).Info("stub-committed intermediate virtual snapshot")
-	return fmt.Errorf("intermediate virtual snapshot %q: %w", name, errdefs.ErrAlreadyExists)
-}
-
 // View records a new read-only snapshot under key, descending from parent, and
 // returns its mounts. Views are how a caller inspects committed content
 // without creating a writable layer — containerd's differ and image export
@@ -456,6 +399,73 @@ func (s *snapshotter) Walk(ctx context.Context, fn snapshots.WalkFunc, filters .
 	return s.ms.WithTransaction(ctx, false, func(ctx context.Context) error {
 		return storage.WalkInfo(ctx, fn, filters...)
 	})
+}
+
+// Close releases the snapshotter's metadata store. It is safe to call on an
+// already-closed snapshotter.
+func (s *snapshotter) Close() error {
+	log.L.Trace("cfs snapshotter: close")
+	if s.ms == nil {
+		return nil
+	}
+	return s.ms.Close()
+}
+
+// optFields renders the snapshot info fields the given opts set. An Opt
+// mutates an Info, so applying the opts to a zero Info exposes exactly what
+// the caller attached — in practice the labels, which carry the
+// remote-snapshotter protocol (the containerd.io/snapshot.ref name and the
+// containerd.io/snapshot/* chain labels) and are otherwise invisible until
+// they land in the metadata store.
+func optFields(opts []snapshots.Opt) log.Fields {
+	var info snapshots.Info
+	for _, opt := range opts {
+		if err := opt(&info); err != nil {
+			return log.Fields{"optserror": err.Error()}
+		}
+	}
+	fields := log.Fields{}
+	if info.Name != "" {
+		fields["optname"] = info.Name
+	}
+	if info.Parent != "" {
+		fields["optparent"] = info.Parent
+	}
+	if len(info.Labels) > 0 {
+		fields["labels"] = info.Labels
+	}
+	return fields
+}
+
+// createAndCommitIntermediateVirtualSnapshot answers the unpack handshake:
+// the snapshot the caller asks about is recorded as pure metadata — created
+// and committed under the requested name, with the caller's labels and zero
+// usage, in one transaction — and ErrAlreadyExists is reported so the caller
+// skips fetching and applying the layer. The snapshot is virtual: nothing
+// ever mounts an intermediate snapshot, so no directory is provisioned, and
+// a concurrent handshake that loses the commit race rolls back whole,
+// leaving nothing to clean up. In this stub the record only claims the chain
+// exists; the stub's replacement verifies the content really is present
+// locally before answering.
+func (s *snapshotter) createAndCommitIntermediateVirtualSnapshot(ctx context.Context, key, parent, name string, labels map[string]string, opts []snapshots.Opt) error {
+	err := s.ms.WithTransaction(ctx, true, func(ctx context.Context) error {
+		if _, err := storage.CreateSnapshot(ctx, snapshots.KindActive, key, parent, opts...); err != nil {
+			return fmt.Errorf("create intermediate snapshot %q: %w", name, err)
+		}
+		if _, err := storage.CommitActive(ctx, key, name, snapshots.Usage{}, append(opts, snapshots.WithLabels(labels))...); err != nil {
+			return fmt.Errorf("commit intermediate snapshot %q: %w", name, err)
+		}
+		return nil
+	})
+	if err != nil && !errdefs.IsAlreadyExists(err) {
+		return err
+	}
+	log.G(ctx).WithFields(log.Fields{
+		"key":    key,
+		"name":   name,
+		"parent": parent,
+	}).Info("stub-committed intermediate virtual snapshot")
+	return fmt.Errorf("intermediate virtual snapshot %q: %w", name, errdefs.ErrAlreadyExists)
 }
 
 // createSnapshot records an active or view snapshot in the metadata store
@@ -629,16 +639,6 @@ func (s *snapshotter) materializeChain(ctx context.Context, id string) error {
 func pathExists(path string) bool {
 	_, err := os.Lstat(path)
 	return err == nil
-}
-
-// Close releases the snapshotter's metadata store. It is safe to call on an
-// already-closed snapshotter.
-func (s *snapshotter) Close() error {
-	log.L.Trace("cfs snapshotter: close")
-	if s.ms == nil {
-		return nil
-	}
-	return s.ms.Close()
 }
 
 // isMounted reports whether path is a mount point, treating a missing path as
