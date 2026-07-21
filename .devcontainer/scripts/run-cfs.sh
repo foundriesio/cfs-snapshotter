@@ -146,13 +146,7 @@ main() {
 	bind_root cfs "${CFS_ROOT}"
 	bind_root knarr "${KNARR_ROOT}"
 	local old_hash new_hash old_state new_state
-	# The snapshotter requires a stand-in rootfs; build the default one when
-	# the caller does not supply a directory.
-	local stub_rootfs="${CFS_STUB_ROOTFS:-/tmp/cfs-stub-rootfs}"
-	if [ ! -e "${stub_rootfs}/hello" ] || [ ! -e "${stub_rootfs}/bin/sh" ]; then
-		"${ROOT_DIR}/.devcontainer/scripts/make-stub-rootfs.sh" "${stub_rootfs}"
-	fi
-	new_state="${CFS_LOG_LEVEL} ${stub_rootfs} ${KNARR_ROOT}"
+	new_state="${CFS_LOG_LEVEL} ${KNARR_ROOT}"
 	old_hash="$(file_hash "${CONTAINERD_CFS_GRPC_BIN}")"
 	old_state="$(cat "${CFS_STATE_FILE}" 2>/dev/null || true)"
 	make -C "${ROOT_DIR}" build
@@ -170,7 +164,7 @@ main() {
 			"${CFS_SOCKET}" \
 			"${CFS_LOGFILE}" \
 			"${CONTAINERD_CFS_GRPC_BIN}" -log-level "${CFS_LOG_LEVEL}" \
-			-stub-rootfs "${stub_rootfs}" -knarr-root "${KNARR_ROOT}"
+			-knarr-root "${KNARR_ROOT}"
 		printf '%s\n' "${new_state}" >"${CFS_STATE_FILE}"
 	fi
 	wait_for cfs-snapshotter test -S "${CFS_SOCKET}"

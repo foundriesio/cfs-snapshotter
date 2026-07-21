@@ -9,13 +9,17 @@ require_cfs_devcontainer
 
 CONTAINERD_SOCKET=${CONTAINERD_SOCKET:-/run/containerd/containerd.sock}
 REGISTRY_URL=${REGISTRY_URL:-http://127.0.0.1:5000}
-IMAGE_REF=${1:-127.0.0.1:5000/cfs/smoke:latest}
+IMAGE_REF=${1:-127.0.0.1:5000/cfs/e2e:latest}
 SEED_NAMESPACE=${SEED_NAMESPACE:-cfs-seed}
-KNARR_BIN=${KNARR_BIN:-/opt/cfs-dev/bin/knarr}
+SEED_LAYER_COUNT=${SEED_LAYER_COUNT:-1}
+SEED_NONCE=${SEED_NONCE:-}
+SEED_KEEP_LAYOUT=${SEED_KEEP_LAYOUT:-}
+SEED_RUNNABLE=${SEED_RUNNABLE:-}
+
+work=""
 
 detect_architecture() {
-	local arch
-	arch="${SMOKE_ARCH:-}"
+	local arch="${SMOKE_ARCH:-}"
 	if [ -z "${arch}" ] && command -v go >/dev/null 2>&1; then
 		arch="$(go env GOARCH)"
 	fi
@@ -27,7 +31,7 @@ detect_architecture() {
 		amd64 | x86_64) echo amd64 ;;
 		arm64 | aarch64) echo arm64 ;;
 		arm | armv7l) echo arm ;;
-		*) echo "unsupported smoke image architecture: ${arch}" >&2; return 1 ;;
+		*) echo "unsupported e2e image architecture: ${arch}" >&2; return 1 ;;
 	esac
 }
 
@@ -38,9 +42,21 @@ wait_for_registry() {
 		fi
 		sleep 1
 	done
-
 	echo "timed out waiting for ${REGISTRY_URL}" >&2
 	return 1
+}
+
+validate_layer_count() {
+	case "${SEED_LAYER_COUNT}" in
+		'' | *[!0-9]*)
+			echo "SEED_LAYER_COUNT must be a positive integer" >&2
+			return 1
+			;;
+	esac
+	if [ "${SEED_LAYER_COUNT}" -lt 1 ]; then
+		echo "SEED_LAYER_COUNT must be a positive integer" >&2
+		return 1
+	fi
 }
 
 digest_file() {
@@ -51,84 +67,124 @@ size_file() {
 	stat -c '%s' "$1"
 }
 
-write_image_layout() {
-	local work="$1"
-	local architecture="$2"
-	local oci="${work}/oci"
-	local rootfs="${work}/rootfs"
+append_json_item() {
+	local current="$1" item="$2"
+	if [ -n "${current}" ]; then
+		printf '%s,%s' "${current}" "${item}"
+	else
+		printf '%s' "${item}"
+	fi
+}
 
-	mkdir -p "${oci}/blobs/sha256" "${rootfs}"
-	printf 'cfs smoke test\n' >"${rootfs}/hello.txt"
+write_layer_rootfs() {
+	local rootfs="$1" layer="$2"
+	mkdir -p "${rootfs}"
+	if [ "${layer}" = 1 ] && [ -n "${SEED_RUNNABLE}" ]; then
+		local source_dir
+		source_dir="$(mktemp -d)"
+		cat >"${source_dir}/hello.go" <<EOF
+package main
 
-	tar -C "${rootfs}" -cf "${work}/layer.tar" .
-	gzip -n -c "${work}/layer.tar" >"${work}/layer.tar.gz"
+import (
+	"os"
+	"os/signal"
+	"syscall"
+)
 
-	local layer_diff_id layer_digest layer_size
-	layer_diff_id="$(digest_file "${work}/layer.tar")"
-	layer_digest="$(digest_file "${work}/layer.tar.gz")"
-	layer_size="$(size_file "${work}/layer.tar.gz")"
-	cp "${work}/layer.tar.gz" "${oci}/blobs/sha256/${layer_digest}"
-
-	cat >"${work}/config.json" <<EOF
-{"created":"1970-01-01T00:00:00Z","architecture":"${architecture}","os":"linux","config":{},"rootfs":{"type":"layers","diff_ids":["sha256:${layer_diff_id}"]},"history":[{"created":"1970-01-01T00:00:00Z","created_by":"cfs devcontainer smoke image"}]}
+func main() {
+	if len(os.Args) > 1 && os.Args[1] == "sleep" {
+		term := make(chan os.Signal, 1)
+		signal.Notify(term, syscall.SIGTERM)
+		<-term
+		return
+	}
+	if err := os.WriteFile("/scratch.txt", []byte("rw"), 0o644); err != nil {
+		os.Stderr.WriteString("write: " + err.Error() + "\n")
+		os.Exit(1)
+	}
+	os.Stdout.WriteString("cfs hello ${SEED_NONCE}\n")
+}
 EOF
+		CGO_ENABLED=0 go build -trimpath -o "${rootfs}/hello" "${source_dir}/hello.go"
+		rm -rf "${source_dir}" || echo "warning: failed to remove ${source_dir}" >&2
+	fi
+	printf 'cfs e2e layer %s %s\n' "${layer}" "${SEED_NONCE}" >"${rootfs}/layer-${layer}.txt"
+}
 
+write_image_layout() {
+	local architecture="$1" tag="$2"
+	local oci="${work}/oci" diff_ids="" layers=""
+	mkdir -p "${oci}/blobs/sha256"
+
+	local i
+	for i in $(seq 1 "${SEED_LAYER_COUNT}"); do
+		local rootfs="${work}/rootfs-${i}"
+		local layer_tar="${work}/layer-${i}.tar"
+		local layer_gz="${work}/layer-${i}.tar.gz"
+		write_layer_rootfs "${rootfs}" "${i}"
+		tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner \
+			-C "${rootfs}" -cf "${layer_tar}" .
+		gzip -n -c "${layer_tar}" >"${layer_gz}"
+
+		local diff_id digest size
+		diff_id="$(digest_file "${layer_tar}")"
+		digest="$(digest_file "${layer_gz}")"
+		size="$(size_file "${layer_gz}")"
+		cp "${layer_gz}" "${oci}/blobs/sha256/${digest}"
+		diff_ids="$(append_json_item "${diff_ids}" "\"sha256:${diff_id}\"")"
+		layers="$(append_json_item "${layers}" "{\"mediaType\":\"application/vnd.oci.image.layer.v1.tar+gzip\",\"digest\":\"sha256:${digest}\",\"size\":${size}}")"
+	done
+
+	local config=""
+	if [ -n "${SEED_RUNNABLE}" ]; then
+		config='"Cmd":["/hello"]'
+	fi
+	cat >"${work}/config.json" <<EOF
+{"created":"1970-01-01T00:00:00Z","architecture":"${architecture}","os":"linux","config":{${config}},"rootfs":{"type":"layers","diff_ids":[${diff_ids}]}}
+EOF
 	local config_digest config_size
 	config_digest="$(digest_file "${work}/config.json")"
 	config_size="$(size_file "${work}/config.json")"
 	cp "${work}/config.json" "${oci}/blobs/sha256/${config_digest}"
 
 	cat >"${work}/manifest.json" <<EOF
-{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:${config_digest}","size":${config_size}},"layers":[{"mediaType":"application/vnd.oci.image.layer.v1.tar+gzip","digest":"sha256:${layer_digest}","size":${layer_size}}]}
+{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:${config_digest}","size":${config_size}},"layers":[${layers}]}
 EOF
-
 	local manifest_digest manifest_size
 	manifest_digest="$(digest_file "${work}/manifest.json")"
 	manifest_size="$(size_file "${work}/manifest.json")"
 	cp "${work}/manifest.json" "${oci}/blobs/sha256/${manifest_digest}"
 
 	cat >"${oci}/index.json" <<EOF
-{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:${manifest_digest}","size":${manifest_size},"platform":{"architecture":"${architecture}","os":"linux"},"annotations":{"org.opencontainers.image.ref.name":"latest"}}]}
+{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:${manifest_digest}","size":${manifest_size},"platform":{"architecture":"${architecture}","os":"linux"},"annotations":{"org.opencontainers.image.ref.name":"${tag}"}}]}
 EOF
 	printf '{"imageLayoutVersion":"1.0.0"}\n' >"${oci}/oci-layout"
-
-	tar -C "${oci}" -cf "${work}/smoke.oci.tar" .
+	tar -C "${oci}" -cf "${work}/image.oci.tar" .
 }
 
-# seed_knarr_store stages the just-built image in the local knarr store by
-# sideloading the OCI layout, pinned by its manifest digest. The devshell
-# mounts the knarr CLI in best-effort, so skip with a warning when it is
-# absent instead of failing the registry seeding.
-seed_knarr_store() {
-	local work="$1" repo="$2" digest
-	if [ ! -x "${KNARR_BIN}" ]; then
-		echo "warning: knarr CLI not found at ${KNARR_BIN}; skipping knarr store seeding" >&2
-		return 0
+cleanup() {
+	if [ -n "${work}" ] && [ -e "${work}" ]; then
+		rm -rf "${work}" || echo "warning: failed to remove ${work}" >&2
 	fi
-	digest="$(jq -r '.manifests[0].digest' "${work}/oci/index.json")"
-	"${KNARR_BIN}" pull --from-dir "${work}/oci" "${repo}@${digest}"
-	echo "seeded knarr store with ${repo}@${digest}"
 }
 
 main() {
 	wait_for_registry
-
-	local work
+	validate_layer_count
 	work="$(mktemp -d)"
-	trap "rm -rf '${work}'" EXIT
+	trap cleanup EXIT
 
-	write_image_layout "${work}" "$(detect_architecture)"
+	local base_name="${IMAGE_REF%:*}" tag="${IMAGE_REF##*:}"
+	write_image_layout "$(detect_architecture)" "${tag}"
+	if [ -n "${SEED_KEEP_LAYOUT}" ]; then
+		mkdir -p "${SEED_KEEP_LAYOUT}"
+		cp -a "${work}/oci/." "${SEED_KEEP_LAYOUT}/"
+	fi
 
 	ctr --address "${CONTAINERD_SOCKET}" --namespace "${SEED_NAMESPACE}" images import \
-		--digests \
-		--base-name "${IMAGE_REF%:*}" \
-		"${work}/smoke.oci.tar"
+		--digests --no-unpack --base-name "${base_name}" "${work}/image.oci.tar"
 	ctr --address "${CONTAINERD_SOCKET}" --namespace "${SEED_NAMESPACE}" images push \
-		--plain-http \
-		"${IMAGE_REF}"
-
-	seed_knarr_store "${work}" "${IMAGE_REF%:*}"
-
+		--plain-http "${IMAGE_REF}"
 	echo "seeded ${IMAGE_REF}"
 }
 

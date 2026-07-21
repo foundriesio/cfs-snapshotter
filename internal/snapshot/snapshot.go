@@ -9,13 +9,13 @@
 // root/snapshots holding its overlay upper and work directories. A snapshot
 // mount is one flat overlay assembled by walking the parent chain: committed
 // ancestors' upper directories stack as lowers, and the walk stops at the
-// first image chain snapshot, whose data plane — materialized at first use
-// as a stand-in for the image content — is the base lower. The snapshot's
-// own upper receives its writes. Content-addressed composefs materialization
-// later keeps this exact shape, only putting the real image where the
-// stand-in link points. Until then the implementation is a remote-snapshotter
-// stub: every unpack handshake is answered as if the content were already
-// present locally (see the calling contract below).
+// first image chain snapshot, whose data plane — the image's read-only EROFS
+// metadata mount, with the knarr object directory stacked below it as a
+// data-only lower requiring fs-verity — is the base lower. The snapshot's own
+// upper receives its writes. The image content is staged out of band in the
+// knarr store; the snapshotter only reads and mounts it, and every unpack
+// handshake is answered as if the content were already present locally (see
+// the calling contract below).
 //
 // # Calling contract
 //
@@ -42,15 +42,10 @@
 // committed snapshot the unpacker actually wants. A snapshotter that can
 // produce that snapshot without the caller fetching anything answers
 // ErrAlreadyExists, which skips the fetch/apply/Commit round for that layer.
-// This stub always answers that way, so a pull completes with zero layer
-// fetches (the caller still downloads the image metadata: index, manifest,
-// config, etc.) — but
-// the committed records carry no image content. The mounts the
-// container flow receives are instead overlays whose base lower is a
-// stand-in rootfs (the daemon's -stub-rootfs flag), so the whole lifecycle
-// through `docker run` can be exercised, against stand-in content that is
-// the same for every image. Materializing real image content behind the
-// handshake is what replaces this stub.
+// When it does, the pull completes with zero layer fetches — the caller still
+// downloads the image metadata (index, manifest, config, etc.) — and the
+// mounts the container flow later receives compose the image's EROFS metadata
+// and knarr objects as the base of one flat overlay (see mounts).
 //
 // Container creation (the docker daemon, via containerd) prepares two
 // snapshots on top of the image's full chain:
@@ -78,6 +73,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/containerd/containerd/v2/core/snapshots"
@@ -95,52 +91,45 @@ import (
 // layer chain to exist as a committed snapshot. Such snapshots are
 // intermediate — they are only ever parents of other snapshots, never mounted
 // themselves — and start out virtual: pure metadata records whose data plane
-// materializes only if and when a descendant snapshot needs the image (see
-// materializeChain).
+// is mounted only if and when a descendant snapshot needs the image.
 const intermediateSnapshotLabel = "containerd.io/snapshot.ref"
 
 // snapshotter is the cfs-snapshotter implementation of snapshots.Snapshotter.
 type snapshotter struct {
 	// root is the snapshotter's root directory.
 	root string
+	// objectsDir is the knarr store's backing-object directory.
+	objectsDir string
 	// ms is the bolt-backed metadata store holding snapshot records.
 	ms *storage.MetaStore
 	// engine provides access to images in the local knarr store.
 	engine engineAPI
-	// stubRootfs names the read-only directory standing in for materialized
-	// image content: e.g. `docker run --rm <image> /hello` with a static
-	// /hello in the directory. Chain snapshots materialize their data plane
-	// as a symlink to it — never a copy — so it is the same for every image:
-	// it simulates image content, it is not image content.
-	stubRootfs string
 	// mounted reports whether a path is a mount point; it is mountinfo.Mounted
 	// in production and is replaced in tests.
 	mounted func(string) (bool, error)
+	// mountMu serializes shared chain mount creation and teardown.
+	mountMu sync.Mutex
 }
 
 // Compile-time assertion that *snapshotter satisfies the containerd interface.
 var _ snapshots.Snapshotter = (*snapshotter)(nil)
 
-// NewSnapshotter returns a snapshots.Snapshotter rooted at root, serving the
-// stand-in tree at stubRootfs while resolving images from the knarr store at
-// knarrRoot.
-func NewSnapshotter(ctx context.Context, root, stubRootfs, knarrRoot string) (snapshots.Snapshotter, error) {
+// NewSnapshotter returns a snapshots.Snapshotter rooted at root, serving
+// composefs images from the knarr store at knarrRoot.
+func NewSnapshotter(ctx context.Context, root, knarrRoot string) (snapshots.Snapshotter, error) {
 	engine, err := knarr.New(knarr.Config{Root: knarrRoot})
 	if err != nil {
 		return nil, fmt.Errorf("create knarr engine: %w", err)
 	}
-	return newSnapshotter(ctx, root, stubRootfs, engine)
+	return newSnapshotter(ctx, root, engine)
 }
 
-func newSnapshotter(ctx context.Context, root, stubRootfs string, engine engineAPI) (*snapshotter, error) {
+func newSnapshotter(ctx context.Context, root string, engine engineAPI) (*snapshotter, error) {
 	if root == "" {
 		return nil, fmt.Errorf("cfs snapshotter: root directory must not be empty: %w", errdefs.ErrInvalidArgument)
 	}
 	if strings.ContainsAny(root, ":,") {
 		return nil, fmt.Errorf("cfs snapshotter: root directory must not contain ':' or ',' (paths under it become overlay mount options): %w", errdefs.ErrInvalidArgument)
-	}
-	if fi, err := os.Stat(stubRootfs); err != nil || !fi.IsDir() {
-		return nil, fmt.Errorf("cfs snapshotter: stub rootfs %q is not a directory: %w", stubRootfs, errdefs.ErrInvalidArgument)
 	}
 	objectsDir, err := engine.ObjectsDir()
 	if err != nil {
@@ -161,23 +150,22 @@ func newSnapshotter(ctx context.Context, root, stubRootfs string, engine engineA
 	}
 	return &snapshotter{
 		root:       root,
+		objectsDir: objectsDir,
 		ms:         ms,
 		engine:     engine,
-		stubRootfs: stubRootfs,
 		mounted:    mountinfo.Mounted,
 	}, nil
 }
 
 // engineAPI is the subset of knarr.Engine the snapshotter uses: reading the
-// local store (Inspect, ResolveChain, ObjectsDir) and mounting from it (Mount,
-// Unmount). Pull, Publish, and Remove are deliberately excluded — content is
-// fetched, built, and deleted out of band, never by the snapshotter, which
-// only reads and mounts — so snapshotter code cannot casually reach for them.
-// The narrow surface is also the seam the tests fake.
+// local store (Inspect, ObjectsDir) and mounting an image chain from it
+// (MountChain, Unmount). Pull, Publish, and Remove are deliberately excluded —
+// content is fetched, built, and deleted out of band, never by the
+// snapshotter, which only reads and mounts — so snapshotter code cannot
+// casually reach for them. The narrow surface is also the seam the tests fake.
 type engineAPI interface {
 	Inspect(ctx context.Context, ref string) (*knarr.ImageInfo, error)
-	ResolveChain(ctx context.Context, chainID string) (*knarr.ImageInfo, error)
-	Mount(ctx context.Context, ref, target string, opts ...knarr.MountOption) error
+	MountChain(ctx context.Context, chainID, target string, opts ...knarr.MountOption) error
 	Unmount(ctx context.Context, target string) error
 	ObjectsDir() (string, error)
 }
@@ -253,20 +241,9 @@ func (s *snapshotter) Usage(ctx context.Context, key string) (usage snapshots.Us
 // re-fetch mount specs rather than caching what Prepare returned — a runtime
 // typically calls Mounts just before starting a container — so the specs must
 // stay reproducible for the lifetime of the snapshot.
-func (s *snapshotter) Mounts(ctx context.Context, key string) (_ []mount.Mount, err error) {
+func (s *snapshotter) Mounts(ctx context.Context, key string) ([]mount.Mount, error) {
 	log.G(ctx).WithField("key", key).Trace("cfs snapshotter: mounts")
-	var sn storage.Snapshot
-	err = s.ms.WithTransaction(ctx, false, func(ctx context.Context) error {
-		sn, err = storage.GetSnapshot(ctx, key)
-		if err != nil {
-			return fmt.Errorf("failed to get snapshot mount: %w", err)
-		}
-		return nil
-	})
-	if err != nil {
-		return nil, err
-	}
-	return s.mounts(ctx, sn)
+	return s.mounts(ctx, key)
 }
 
 // Prepare records a new active snapshot under key, descending from parent,
@@ -275,8 +252,9 @@ func (s *snapshotter) Mounts(ctx context.Context, key string) (_ []mount.Mount, 
 // needs only a metadata record — created and committed virtually in one
 // transaction, no directory ever provisioned — and is answered with
 // ErrAlreadyExists instead of mounts. Everything else gets a directory-backed
-// active snapshot and overlay mounts composing the stand-in rootfs, the
-// uppers of its committed ancestors, and its own upper (see mounts).
+// active snapshot and overlay mounts composing the image metadata, the knarr
+// objects, the uppers of its committed ancestors, and its own upper (see
+// mounts).
 func (s *snapshotter) Prepare(ctx context.Context, key, parent string, opts ...snapshots.Opt) ([]mount.Mount, error) {
 	log.G(ctx).WithFields(log.Fields{"key": key, "parent": parent}).
 		WithFields(optFields(opts)).Trace("cfs snapshotter: prepare")
@@ -361,12 +339,21 @@ func (s *snapshotter) Remove(ctx context.Context, key string) (err error) {
 			return fmt.Errorf("failed to remove: %w", err)
 		}
 		path = s.getSnapshotDir(id)
+		// path may not exist: virtual snapshots (see
+		// createAndCommitIntermediateVirtualSnapshot) never get a directory.
+		// unmountDirIfMounted and the rename below both treat that as a no-op.
+		if err := s.unmountDirIfMounted(ctx, path); err != nil {
+			return err
+		}
+		// Rename now (one fast, atomic syscall) and delete after the
+		// transaction closes, so the slow recursive delete doesn't hold the
+		// metadata store's write lock.
 		renamed = filepath.Join(s.root, "snapshots", "rm-"+id)
 		if err = os.Rename(path, renamed); err != nil {
 			if !os.IsNotExist(err) {
 				return fmt.Errorf("failed to rename: %w", err)
 			}
-			renamed = ""
+			renamed = "" // path never existed; nothing to restore or clean up below
 		}
 		restore = true
 		return nil
@@ -484,24 +471,8 @@ func (s *snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 		if sn, terr = storage.CreateSnapshot(ctx, kind, key, parent, opts...); terr != nil {
 			return fmt.Errorf("failed to create snapshot: %w", terr)
 		}
-		// A directory-less direct parent is an intermediate virtual
-		// snapshot: the image chain this snapshot is layered over.
-		// Materialize its data plane before finishing the snapshot that
-		// needs it — a failure rolls the new record back, and checking only
-		// the direct parent suffices because every committed delta's own
-		// Prepare already ensured the chain below it. (A parent with a
-		// directory needs nothing: it is either a delta or an already
-		// materialized chain.)
-		if len(sn.ParentIDs) > 0 {
-			pdir := s.getSnapshotDir(sn.ParentIDs[0])
-			if !pathExists(pdir) {
-				if terr := s.materializeChain(ctx, sn.ParentIDs[0]); terr != nil {
-					return terr
-				}
-			}
-		}
 		path = s.getSnapshotDir(sn.ID)
-		return provisionOverlayDirs(path)
+		return provisionOverlayDirs(path, kind)
 	})
 	if err != nil {
 		// The rollback discards the record; the directory, if it was
@@ -520,17 +491,27 @@ func (s *snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 		"kind":   kind,
 	}).Debug("cfs snapshotter created snapshot")
 
-	return s.mounts(ctx, sn)
+	mounts, err := s.mounts(ctx, key)
+	if err != nil {
+		if removeErr := s.Remove(ctx, key); removeErr != nil && !errdefs.IsNotFound(removeErr) {
+			log.G(ctx).WithError(removeErr).WithField("key", key).Warn("failed to roll back snapshot after mount failure")
+		}
+		return nil, err
+	}
+	return mounts, nil
 }
 
-// provisionOverlayDirs creates the empty upper and work directories the
-// snapshot's overlay mounts name inside its directory. The upper is where the
-// snapshot's own writes land — docker's init files, a running container's
-// changes — and where a committed snapshot's content lives when a descendant
-// stacks it as a lower.
-func provisionOverlayDirs(dir string) error {
+// provisionOverlayDirs creates a snapshot directory and, for an active
+// snapshot, the upper and work directories its overlay mount names inside it.
+// The upper is where the snapshot's own writes land — docker's init files, a
+// running container's changes — and where a committed snapshot's content lives
+// when a descendant stacks it as a lower.
+func provisionOverlayDirs(dir string, kind snapshots.Kind) error {
 	if err := os.Mkdir(dir, 0700); err != nil {
 		return fmt.Errorf("failed to create snapshot dir: %w", err)
+	}
+	if kind != snapshots.KindActive {
+		return nil
 	}
 	for _, name := range []string{"upper", "work"} {
 		if err := os.Mkdir(filepath.Join(dir, name), 0755); err != nil { //nolint:gosec // G301: the merged root inherits the upper's mode and must be world-traversable
@@ -545,97 +526,144 @@ func (s *snapshotter) getSnapshotDir(id string) string {
 	return filepath.Join(s.root, "snapshots", id)
 }
 
-// mounts returns the mounts exposing the snapshot's filesystem: one flat
-// overlay over the snapshot's own upper and the lowers composed from its
-// parent chain.
-func (s *snapshotter) mounts(ctx context.Context, sn storage.Snapshot) ([]mount.Mount, error) {
-	roFlag := "rw"
-	if sn.Kind == snapshots.KindView {
-		roFlag = "ro"
+// mounts returns the mounts exposing the filesystem of the snapshot identified
+// by key: one flat overlay over the lowers composed from its parent chain and,
+// for an active snapshot, its upper and work directories. No write transaction
+// may be opened while mountMu is held: Remove holds a write transaction while
+// waiting for that mutex, and bbolt serializes writers.
+func (s *snapshotter) mounts(ctx context.Context, key string) ([]mount.Mount, error) {
+	// Resolve the snapshot and its full ancestor list, nearest parent first,
+	// in one read transaction for a consistent view of the chain. The list
+	// mixes real deltas and virtual chain snapshots; the walk below tells
+	// them apart by disk layout, not by anything available here.
+	type ancestor struct {
+		id   string
+		name string
 	}
-	// Walk the ancestors, nearest parent first: a committed delta (it has an
-	// upper directory) contributes that upper as a lower and the walk goes
-	// on; the first image chain snapshot ends the walk and its data plane —
-	// materialized on first use — becomes the base lower. The walk must stop
-	// there: a materialized image is a flattened tree carrying no whiteout
-	// markers, so anything stacked below it would shine through wherever the
-	// image's own layers deleted files (and with shared layer prefixes, a
-	// longer image's chain has shorter images' chains beneath it). Every
-	// snapshot thus sees an empty upper of its own plus the full composed
-	// view below — which is why nothing here ever needs to know whether the
-	// caller is preparing docker's init layer or a container rootfs.
-	lowers := make([]string, 0, len(sn.ParentIDs)+1)
-	for _, pid := range sn.ParentIDs {
-		dir := s.getSnapshotDir(pid)
-		if fs := filepath.Join(dir, "fs"); pathExists(fs) {
-			lowers = append(lowers, fs)
-			break
+	var (
+		id        string
+		kind      snapshots.Kind
+		ancestors []ancestor
+	)
+	err := s.ms.WithTransaction(ctx, false, func(ctx context.Context) error {
+		var (
+			info snapshots.Info
+			terr error
+		)
+		if id, info, _, terr = storage.GetInfo(ctx, key); terr != nil {
+			return fmt.Errorf("failed to get snapshot info: %w", terr)
 		}
+		if info.Kind != snapshots.KindActive && info.Kind != snapshots.KindView {
+			return fmt.Errorf("requested snapshot %s has kind %s, want active or view: %w", key, info.Kind, errdefs.ErrFailedPrecondition)
+		}
+		kind = info.Kind
+		for name := info.Parent; name != ""; {
+			aid, ainfo, _, err := storage.GetInfo(ctx, name)
+			if err != nil {
+				return fmt.Errorf("resolve parent snapshot %s: %w", name, err)
+			}
+			ancestors = append(ancestors, ancestor{id: aid, name: name})
+			name = ainfo.Parent
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	// Walk nearest parent first. An ancestor with an upper dir
+	// (provisionOverlayDirs made it) is a real delta: stack its upper as a
+	// lower and keep going. One with no upper is the image's own chain
+	// snapshot — unpack committed it as metadata only — so mount its EROFS
+	// metadata and stop: that mount is the whole image already flattened, so
+	// older, shorter chain snapshots above it add nothing (and have no
+	// directory to mount anyway). Stopping is also required for
+	// correctness: the image has no whiteout markers, so anything stacked
+	// below it would leak through wherever a layer deleted a file, and
+	// shared layer prefixes mean a longer image's chain sits above a
+	// shorter one's.
+	lowers := make([]string, 0, len(ancestors))
+	foundChain := false
+	for _, a := range ancestors {
+		dir := s.getSnapshotDir(a.id)
 		if upper := filepath.Join(dir, "upper"); pathExists(upper) {
 			lowers = append(lowers, upper)
 			continue
 		}
-		// Unreachable when the creation invariant holds: every snapshot's
-		// Prepare materialized the chain below it, so an ancestor without a
-		// directory means the state was tampered with or an upgrade broke
-		// the invariant. Fail rather than compose a wrong rootfs.
-		return nil, fmt.Errorf("image chain snapshot %s has no data plane", pid)
+		fsDir := filepath.Join(dir, "fs")
+		if err := s.ensureChainMounted(ctx, a.name, fsDir); err != nil {
+			return nil, err
+		}
+		lowers = append(lowers, fsDir)
+		foundChain = true
+		break // remaining ancestors are older chain snapshots; nothing more to mount
 	}
-	if len(lowers) == 0 {
-		// No image in the ancestry: a scratch snapshot. The stub serves
-		// only image-backed snapshots, so refuse loudly here rather than
-		// emit an overlay spec with no lower that fails at mount time.
+	if !foundChain {
 		return nil, fmt.Errorf("snapshot has no image in its ancestry; scratch snapshots are not supported: %w", errdefs.ErrInvalidArgument)
 	}
-	dir := s.getSnapshotDir(sn.ID)
-	return []mount.Mount{
-		{
-			Source: "overlay",
-			Type:   "overlay",
-			Options: []string{
-				roFlag,
-				"lowerdir=" + strings.Join(lowers, ":"),
-				"upperdir=" + filepath.Join(dir, "upper"),
-				"workdir=" + filepath.Join(dir, "work"),
-			},
-		},
-	}, nil
+	dir := s.getSnapshotDir(id)
+	opts := []string{
+		"lowerdir=" + strings.Join(lowers, ":") + "::" + s.objectsDir,
+		"redirect_dir=on",
+		"metacopy=on",
+		"verity=require",
+	}
+	if kind == snapshots.KindActive {
+		opts = append([]string{
+			"workdir=" + filepath.Join(dir, "work"),
+			"upperdir=" + filepath.Join(dir, "upper"),
+		}, opts...)
+	}
+	return []mount.Mount{{Source: "overlay", Type: "overlay", Options: opts}}, nil
 }
 
-// materializeChain gives the chain snapshot with the given id its data plane:
-// a directory whose fs entry serves the image content — a symlink to the
-// stand-in rootfs (the stub's replacement instead mounts the image's
-// composefs metadata here). Materialization is on demand, at the first
-// snapshot that needs the image, because the unpack handshake cannot own it:
-// handshake Prepares fire only during the pull — every later container
-// Prepare stacks directly on the committed chain records — and a real mount,
-// unlike this symlink, does not survive a reboot, so the data plane must be
-// re-establishable wherever mounts are rebuilt, not built once at pull time.
-// Eager materialization would also spend a data plane on every intermediate
-// chain and on images that never back a container. Callers run inside the
-// metadata store's write transaction, which serializes concurrent prepares
-// over the same image.
-func (s *snapshotter) materializeChain(ctx context.Context, id string) error {
-	dir := s.getSnapshotDir(id)
-	fs := filepath.Join(dir, "fs")
-	if pathExists(fs) {
+// ensureChainMounted mounts an image's read-only EROFS metadata at fsDir if the
+// shared mount is not already present. The knarr store resolves the layer chain
+// to a stored image and mounts it in one call.
+func (s *snapshotter) ensureChainMounted(ctx context.Context, chainID, fsDir string) error {
+	s.mountMu.Lock()
+	defer s.mountMu.Unlock()
+
+	mounted, err := s.isMounted(fsDir)
+	if err != nil {
+		return err
+	}
+	if mounted {
 		return nil
 	}
-	if err := os.MkdirAll(dir, 0700); err != nil {
-		return fmt.Errorf("create chain snapshot dir: %w", err)
+	if err := os.MkdirAll(fsDir, 0755); err != nil { //nolint:gosec // G301: rootfs mount target must be world-traversable
+		return fmt.Errorf("create chain mount dir %s: %w", fsDir, err)
 	}
-	if err := os.Symlink(s.stubRootfs, fs); err != nil {
-		return fmt.Errorf("materialize chain data plane: %w", err)
+	if err := s.engine.MountChain(ctx, chainID, fsDir, knarr.WithMetadataOnly()); err != nil {
+		if errors.Is(err, knarr.ErrNotFound) {
+			return fmt.Errorf("image not found in the knarr store; pull it with knarr before running the container (chain %s): %w", chainID, errdefs.ErrFailedPrecondition)
+		}
+		return fmt.Errorf("mount image chain %s at %s: %w", chainID, fsDir, err)
 	}
-	log.G(ctx).WithFields(log.Fields{
-		"id": id,
-		"fs": fs,
-	}).Info("materialized stand-in data plane for image chain snapshot")
+	return nil
+}
+
+// unmountDirIfMounted tears down a shared image metadata mount in dir.
+// Snapshots with no such mount are left untouched.
+func (s *snapshotter) unmountDirIfMounted(ctx context.Context, dir string) error {
+	s.mountMu.Lock()
+	defer s.mountMu.Unlock()
+
+	fsDir := filepath.Join(dir, "fs")
+	mounted, err := s.isMounted(fsDir)
+	if err != nil {
+		return err
+	}
+	if !mounted {
+		return nil
+	}
+	if err := s.engine.Unmount(ctx, fsDir); err != nil {
+		return fmt.Errorf("unmount %s: %w", fsDir, err)
+	}
 	return nil
 }
 
 // pathExists reports whether the path itself exists, without following a
-// final symlink (a chain snapshot's fs is one).
+// final symlink.
 func pathExists(path string) bool {
 	_, err := os.Lstat(path)
 	return err == nil

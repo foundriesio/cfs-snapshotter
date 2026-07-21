@@ -7,25 +7,25 @@ daemon (`containerd-cfs-grpc`) that serves the containerd Snapshots gRPC API on 
 unix socket. containerd — and Docker, which uses the same containerd — is pointed
 at it through one `proxy_plugins` entry.
 
-> **Status:** the snapshotter is a remote-snapshotter stub. It answers the
-> unpacker's per-layer handshake as if the image content were already present
-> locally, so a pull routed to cfs downloads no layers (`ctr` and `docker`
-> still fetch the image metadata: index, manifest, config, etc.), and it
-> serves every snapshot as one flat overlay whose base layer is a stand-in
-> rootfs (`-stub-rootfs`) — enough to run containers, against stand-in content.
-> Content-addressed composefs mounts of real image content land in a later
-> change.
+> **Status:** the snapshotter serves real image content from a local
+> [knarr](https://github.com/foundriesio/knarr) store. It answers the
+> unpacker's per-layer handshake, so a pull routed to cfs downloads no layers
+> (`ctr` and `docker` still fetch the image metadata: index, manifest,
+> config, etc.). A container snapshot mounts the image's read-only EROFS
+> metadata — once per image, shared by all its containers — and gets one flat
+> overlay whose data comes from the store's fs-verity-backed objects
+> (`verity=require`). The snapshotter never pulls: images enter the store out
+> of band via `knarr pull`, pinned by digest.
 
 ## 1. Build and start the daemon
 
 ```sh
 make build
-sudo ./bin/containerd-cfs-grpc -stub-rootfs <dir> &
+sudo ./bin/containerd-cfs-grpc -knarr-root /var/lib/knarr &
 ```
 
-`-stub-rootfs` is required: a read-only directory served as every container's
-base layer in place of real image content (the devcontainer builds one — see
-`.devcontainer/scripts/make-stub-rootfs.sh`). The other defaults (socket
+`-knarr-root` points at the knarr store the out-of-band `knarr pull` writes
+(default `/var/lib/knarr`). The other defaults (socket
 `/run/containerd-cfs-grpc/containerd-cfs-grpc.sock`, root
 `/var/lib/containerd-cfs-grpc`) match the config below. See `-help` for flags.
 

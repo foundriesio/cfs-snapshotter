@@ -79,9 +79,13 @@ run_new_container() {
 	# binary in, so the container has a knarr CLI matching the pinned module.
 	# Portable across setups and CI, unlike bind-mounting a checkout. Best-effort:
 	# a plain shell still opens when the CLI is not needed or cannot be built.
+	#
+	# This also populates /tmp/cfs-gomodcache with the pinned knarr module, so the
+	# container's own `go build` (same GOMODCACHE, bind-mounted below) finds it
+	# without needing network access.
 	local knarr_version
 	if knarr_version="$(cd "${ROOT_DIR}" && go list -m -f '{{.Version}}' github.com/foundriesio/knarr 2>/dev/null)" &&
-		GOBIN=/tmp/cfs-knarr-bin GOTOOLCHAIN=auto GOPRIVATE=github.com/foundriesio go install "github.com/foundriesio/knarr/cmd/knarr@${knarr_version}"; then
+		GOBIN=/tmp/cfs-knarr-bin GOMODCACHE=/tmp/cfs-gomodcache GOTOOLCHAIN=auto GOPRIVATE=github.com/foundriesio go install "github.com/foundriesio/knarr/cmd/knarr@${knarr_version}"; then
 		run_flags+=(-v /tmp/cfs-knarr-bin/knarr:/opt/cfs-dev/bin/knarr:ro)
 	else
 		echo "warning: could not build the knarr CLI on the host; any e2e that needs it will fail" >&2
