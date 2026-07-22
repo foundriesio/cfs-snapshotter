@@ -105,9 +105,11 @@ func newTestSnapshotter(t *testing.T) *snapshotter {
 // fake knarr store.
 func imageChain(t *testing.T, ctx context.Context, sn *snapshotter, name string) {
 	t.Helper()
-	addFakeImage(sn.engine.(*fakeEngine), testImageInfo("root-"+name, digest.Digest(name)))
+	info := testImageInfo("root-"+name, digest.Digest(name))
+	addFakeImage(sn.engine.(*fakeEngine), info)
 	if _, err := sn.Prepare(ctx, "extract-"+name, "", snapshots.WithLabels(map[string]string{
-		"containerd.io/snapshot.ref": name,
+		intermediateSnapshotLabel: name,
+		imageRefLabel:             info.Root.String(),
 	})); !errdefs.IsAlreadyExists(err) {
 		t.Fatalf("image chain handshake error = %v, want already exists", err)
 	}
@@ -373,10 +375,12 @@ func TestPrepareIntermediateSnapshotAnswersAlreadyExists(t *testing.T) {
 	}()
 
 	const name = "sha256:1111111111111111111111111111111111111111111111111111111111111111"
-	addFakeImage(engine, testImageInfo("handshake-root", digest.Digest(name)))
+	image := testImageInfo("handshake-root", digest.Digest(name))
+	addFakeImage(engine, image)
 	labels := map[string]string{
-		"containerd.io/snapshot.ref": name,
-		"other":                      "kept",
+		intermediateSnapshotLabel: name,
+		imageRefLabel:             image.Root.String(),
+		"other":                   "kept",
 	}
 	if _, err := sn.Prepare(ctx, "extract-1 "+name, "", snapshots.WithLabels(labels)); !errdefs.IsAlreadyExists(err) {
 		t.Fatalf("handshake Prepare error = %v, want already exists", err)
@@ -415,6 +419,128 @@ func TestPrepareIntermediateSnapshotAnswersAlreadyExists(t *testing.T) {
 	}
 	if len(mounts) == 0 {
 		t.Fatal("plain Prepare returned no mounts")
+	}
+}
+
+func TestPrepareIntermediateSnapshotDeclinesUnheldImage(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	sn, err := newSnapshotter(ctx, root, fakeEngineForImages())
+	if err != nil {
+		t.Fatalf("newSnapshotter() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := sn.Close(); err != nil {
+			t.Errorf("Close() error = %v", err)
+		}
+	})
+
+	const name = "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+	if _, err := sn.Prepare(ctx, "extract-missing", "", snapshots.WithLabels(map[string]string{
+		intermediateSnapshotLabel: name,
+		imageRefLabel:             digest.FromString("unheld-image").String(),
+	})); !errdefs.IsFailedPrecondition(err) {
+		t.Fatalf("handshake Prepare error = %v, want failed precondition", err)
+	}
+	if _, err := sn.Stat(ctx, name); !errdefs.IsNotFound(err) {
+		t.Fatalf("Stat(%q) error = %v, want not found", name, err)
+	}
+	entries, err := os.ReadDir(filepath.Join(root, "snapshots"))
+	if err != nil {
+		t.Fatalf("read snapshots dir: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("snapshots dir has %d entries after declined handshake, want none", len(entries))
+	}
+}
+
+func TestPrepareIntermediateSnapshotAcceptsNonLeafChain(t *testing.T) {
+	ctx := context.Background()
+	base := digest.FromString("base-chain")
+	derived := testImageInfo("derived-image", base, digest.FromString("derived-chain"))
+	sn := newSnapshotterForTest(t, fakeEngineForImages(derived), notMounted)
+
+	if _, err := sn.Prepare(ctx, "extract-base", "", snapshots.WithLabels(map[string]string{
+		intermediateSnapshotLabel: base.String(),
+		imageRefLabel:             derived.Root.String(),
+	})); !errdefs.IsAlreadyExists(err) {
+		t.Fatalf("non-leaf handshake Prepare error = %v, want already exists", err)
+	}
+	if info, err := sn.Stat(ctx, base.String()); err != nil {
+		t.Fatalf("Stat(%q) error = %v", base, err)
+	} else if info.Kind != snapshots.KindCommitted {
+		t.Fatalf("Stat(%q).Kind = %v, want committed", base, info.Kind)
+	}
+}
+
+func TestPrepareIntermediateSnapshotDeclinesMismatchedChain(t *testing.T) {
+	ctx := context.Background()
+	image := testImageInfo("held-image", digest.FromString("held-chain"))
+	sn := newSnapshotterForTest(t, fakeEngineForImages(image), notMounted)
+	requested := digest.FromString("other-chain").String()
+
+	if _, err := sn.Prepare(ctx, "extract-mismatch", "", snapshots.WithLabels(map[string]string{
+		intermediateSnapshotLabel: requested,
+		imageRefLabel:             image.Root.String(),
+	})); !errdefs.IsFailedPrecondition(err) {
+		t.Fatalf("mismatched handshake Prepare error = %v, want failed precondition", err)
+	}
+	if _, err := sn.Stat(ctx, requested); !errdefs.IsNotFound(err) {
+		t.Fatalf("Stat(%q) error = %v, want not found", requested, err)
+	}
+}
+
+func TestPrepareIntermediateSnapshotDeclinesMissingImageRef(t *testing.T) {
+	ctx := context.Background()
+	chain := digest.FromString("held-chain")
+	sn := newSnapshotterForTest(t, fakeEngineForImages(testImageInfo("held-image", chain)), notMounted)
+
+	if _, err := sn.Prepare(ctx, "extract-no-image-ref", "", snapshots.WithLabels(map[string]string{
+		intermediateSnapshotLabel: chain.String(),
+	})); !errdefs.IsFailedPrecondition(err) {
+		t.Fatalf("unstamped handshake Prepare error = %v, want failed precondition", err)
+	}
+	if _, err := sn.Stat(ctx, chain.String()); !errdefs.IsNotFound(err) {
+		t.Fatalf("Stat(%q) error = %v, want not found", chain, err)
+	}
+}
+
+func TestPrepareIntermediateSnapshotPropagatesInspectErrors(t *testing.T) {
+	canceledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	inspectErr := errors.New("inspect failed")
+	tests := []struct {
+		name       string
+		ctx        context.Context
+		inspectErr error
+		wantErr    error
+	}{
+		{name: "engine error", ctx: context.Background(), inspectErr: inspectErr, wantErr: inspectErr},
+		{name: "context cancellation", ctx: canceledCtx, wantErr: context.Canceled},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			engine := fakeEngineForImages()
+			if tt.inspectErr != nil {
+				engine.inspectFunc = func(context.Context, string) (*knarr.ImageInfo, error) {
+					return nil, tt.inspectErr
+				}
+			}
+			sn := newSnapshotterForTest(t, engine, notMounted)
+			chain := digest.FromString("requested-chain").String()
+
+			_, err := sn.Prepare(tt.ctx, "extract-error", "", snapshots.WithLabels(map[string]string{
+				intermediateSnapshotLabel: chain,
+				imageRefLabel:             digest.FromString("held-image").String(),
+			}))
+			if !errors.Is(err, tt.wantErr) {
+				t.Fatalf("handshake Prepare error = %v, want %v", err, tt.wantErr)
+			}
+			if _, err := sn.Stat(context.Background(), chain); !errdefs.IsNotFound(err) {
+				t.Fatalf("Stat(%q) error = %v, want not found", chain, err)
+			}
+		})
 	}
 }
 
@@ -518,7 +644,7 @@ func TestPrepareRejectsPrefixOnlyChain(t *testing.T) {
 	chain := digest.FromString("base-chain")
 	derived := testImageInfo("derived", chain, digest.FromString("leaf-chain"))
 	sn := newSnapshotterForTest(t, fakeEngineForImages(derived), notMounted)
-	seedChainRecord(t, ctx, sn, chain.String(), "")
+	seedChainRecord(t, ctx, sn, chain.String(), "", derived.Root.String())
 
 	if _, err := sn.Prepare(ctx, "container", chain.String()); !errdefs.IsFailedPrecondition(err) {
 		t.Fatalf("Prepare() error = %v, want failed precondition", err)
@@ -567,10 +693,12 @@ func TestMountsStopAtNearestImageChain(t *testing.T) {
 	ctx := context.Background()
 	chainA := digest.FromString("chain-a")
 	chainB := digest.FromString("chain-b")
-	engine := fakeEngineForImages(testImageInfo("a", chainA), testImageInfo("b", chainB))
+	imageA := testImageInfo("a", chainA)
+	imageB := testImageInfo("b", chainB)
+	engine := fakeEngineForImages(imageA, imageB)
 	sn := newSnapshotterForTest(t, engine, notMounted)
-	seedChainRecord(t, ctx, sn, chainA.String(), "")
-	seedChainRecord(t, ctx, sn, chainB.String(), chainA.String())
+	seedChainRecord(t, ctx, sn, chainA.String(), "", imageA.Root.String())
+	seedChainRecord(t, ctx, sn, chainB.String(), chainA.String(), imageB.Root.String())
 	var calls []mountCall
 	recordMounts(engine, &calls)
 
@@ -768,17 +896,19 @@ func newBackedSnapshotter(t *testing.T, mounted func(string) (bool, error)) (*sn
 	ctx := context.Background()
 	chain1 := digest.FromString("chain-1")
 	chain2 := digest.FromString("chain-2")
-	engine := fakeEngineForImages(testImageInfo("image-root", chain1, chain2))
+	image := testImageInfo("image-root", chain1, chain2)
+	engine := fakeEngineForImages(image)
 	sn := newSnapshotterForTest(t, engine, mounted)
-	seedChainRecord(t, ctx, sn, chain1.String(), "")
-	seedChainRecord(t, ctx, sn, chain2.String(), chain1.String())
+	seedChainRecord(t, ctx, sn, chain1.String(), "", image.Root.String())
+	seedChainRecord(t, ctx, sn, chain2.String(), chain1.String(), image.Root.String())
 	return sn, engine, chain2.String()
 }
 
-func seedChainRecord(t *testing.T, ctx context.Context, sn *snapshotter, name, parent string) {
+func seedChainRecord(t *testing.T, ctx context.Context, sn *snapshotter, name, parent, imageRef string) {
 	t.Helper()
 	if _, err := sn.Prepare(ctx, "extract-"+name, parent, snapshots.WithLabels(map[string]string{
 		intermediateSnapshotLabel: name,
+		imageRefLabel:             imageRef,
 	})); !errdefs.IsAlreadyExists(err) {
 		t.Fatalf("seed chain %s error = %v, want already exists", name, err)
 	}

@@ -16,6 +16,9 @@ CFS_LOG=/var/log/cfs-devcontainer/containerd-cfs-grpc.log
 
 work=""
 image_ref=""
+unheld_ref=""
+base_ref=""
+substitution_ref=""
 
 cleanup() {
 	local name
@@ -24,9 +27,12 @@ cleanup() {
 			docker rm -f "${name}" >/dev/null 2>&1 || echo "warning: failed to remove ${name}" >&2
 		fi
 	done
-	if [ -n "${image_ref}" ] && docker image inspect "${image_ref}" >/dev/null 2>&1; then
-		docker rmi -f "${image_ref}" >/dev/null 2>&1 || echo "warning: failed to remove ${image_ref}" >&2
-	fi
+	local ref
+	for ref in "${image_ref}" "${unheld_ref}" "${base_ref}" "${substitution_ref}"; do
+		if [ -n "${ref}" ] && docker image inspect "${ref}" >/dev/null 2>&1; then
+			docker rmi -f "${ref}" >/dev/null 2>&1 || echo "warning: failed to remove ${ref}" >&2
+		fi
+	done
 	if [ -n "${work}" ] && [ -e "${work}" ]; then
 		rm -rf "${work}" || echo "warning: failed to remove ${work}" >&2
 	fi
@@ -68,20 +74,132 @@ wait_unmounted() {
 	return 1
 }
 
-seed_and_stage() {
-	local nonce="$1" repo="cfs/e2e" layout="${work}/layout" digest
-	image_ref="${REGISTRY}/${repo}:${nonce}"
-	SEED_LAYER_COUNT=3 SEED_NONCE="${nonce}" SEED_RUNNABLE=1 SEED_KEEP_LAYOUT="${layout}" \
-		"${SCRIPT_DIR}/seed-registry.sh" "${image_ref}" >&2
-	digest="$(jq -r '.manifests[0].digest' "${layout}/index.json")"
+forget_knarr_images() {
+	local listing refs ref
+	listing="$("${KNARR_BIN}" ls --format json)" || fail "cannot list staged knarr images"
+	refs="$(jq -r '.[].ref' <<<"${listing}")" || fail "cannot parse staged knarr images"
+	while IFS= read -r ref; do
+		[ -z "${ref}" ] && continue
+		"${KNARR_BIN}" remove "${ref}" >&2 || fail "cannot forget staged knarr image ${ref}"
+	done <<<"${refs}"
+}
+
+seed_image() {
+	local nonce="$1" ref="$2" layer_count="$3" layout="$4" alternate_config="${5:-}"
+	SEED_LAYER_COUNT="${layer_count}" SEED_NONCE="${nonce}" SEED_RUNNABLE=1 \
+		SEED_ALTERNATE_CONFIG="${alternate_config}" \
+		SEED_KEEP_LAYOUT="${layout}" "${SCRIPT_DIR}/seed-registry.sh" "${ref}" >&2 ||
+		fail "cannot seed ${ref}"
+}
+
+manifest_digest() {
+	jq -r '.manifests[0].digest' "${1}/index.json"
+}
+
+pinned_ref() {
+	local repo="$1" layout="$2" digest
+	digest="$(manifest_digest "${layout}")" || return 1
+	printf '%s@%s\n' "${repo}" "${digest}"
+}
+
+stage_image() {
+	local repo="$1" layout="$2" digest
+	digest="$(manifest_digest "${layout}")" ||
+		fail "cannot read manifest digest for ${repo}"
 	"${KNARR_BIN}" pull --from-dir "${layout}" "${repo}@${digest}" >&2 ||
-		fail "knarr pull failed"
+		fail "knarr pull failed for ${repo}"
+}
+
+image_layers() {
+	local layout="$1" manifest
+	manifest="$(manifest_digest "${layout}")" || return 1
+	jq -c '[.layers[].digest]' "${layout}/blobs/sha256/${manifest#sha256:}"
+}
+
+image_config_digest() {
+	local layout="$1" manifest
+	manifest="$(manifest_digest "${layout}")" || return 1
+	jq -r '.config.digest' "${layout}/blobs/sha256/${manifest#sha256:}"
+}
+
+first_diff_id() {
+	local layout="$1" manifest config
+	manifest="$(manifest_digest "${layout}")" || return 1
+	config="$(jq -r '.config.digest' "${layout}/blobs/sha256/${manifest#sha256:}")" || return 1
+	jq -r '.rootfs.diff_ids[0]' "${layout}/blobs/sha256/${config#sha256:}"
+}
+
+seed_and_stage() {
+	local nonce="$1" repo="cfs/e2e" layout="${work}/layout" tag_ref
+	tag_ref="${REGISTRY}/${repo}:${nonce}"
+	seed_image "${nonce}" "${tag_ref}" 3 "${layout}"
+	stage_image "${repo}" "${layout}"
+	image_ref="$(pinned_ref "${REGISTRY}/${repo}" "${layout}")" || fail "cannot pin staged image ref"
+}
+
+assert_handshake_identity() {
+	local nonce="$1" pair_nonce="${nonce}-pair"
+	local base_repo="cfs/e2e-base" derived_repo="cfs/e2e-derived"
+	local substitution_repo="cfs/e2e-substitution" unheld_repo="cfs/e2e-unheld"
+	local base_layout="${work}/base-layout" derived_layout="${work}/derived-layout"
+	local substitution_layout="${work}/substitution-layout" unheld_layout="${work}/unheld-layout"
+	local base_tag derived_tag substitution_tag unheld_tag
+	local base_first derived_first unheld_first derived_layers substitution_layers
+	local derived_config substitution_config output
+
+	base_tag="${REGISTRY}/${base_repo}:${nonce}"
+	derived_tag="${REGISTRY}/${derived_repo}:${nonce}"
+	substitution_tag="${REGISTRY}/${substitution_repo}:${nonce}"
+	unheld_tag="${REGISTRY}/${unheld_repo}:${nonce}"
+	seed_image "${pair_nonce}" "${base_tag}" 1 "${base_layout}"
+	seed_image "${pair_nonce}" "${derived_tag}" 2 "${derived_layout}"
+	stage_image "${derived_repo}" "${derived_layout}"
+	seed_image "${pair_nonce}" "${substitution_tag}" 2 "${substitution_layout}" 1
+	seed_image "${nonce}-unheld" "${unheld_tag}" 1 "${unheld_layout}"
+
+	base_ref="$(pinned_ref "${REGISTRY}/${base_repo}" "${base_layout}")" || fail "cannot pin base ref"
+	substitution_ref="$(pinned_ref "${REGISTRY}/${substitution_repo}" "${substitution_layout}")" ||
+		fail "cannot pin config-substitution ref"
+	unheld_ref="$(pinned_ref "${REGISTRY}/${unheld_repo}" "${unheld_layout}")" || fail "cannot pin unheld ref"
+
+	base_first="$(first_diff_id "${base_layout}")" || fail "cannot read base diffID"
+	derived_first="$(first_diff_id "${derived_layout}")" || fail "cannot read derived diffID"
+	unheld_first="$(first_diff_id "${unheld_layout}")" || fail "cannot read unheld diffID"
+	[ "${base_first}" = "${derived_first}" ] || fail "base is not a prefix of the staged derived image"
+	[ "${unheld_first}" != "${derived_first}" ] || fail "unheld image shares the staged image's base layer"
+	derived_layers="$(image_layers "${derived_layout}")" || fail "cannot read staged image layers"
+	substitution_layers="$(image_layers "${substitution_layout}")" || fail "cannot read substitution image layers"
+	[ "${derived_layers}" = "${substitution_layers}" ] || fail "config-substitution image changed the layer set"
+	derived_config="$(image_config_digest "${derived_layout}")" || fail "cannot read staged image config"
+	substitution_config="$(image_config_digest "${substitution_layout}")" || fail "cannot read substitution image config"
+	[ "${derived_config}" != "${substitution_config}" ] || fail "config-substitution image reused the staged config"
+
+	if output="$(docker pull "${substitution_ref}" 2>&1)"; then
+		fail "docker pull succeeded for an unheld config substitution: ${output}"
+	fi
+	grep -Fq 'is not present in the local store' <<<"${output}" ||
+		fail "config-substitution pull did not fail at the identity gate: ${output}"
+	echo "PASS: an unheld config substitution with identical layers failed during docker pull"
+
+	if output="$(docker pull "${unheld_ref}" 2>&1)"; then
+		fail "docker pull succeeded for an image absent from knarr: ${output}"
+	fi
+	grep -Fq 'is not present in the local store' <<<"${output}" ||
+		fail "unheld pull did not fail at the handshake identity gate: ${output}"
+	echo "PASS: an unrelated image absent from knarr failed during docker pull"
+
+	if output="$(docker pull "${base_ref}" 2>&1)"; then
+		fail "docker pull succeeded for an unheld base prefix: ${output}"
+	fi
+	grep -Fq 'is not present in the local store' <<<"${output}" ||
+		fail "base-prefix pull did not fail at the handshake identity gate: ${output}"
+	echo "PASS: an unheld base prefix failed during docker pull"
 }
 
 assert_real_zero_fetch_run() {
-	local nonce="$1" layout="${work}/layout" manifest_digest manifest config output digest
-	manifest_digest="$(jq -r '.manifests[0].digest' "${layout}/index.json")"
-	manifest="$(cat "${layout}/blobs/sha256/${manifest_digest#sha256:}")"
+	local nonce="$1" layout="${work}/layout" mdigest manifest config output digest
+	mdigest="$(manifest_digest "${layout}")" || fail "cannot read manifest digest"
+	manifest="$(cat "${layout}/blobs/sha256/${mdigest#sha256:}")"
 	config="$(jq -r '.config.digest' <<<"${manifest}")"
 
 	while read -r digest; do
@@ -149,9 +267,9 @@ assert_gc_teardown() {
 }
 
 find_hello_object() {
-	local layout="${work}/layout" manifest_digest layer object="" candidate
-	manifest_digest="$(jq -r '.manifests[0].digest' "${layout}/index.json")"
-	layer="$(jq -r '.layers[0].digest' "${layout}/blobs/sha256/${manifest_digest#sha256:}")"
+	local layout="${work}/layout" mdigest layer object="" candidate
+	mdigest="$(manifest_digest "${layout}")" || fail "cannot read manifest digest"
+	layer="$(jq -r '.layers[0].digest' "${layout}/blobs/sha256/${mdigest#sha256:}")"
 	tar -xzOf "${layout}/blobs/sha256/${layer#sha256:}" ./hello >"${work}/hello" ||
 		fail "extract seeded /hello"
 	while IFS= read -r candidate; do
@@ -188,6 +306,8 @@ main() {
 	work="$(mktemp -d)"
 	trap cleanup EXIT
 	local nonce="${RANDOM}${RANDOM}" chainfs
+	forget_knarr_images
+	assert_handshake_identity "${nonce}"
 	seed_and_stage "${nonce}"
 	assert_real_zero_fetch_run "${nonce}"
 	chainfs="$(chain_mount)"
@@ -196,7 +316,7 @@ main() {
 	assert_mount_recovery "${nonce}" "${chainfs}"
 	assert_gc_teardown "${chainfs}"
 	assert_tamper_fails_at_open
-	echo "E2E PASS: real content, recovery, concurrency, teardown, and tamper enforcement"
+	echo "E2E PASS: handshake identity, real content, recovery, concurrency, teardown, and tamper enforcement"
 }
 
 main "$@"

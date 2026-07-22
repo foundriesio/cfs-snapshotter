@@ -9,13 +9,15 @@ at it through one `proxy_plugins` entry.
 
 > **Status:** the snapshotter serves real image content from a local
 > [knarr](https://github.com/foundriesio/knarr) store. It answers the
-> unpacker's per-layer handshake, so a pull routed to cfs downloads no layers
-> (`ctr` and `docker` still fetch the image metadata: index, manifest,
-> config, etc.). A container snapshot mounts the image's read-only EROFS
-> metadata — once per image, shared by all its containers — and gets one flat
-> overlay whose data comes from the store's fs-verity-backed objects
-> (`verity=require`). The snapshotter never pulls: images enter the store out
-> of band via `knarr pull`, pinned by digest.
+> unpacker's per-layer handshake only when the runtime-stamped image
+> reference resolves to a held image containing the requested chain, so an
+> admitted pull routed to cfs downloads no layers (`ctr` and `docker` still
+> fetch the image metadata: index, manifest, config, etc.). A container
+> snapshot mounts the image's read-only EROFS metadata — once per image,
+> shared by all its containers — and gets one flat overlay whose data comes
+> from the store's fs-verity-backed objects (`verity=require`). The
+> snapshotter never pulls: images enter the store out of band via
+> `knarr pull`, pinned by digest.
 
 ## 1. Build and start the daemon
 
@@ -56,6 +58,10 @@ version = 2
   snapshotter = "cfs"
 ```
 
+The `enable_remote_snapshot_annotations = "true"` export is required. Without
+it, transfer-service pulls do not stamp the image identity used by the cfs
+admission gate and are declined.
+
 ## 3. Configure Docker
 
 Docker shares the system containerd, so the entry above is all it needs. Enable
@@ -71,31 +77,66 @@ the containerd image store and select cfs in `/etc/docker/daemon.json`, then
 }
 ```
 
-## 4. Pull
+## 4. Stage, pull, run
+
+Stage the image in the knarr store first (from a registry or, as in the
+devcontainer's tests, from an OCI layout directory):
+
+```sh
+sudo knarr pull <registry>/<repo>@sha256:<manifest-digest>
+```
+
+Then pull and run through cfs, using the same reference you staged:
 
 ```sh
 # containerd
-sudo ctr image pull --snapshotter cfs docker.io/library/busybox:latest
+sudo ctr image pull --snapshotter cfs <registry>/<repo>@sha256:<manifest-digest>
 
 # Docker (storage-driver already selects cfs)
-docker pull busybox
+docker pull <registry>/<repo>@sha256:<manifest-digest>
+docker run --rm <registry>/<repo>@sha256:<manifest-digest>
 ```
 
-Both complete through cfs with zero layer downloads — only the image
-metadata (index, manifest, config, etc.) is fetched: the snapshotter answers the
-unpacker's per-layer handshake as if the layer chain were already present
-locally. `ctr snapshots --snapshotter cfs ls` then lists the committed chain
-snapshots, confirming both clients reached cfs through the proxy, and
-`docker run` serves the stand-in rootfs.
+A tag reference works the same way when the image was staged by that tag
+(`knarr pull <registry>/<repo>:<tag>` followed by
+`docker pull <registry>/<repo>:<tag>`): knarr resolves the tag to the digest
+its most recent pull by that tag recorded.
 
-## Quick test without editing config
+Both pulls complete through cfs with zero layer downloads — only the image
+metadata (index, manifest, config, etc.) is fetched: the snapshotter answers
+the unpacker's per-layer handshake so the layer chain is recorded as already
+present. `ctr snapshots --snapshotter cfs ls` then lists the committed chain
+snapshots, and `docker run` serves the image content from the knarr store.
+Pulling an image the store does not hold fails during the pull at the
+snapshotter's admission gate, and running an image whose layer chain is not
+in the store fails with an error asking you to pull it by digest out of band.
 
-`ctr image pull --local` skips the transfer service (so the `unpack_config` step
-is unnecessary) and still routes to cfs:
+## Image-reference stamping and admission
 
-```sh
-sudo ctr image pull --local --snapshotter cfs docker.io/library/busybox:latest
-```
+The handshake uses `containerd.io/snapshot/cri.image-ref`. Supported runtime
+paths stamp it as follows:
+
+| Runtime path | Required configuration |
+| --- | --- |
+| Docker pull | Docker stamps the reference unconditionally. |
+| CRI local pull | Set `disable_snapshot_annotations = false`; the Unix default is `true`. |
+| CRI transfer-service pull | Keep the mandatory `enable_remote_snapshot_annotations = "true"` proxy-plugin export shown above. |
+
+The stamped value is the reference exactly as invoked, and the snapshotter
+resolves it against the knarr store: a digest reference must be held, and a tag
+reference resolves to the digest knarr's most recent pull by that tag recorded —
+a tag knarr holds no alias for is declined. A missing annotation is also
+declined; non-stamping configurations are unsupported for image-identity
+admission. If an unsupported client can forge the annotation, chain membership
+still limits it to rootfs content belonging to the named held image, but the
+snapshotter cannot establish the unheld config's identity.
+
+This pull-time gate is not a runtime allowlist. Starting an image already cached
+or pre-loaded in the runtime can bypass the pull handshake, and container-create
+carries only the content chain, not the image reference. Runtime policy must
+prevent an unheld cached config from using an otherwise held rootfs. Rootfs
+digest and fs-verity enforcement remain active independently of this admission
+gate.
 
 ## Inspecting a running container (devcontainer stub)
 
