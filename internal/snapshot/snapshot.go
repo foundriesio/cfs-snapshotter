@@ -92,7 +92,15 @@ import (
 // intermediate — they are only ever parents of other snapshots, never mounted
 // themselves — and start out virtual: pure metadata records whose data plane
 // is mounted only if and when a descendant snapshot needs the image.
-const intermediateSnapshotLabel = "containerd.io/snapshot.ref"
+//
+// imageRefLabel carries the image reference the runtime pulled. The handshake
+// admits a layer chain only when this reference resolves to a locally stored
+// image containing that chain, so a pull of an image the store does not hold
+// is declined at pull time instead of being silently answered.
+const (
+	intermediateSnapshotLabel = "containerd.io/snapshot.ref"
+	imageRefLabel             = "containerd.io/snapshot/cri.image-ref"
+)
 
 // snapshotter is the cfs-snapshotter implementation of snapshots.Snapshotter.
 type snapshotter struct {
@@ -424,18 +432,39 @@ func optFields(opts []snapshots.Opt) log.Fields {
 	return fields
 }
 
-// createAndCommitIntermediateVirtualSnapshot answers the unpack handshake:
-// the snapshot the caller asks about is recorded as pure metadata — created
-// and committed under the requested name, with the caller's labels and zero
-// usage, in one transaction — and ErrAlreadyExists is reported so the caller
-// skips fetching and applying the layer. The snapshot is virtual: nothing
-// ever mounts an intermediate snapshot, so no directory is provisioned, and
-// a concurrent handshake that loses the commit race rolls back whole,
-// leaving nothing to clean up. In this stub the record only claims the chain
-// exists; the stub's replacement verifies the content really is present
-// locally before answering.
+// createAndCommitIntermediateVirtualSnapshot answers the unpack handshake only
+// when the caller names a locally stored image containing the requested chain.
+// The snapshot is recorded as pure metadata — created and committed under the
+// requested name, with the caller's labels and zero usage, in one transaction
+// — and ErrAlreadyExists is reported so the caller skips fetching and applying
+// the layer. Nothing mounts an intermediate snapshot, so no directory is
+// provisioned, and a concurrent handshake that loses the commit race rolls
+// back whole, leaving nothing to clean up. The admission check runs before the
+// transaction, so a decline leaves no record.
 func (s *snapshotter) createAndCommitIntermediateVirtualSnapshot(ctx context.Context, key, parent, name string, labels map[string]string, opts []snapshots.Opt) error {
-	err := s.ms.WithTransaction(ctx, true, func(ctx context.Context) error {
+	imageRef := labels[imageRefLabel]
+	if imageRef == "" {
+		return fmt.Errorf("image reference is required for layer chain %q: %w", name, errdefs.ErrFailedPrecondition)
+	}
+	info, err := s.engine.Inspect(ctx, imageRef)
+	if errors.Is(err, knarr.ErrNotFound) {
+		return fmt.Errorf("image %q is not present in the local store: %w", imageRef, errdefs.ErrFailedPrecondition)
+	}
+	if err != nil {
+		return fmt.Errorf("inspect image %q for layer chain %q: %w", imageRef, name, err)
+	}
+	found := false
+	for _, layer := range info.Layers {
+		if layer.ChainID.String() == name {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return fmt.Errorf("layer chain %q does not belong to image %q: %w", name, imageRef, errdefs.ErrFailedPrecondition)
+	}
+
+	err = s.ms.WithTransaction(ctx, true, func(ctx context.Context) error {
 		if _, err := storage.CreateSnapshot(ctx, snapshots.KindActive, key, parent, opts...); err != nil {
 			return fmt.Errorf("create intermediate snapshot %q: %w", name, err)
 		}
@@ -451,7 +480,7 @@ func (s *snapshotter) createAndCommitIntermediateVirtualSnapshot(ctx context.Con
 		"key":    key,
 		"name":   name,
 		"parent": parent,
-	}).Info("stub-committed intermediate virtual snapshot")
+	}).Info("committed intermediate virtual snapshot")
 	return fmt.Errorf("intermediate virtual snapshot %q: %w", name, errdefs.ErrAlreadyExists)
 }
 

@@ -15,6 +15,7 @@ SEED_LAYER_COUNT=${SEED_LAYER_COUNT:-1}
 SEED_NONCE=${SEED_NONCE:-}
 SEED_KEEP_LAYOUT=${SEED_KEEP_LAYOUT:-}
 SEED_RUNNABLE=${SEED_RUNNABLE:-}
+SEED_ALTERNATE_CONFIG=${SEED_ALTERNATE_CONFIG:-}
 
 work=""
 
@@ -138,6 +139,9 @@ write_image_layout() {
 	local config=""
 	if [ -n "${SEED_RUNNABLE}" ]; then
 		config='"Cmd":["/hello"]'
+	fi
+	if [ -n "${SEED_ALTERNATE_CONFIG}" ]; then
+		config='"Env":["CFS_E2E_CONFIG_SUBSTITUTION=1"],"Cmd":["/hello"]'
 	fi
 	cat >"${work}/config.json" <<EOF
 {"created":"1970-01-01T00:00:00Z","architecture":"${architecture}","os":"linux","config":{${config}},"rootfs":{"type":"layers","diff_ids":[${diff_ids}]}}
