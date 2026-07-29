@@ -98,6 +98,7 @@ run_new_container() {
 		--security-opt=apparmor=unconfined \
 		--cgroupns=host \
 		-e CFS_DEVCONTAINER=1 \
+		-e CFS_SHARED_ROOT_SIZE_MB \
 		-e PATH=/opt/cfs-dev/bin:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
 		-e GOCACHE=/tmp/cfs-gocache \
 		-e GOMODCACHE=/tmp/cfs-gomodcache \

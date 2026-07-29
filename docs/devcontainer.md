@@ -83,7 +83,9 @@ Opening the devcontainer runs the image entrypoint. The entrypoint:
   subdirectories of it as the knarr store root (`/var/lib/knarr`) and the
   snapshotter roots: the knarr store needs fs-verity, and the overlay
   upper/work directories need a real filesystem (they cannot live on the
-  container's own overlayfs).
+  container's own overlayfs). Its size in MiB comes from the host's
+  `CFS_SHARED_ROOT_SIZE_MB` (default 1024), passed through by `devshell.sh`
+  and `devcontainer.json` and applied when the filesystem is first created.
 - Starts `bin/containerd-cfs-grpc` with `-knarr-root /var/lib/knarr`, before
   `containerd`, so containerd can register the `cfs` proxy snapshotter during
   startup.
@@ -117,6 +119,11 @@ override it:
 CFS_LOG_LEVEL=debug make run-cfs
 ```
 
+The devcontainer boots the snapshotter in the default staged mode. A plain
+`make run-cfs` restarts it that way; `CFS_ALLOW_UNSTAGED_PULLS=0 make run-cfs`
+restarts it in the out-of-band mode instead (the mode is part of the state the
+restart reconciles, so switching back is another `make run-cfs`).
+
 ## End-To-End Test
 
 From the host, run the e2e inside the devcontainer with the nested daemon
@@ -135,16 +142,23 @@ make test-e2e
 
 `make test-e2e` depends on `make run-cfs`, so it rebuilds and restarts the cfs
 proxy first, then runs `.devcontainer/scripts/e2e-fastpath.sh`. The e2e seeds
-Zot with a runnable multi-layer OCI image
-(`.devcontainer/scripts/seed-registry.sh`), stages it in the knarr store with
-`knarr pull --from-dir` pinned by manifest digest, and then asserts the full
-data plane through Docker:
+Zot with runnable multi-layer OCI images
+(`.devcontainer/scripts/seed-registry.sh`) and drives the full data plane
+through Docker, in two phases — one per work mode, since a machine runs in one
+or the other and never both.
+
+The warm phase restarts the snapshotter in the out-of-band mode
+(`-allow-unstaged-pulls=false`), admitting only images staged in the knarr
+store with `knarr pull --from-dir` pinned by manifest digest:
 
 - Pulls of an image the store does not hold — including one that reuses a held
   image's layers under a different config — are declined at the snapshotter's
   admission gate.
 - `docker pull` completes with zero layer fetches and `docker run` prints the
   seeded program's output — real image content, served from the knarr store.
+- An admitted image is held in the store: `knarr remove` declines and names
+  the holder, the container still runs, and the hold is released once the
+  image is removed from the runtime.
 - Concurrent containers share one EROFS image mount and each get their own
   flat overlay rootfs.
 - An existing container recovers after the shared image mount is unmounted
@@ -153,6 +167,63 @@ data plane through Docker:
 - Tampering with a backing object in the store makes the container fail with
   an I/O error — fs-verity rejects the modified content when overlayfs opens
   the file.
+
+The cold phase then restarts the snapshotter in the staged mode — the boot
+default — with
+stores of its own (`/var/lib/knarr-cold`,
+`/var/lib/containerd-cfs-grpc-cold`), and asserts that a plain `docker pull`
+of an image nobody staged:
+
+- lands in the knarr store as exactly one composefs image, present in the CAS
+  and named in the fs-verity view, with the staged directories discarded and
+  the chain's snapshot records kept;
+- runs under `docker run`, on a shared EROFS mount and a `verity=require`
+  overlay, and prints the seeded program's output;
+- fetches its layers again when it is removed from the runtime and
+  re-pulled — a staging machine refetches rather than answering from the
+  store — and converges on the same single store image;
+- is held in the store until the runtime forgets it, exactly as an
+  out-of-band pull is;
+- shares its objects with a second image built on the same layers — the store
+  does not grow by a second copy;
+- leaves nothing behind when the pull is interrupted midway: the active
+  snapshot is aborted, the staged records and their directories are collected
+  once nothing references them, and a re-pull of the same reference converges
+  on the same one composefs image.
+
+The e2e prints a `conversion: <image> <N> layers in <T>s` line per cold pull,
+measured from the snapshotter's own log: the interval between the trace of the
+leaf Commit, inside which the whole chain is built, and the first read of the
+record that Commit created.
+
+## Conformance Suite
+
+`make root-test` runs containerd's reusable snapshotter conformance suite
+(`core/snapshots/testsuite`) against a cfs snapshotter backed by a real knarr
+store. It mounts, so it needs root; a plain `make test` skips it.
+
+```sh
+./devshell.sh make root-test
+```
+
+All 21 subtests currently fail, every one of them on the same call and with
+the same error:
+
+```
+snapshot has no image in its ancestry; scratch snapshots are not supported
+```
+
+The suite builds its fixtures from the bottom up: each test starts by
+preparing a snapshot with no parent and applying files into it. cfs has no
+answer for that by design — a snapshot's lowest layer is an image in the knarr
+store, and a mount with no image beneath it would be unverified scratch, so
+`Prepare` refuses it. Nothing gets far enough to exercise what the suite is
+really checking (layer semantics, whiteouts, `Rename`, the 128-layer mount),
+so the run says nothing about those yet.
+
+Making the suite meaningful needs fixtures that start from an image the store
+holds, which the suite has no seam for; the e2e above is what covers the
+snapshotter's behaviour in the meantime.
 
 ## Debugging Niceties
 
