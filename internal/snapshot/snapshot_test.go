@@ -34,13 +34,30 @@ func TestOptFieldsExposesLabels(t *testing.T) {
 }
 
 func TestNewSnapshotterRejectsEmptyRoot(t *testing.T) {
-	if _, err := NewSnapshotter(context.Background(), "", t.TempDir()); !errdefs.IsInvalidArgument(err) {
+	if _, err := NewSnapshotter(context.Background(), Config{KnarrRoot: t.TempDir()}); !errdefs.IsInvalidArgument(err) {
 		t.Fatalf("NewSnapshotter(%q) error = %v, want invalid argument", "", err)
 	}
 }
 
+// TestNewSnapshotterRefusesUnstagedPulls covers that a snapshotter configured
+// to stage unheld pulls does not come up at all, since nothing turns staged
+// layers into knarr content.
+func TestNewSnapshotterRefusesUnstagedPulls(t *testing.T) {
+	sn, err := NewSnapshotter(context.Background(), Config{
+		Root:               t.TempDir(),
+		KnarrRoot:          t.TempDir(),
+		AllowUnstagedPulls: true,
+	})
+	if !errdefs.IsNotImplemented(err) {
+		t.Fatalf("NewSnapshotter() error = %v, want not implemented", err)
+	}
+	if sn != nil {
+		t.Fatal("NewSnapshotter() returned a snapshotter along with the error")
+	}
+}
+
 func TestNewSnapshotterAcceptsValidRoot(t *testing.T) {
-	sn, err := NewSnapshotter(context.Background(), t.TempDir(), t.TempDir())
+	sn, err := NewSnapshotter(context.Background(), Config{Root: t.TempDir(), KnarrRoot: t.TempDir()})
 	if err != nil {
 		t.Fatalf("NewSnapshotter() error = %v", err)
 	}
@@ -57,13 +74,13 @@ func TestNewSnapshotterRejectsMountOptionSeparators(t *testing.T) {
 	for _, sep := range []string{":", ","} {
 		t.Run("root "+sep, func(t *testing.T) {
 			engine := &fakeEngine{objectsDir: t.TempDir()}
-			if _, err := newSnapshotter(ctx, t.TempDir()+sep+"root", engine); !errdefs.IsInvalidArgument(err) {
+			if _, err := newSnapshotter(ctx, Config{Root: t.TempDir() + sep + "root"}, engine); !errdefs.IsInvalidArgument(err) {
 				t.Fatalf("newSnapshotter() root error = %v, want invalid argument", err)
 			}
 		})
 		t.Run("objects "+sep, func(t *testing.T) {
 			engine := &fakeEngine{objectsDir: t.TempDir() + sep + "objects"}
-			if _, err := newSnapshotter(ctx, t.TempDir(), engine); !errdefs.IsInvalidArgument(err) {
+			if _, err := newSnapshotter(ctx, Config{Root: t.TempDir()}, engine); !errdefs.IsInvalidArgument(err) {
 				t.Fatalf("newSnapshotter() objects error = %v, want invalid argument", err)
 			}
 		})
@@ -71,7 +88,7 @@ func TestNewSnapshotterRejectsMountOptionSeparators(t *testing.T) {
 }
 
 func TestIsMountedTreatsMissingPathAsNotMounted(t *testing.T) {
-	sn, err := newSnapshotter(context.Background(), t.TempDir(), &fakeEngine{objectsDir: t.TempDir()})
+	sn, err := newSnapshotter(context.Background(), Config{Root: t.TempDir()}, &fakeEngine{objectsDir: t.TempDir()})
 	if err != nil {
 		t.Fatalf("newSnapshotter() error = %v", err)
 	}
@@ -274,7 +291,7 @@ func TestRemove(t *testing.T) {
 	root := t.TempDir()
 	engine := fakeEngineForImages()
 	engine.objectsDir = t.TempDir()
-	sn, err := newSnapshotter(ctx, root, engine)
+	sn, err := newSnapshotter(ctx, Config{Root: root}, engine)
 	if err != nil {
 		t.Fatalf("newSnapshotter() error = %v", err)
 	}
@@ -319,7 +336,7 @@ func TestPersistence(t *testing.T) {
 	engine := fakeEngineForImages()
 	engine.objectsDir = t.TempDir()
 
-	sn, err := newSnapshotter(ctx, root, engine)
+	sn, err := newSnapshotter(ctx, Config{Root: root}, engine)
 	if err != nil {
 		t.Fatalf("newSnapshotter() error = %v", err)
 	}
@@ -335,7 +352,7 @@ func TestPersistence(t *testing.T) {
 		t.Fatalf("Close() error = %v", err)
 	}
 
-	reopened, err := newSnapshotter(ctx, root, engine)
+	reopened, err := newSnapshotter(ctx, Config{Root: root}, engine)
 	if err != nil {
 		t.Fatalf("newSnapshotter() reopen error = %v", err)
 	}
@@ -363,7 +380,7 @@ func TestPrepareIntermediateSnapshotAnswersAlreadyExists(t *testing.T) {
 	root := t.TempDir()
 	engine := fakeEngineForImages()
 	engine.objectsDir = t.TempDir()
-	sn, err := newSnapshotter(ctx, root, engine)
+	sn, err := newSnapshotter(ctx, Config{Root: root}, engine)
 	if err != nil {
 		t.Fatalf("newSnapshotter() error = %v", err)
 	}
@@ -425,7 +442,7 @@ func TestPrepareIntermediateSnapshotAnswersAlreadyExists(t *testing.T) {
 func TestPrepareIntermediateSnapshotDeclinesUnheldImage(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
-	sn, err := newSnapshotter(ctx, root, fakeEngineForImages())
+	sn, err := newSnapshotter(ctx, Config{Root: root}, fakeEngineForImages())
 	if err != nil {
 		t.Fatalf("newSnapshotter() error = %v", err)
 	}
@@ -541,6 +558,240 @@ func TestPrepareIntermediateSnapshotPropagatesInspectErrors(t *testing.T) {
 				t.Fatalf("Stat(%q) error = %v, want not found", chain, err)
 			}
 		})
+	}
+}
+
+// TestPrepareStagesPulls covers the handshake in both work modes: the store
+// holds no such image, or holds the image without the requested chain —
+// declined when staging is off, answered with a writable snapshot when it is
+// on — and an image the store does hold, which a staging snapshotter stages
+// all the same instead of admitting, so the runtime fetches and keeps the
+// layers itself.
+func TestPrepareStagesPulls(t *testing.T) {
+	ctx := context.Background()
+	held := testImageInfo("held-image", digest.FromString("held-chain"))
+	requested := digest.FromString("requested-chain").String()
+	tests := []struct {
+		name     string
+		imageRef string
+		images   []*knarr.ImageInfo
+	}{
+		{name: "image not held", imageRef: digest.FromString("unheld-image").String()},
+		{name: "chain not a member", imageRef: held.Root.String(), images: []*knarr.ImageInfo{held}},
+	}
+
+	for _, tt := range tests {
+		labels := map[string]string{
+			intermediateSnapshotLabel: requested,
+			imageRefLabel:             tt.imageRef,
+		}
+		t.Run(tt.name+" declined", func(t *testing.T) {
+			sn := newSnapshotterForTest(t, fakeEngineForImages(tt.images...), notMounted)
+			if _, err := sn.Prepare(ctx, "extract", "", snapshots.WithLabels(labels)); !errdefs.IsFailedPrecondition(err) {
+				t.Fatalf("handshake Prepare error = %v, want failed precondition", err)
+			}
+			if _, err := sn.Stat(ctx, "extract"); !errdefs.IsNotFound(err) {
+				t.Fatalf("Stat(extract) error = %v, want not found", err)
+			}
+		})
+		t.Run(tt.name+" staged", func(t *testing.T) {
+			sn := newStagingSnapshotter(t, fakeEngineForImages(tt.images...))
+			mounts, err := sn.Prepare(ctx, "extract", "", snapshots.WithLabels(labels))
+			if err != nil {
+				t.Fatalf("handshake Prepare error = %v, want a staging snapshot", err)
+			}
+			id, info, err := sn.snapshotInfo(ctx, "extract")
+			if err != nil {
+				t.Fatalf("snapshotInfo(extract) error = %v", err)
+			}
+			if info.Kind != snapshots.KindActive || info.Labels[stagingLabel] == "" {
+				t.Fatalf("staging snapshot info = %+v, want an active snapshot marked as staging", info)
+			}
+			upper := filepath.Join(sn.getSnapshotDir(id), "upper")
+			if _, err := os.Stat(upper); err != nil {
+				t.Fatalf("staging upper directory: %v", err)
+			}
+			// Nothing is staged below a first layer, so it is a plain bind.
+			if len(mounts) != 1 || mounts[0].Type != "bind" || mounts[0].Source != upper ||
+				!slices.Equal(mounts[0].Options, []string{"rw", "rbind"}) {
+				t.Fatalf("mounts = %v, want a writable bind of %s", mounts, upper)
+			}
+		})
+	}
+
+	t.Run("held image staged all the same", func(t *testing.T) {
+		sn := newStagingSnapshotter(t, fakeEngineForImages(held))
+		labels := map[string]string{
+			intermediateSnapshotLabel: held.Layers[len(held.Layers)-1].ChainID.String(),
+			imageRefLabel:             held.Root.String(),
+		}
+		if _, err := sn.Prepare(ctx, "extract", "", snapshots.WithLabels(labels)); err != nil {
+			t.Fatalf("handshake Prepare error = %v, want a staging snapshot", err)
+		}
+		_, info, err := sn.snapshotInfo(ctx, "extract")
+		if err != nil {
+			t.Fatalf("snapshotInfo(extract) error = %v", err)
+		}
+		if info.Kind != snapshots.KindActive || info.Labels[stagingLabel] == "" {
+			t.Fatalf("snapshot info = %+v, want an active snapshot marked as staging", info)
+		}
+	})
+}
+
+// TestCommitCarriesPrivateLabels covers that the snapshotter's own labels move
+// from the active record onto the committed one, and that labels it does not
+// own are left to the caller.
+func TestCommitCarriesPrivateLabels(t *testing.T) {
+	ctx := context.Background()
+	sn := newStagingSnapshotter(t, fakeEngineForImages())
+	chain := digest.FromString("staged-chain").String()
+
+	if _, err := sn.Prepare(ctx, "extract", "", snapshots.WithLabels(map[string]string{
+		intermediateSnapshotLabel: chain,
+		imageRefLabel:             digest.FromString("unheld-image").String(),
+		"other":                   "not ours",
+	})); err != nil {
+		t.Fatalf("handshake Prepare error = %v", err)
+	}
+	if err := sn.Commit(ctx, chain, "extract"); err != nil {
+		t.Fatalf("Commit() error = %v", err)
+	}
+
+	info, err := sn.Stat(ctx, chain)
+	if err != nil {
+		t.Fatalf("Stat(%q) error = %v", chain, err)
+	}
+	if info.Labels[stagingLabel] == "" {
+		t.Fatalf("committed snapshot labels = %v, want the staging marker carried over", info.Labels)
+	}
+	if _, ok := info.Labels["other"]; ok {
+		t.Fatalf("committed snapshot labels = %v, want only the snapshotter's own carried over", info.Labels)
+	}
+}
+
+// TestUpdateKeepsPrivateLabels covers that a whole-map label update, which
+// reaches the backend with everything outside the containerd.io namespace
+// already stripped, does not take the snapshotter's own markers off the
+// record.
+func TestUpdateKeepsPrivateLabels(t *testing.T) {
+	ctx := context.Background()
+	sn := newSnapshotterForTest(t, fakeEngineForImages(), notMounted)
+	chain := digest.FromString("updated-chain").String()
+	commitChainRecord(t, ctx, sn, chain, chain)
+
+	info, err := sn.Update(ctx, snapshots.Info{
+		Name: chain,
+		Labels: map[string]string{
+			intermediateSnapshotLabel: chain,
+			"containerd.io/gc.root":   "keep",
+		},
+	}, "labels")
+	if err != nil {
+		t.Fatalf("Update() error = %v", err)
+	}
+	if info.Labels[chainMemberLabel] == "" {
+		t.Fatalf("updated labels = %v, want the chain-member marker kept", info.Labels)
+	}
+	if info.Labels["containerd.io/gc.root"] != "keep" {
+		t.Fatalf("updated labels = %v, want the caller's label applied", info.Labels)
+	}
+	stat, err := sn.Stat(ctx, chain)
+	if err != nil {
+		t.Fatalf("Stat(%q) error = %v", chain, err)
+	}
+	if stat.Labels[chainMemberLabel] == "" {
+		t.Fatalf("stored labels = %v, want the chain-member marker kept", stat.Labels)
+	}
+}
+
+// TestStagingMountsComposeStagedUppers covers a staging snapshot over staged
+// ancestors: a plain overlay of their uppers, nearest parent first, with no
+// image, no knarr objects, and no fs-verity beneath it.
+func TestStagingMountsComposeStagedUppers(t *testing.T) {
+	ctx := context.Background()
+	sn := newStagingSnapshotter(t, fakeEngineForImages())
+	imageRef := digest.FromString("unheld-image").String()
+	stage := func(key, parent, chain string) ([]mount.Mount, string) {
+		t.Helper()
+		mounts, err := sn.Prepare(ctx, key, parent, snapshots.WithLabels(map[string]string{
+			intermediateSnapshotLabel: chain,
+			imageRefLabel:             imageRef,
+		}))
+		if err != nil {
+			t.Fatalf("Prepare(%s) error = %v", key, err)
+		}
+		id, _, err := sn.snapshotInfo(ctx, key)
+		if err != nil {
+			t.Fatalf("snapshotInfo(%s) error = %v", key, err)
+		}
+		return mounts, sn.getSnapshotDir(id)
+	}
+
+	_, first := stage("extract-1", "", "chain-1")
+	if err := sn.Commit(ctx, "chain-1", "extract-1"); err != nil {
+		t.Fatalf("Commit(chain-1) error = %v", err)
+	}
+	_, second := stage("extract-2", "chain-1", "chain-2")
+	if err := sn.Commit(ctx, "chain-2", "extract-2"); err != nil {
+		t.Fatalf("Commit(chain-2) error = %v", err)
+	}
+	mounts, third := stage("extract-3", "chain-2", "chain-3")
+
+	want := []string{
+		"workdir=" + filepath.Join(third, "work"),
+		"upperdir=" + filepath.Join(third, "upper"),
+		"lowerdir=" + filepath.Join(second, "upper") + ":" + filepath.Join(first, "upper"),
+	}
+	if len(mounts) != 1 || mounts[0].Type != "overlay" || !slices.Equal(mounts[0].Options, want) {
+		t.Fatalf("mounts = %v, want a plain overlay with options %v", mounts, want)
+	}
+}
+
+// TestMountsClassifyChainMemberByLabel covers that a chain snapshot that has
+// picked up staging directories is still where the mount's parent walk stops.
+func TestMountsClassifyChainMemberByLabel(t *testing.T) {
+	ctx := context.Background()
+	sn, engine, leaf := newBackedSnapshotter(t, notMounted)
+	id, _, err := sn.snapshotInfo(ctx, leaf)
+	if err != nil {
+		t.Fatalf("snapshotInfo(%s) error = %v", leaf, err)
+	}
+	if err := provisionOverlayDirs(sn.getSnapshotDir(id), snapshots.KindActive); err != nil {
+		t.Fatalf("provision leftover directories: %v", err)
+	}
+	var calls []mountCall
+	recordMounts(engine, &calls)
+
+	mounts, err := sn.Prepare(ctx, "container", leaf)
+	if err != nil {
+		t.Fatalf("Prepare() error = %v", err)
+	}
+	if len(calls) != 1 || calls[0].chainID != leaf {
+		t.Fatalf("MountChain calls = %+v, want the image chain %q", calls, leaf)
+	}
+	if got := optionValue(t, mounts[0], "lowerdir"); got != calls[0].target+"::"+engine.objectsDir {
+		t.Fatalf("lowerdir = %q, want the image mount only", got)
+	}
+}
+
+// TestMountsUseChainIDFromLabel covers that the image is mounted by the
+// chainID its snapshot.ref label records, not by the name the caller filed the
+// record under.
+func TestMountsUseChainIDFromLabel(t *testing.T) {
+	ctx := context.Background()
+	chain := digest.FromString("labeled-chain").String()
+	engine := fakeEngineForImages(testImageInfo("image", digest.Digest(chain)))
+	sn := newSnapshotterForTest(t, engine, notMounted)
+	const record = "moby/7/sha256:not-a-chain-id"
+	commitChainRecord(t, ctx, sn, record, chain)
+	var calls []mountCall
+	recordMounts(engine, &calls)
+
+	if _, err := sn.Prepare(ctx, "container", record); err != nil {
+		t.Fatalf("Prepare() error = %v", err)
+	}
+	if len(calls) != 1 || calls[0].chainID != chain {
+		t.Fatalf("MountChain calls = %+v, want the label's chain %q", calls, chain)
 	}
 }
 
@@ -878,7 +1129,19 @@ type mountCall struct {
 
 func newSnapshotterForTest(t *testing.T, engine *fakeEngine, mounted func(string) (bool, error)) *snapshotter {
 	t.Helper()
-	sn, err := newSnapshotter(context.Background(), t.TempDir(), engine)
+	return newConfiguredSnapshotter(t, Config{Root: t.TempDir()}, engine, mounted)
+}
+
+// newStagingSnapshotter returns a snapshotter configured to stage pulls of
+// images the knarr store does not hold.
+func newStagingSnapshotter(t *testing.T, engine *fakeEngine) *snapshotter {
+	t.Helper()
+	return newConfiguredSnapshotter(t, Config{Root: t.TempDir(), AllowUnstagedPulls: true}, engine, notMounted)
+}
+
+func newConfiguredSnapshotter(t *testing.T, cfg Config, engine *fakeEngine, mounted func(string) (bool, error)) *snapshotter {
+	t.Helper()
+	sn, err := newSnapshotter(context.Background(), cfg, engine)
 	if err != nil {
 		t.Fatalf("newSnapshotter() error = %v", err)
 	}
@@ -911,6 +1174,27 @@ func seedChainRecord(t *testing.T, ctx context.Context, sn *snapshotter, name, p
 		imageRefLabel:             imageRef,
 	})); !errdefs.IsAlreadyExists(err) {
 		t.Fatalf("seed chain %s error = %v, want already exists", name, err)
+	}
+}
+
+// commitChainRecord commits a metadata-only chain snapshot under name, the way
+// containerd files a backend's records: the name is the caller's own
+// bookkeeping and only the snapshot.ref label names the layer chain.
+func commitChainRecord(t *testing.T, ctx context.Context, sn *snapshotter, name, chainID string) {
+	t.Helper()
+	err := sn.ms.WithTransaction(ctx, true, func(ctx context.Context) error {
+		opt := snapshots.WithLabels(map[string]string{
+			intermediateSnapshotLabel: chainID,
+			chainMemberLabel:          "true",
+		})
+		if _, err := storage.CreateSnapshot(ctx, snapshots.KindActive, "active-"+name, "", opt); err != nil {
+			return err
+		}
+		_, err := storage.CommitActive(ctx, "active-"+name, name, snapshots.Usage{}, opt)
+		return err
+	})
+	if err != nil {
+		t.Fatalf("commit chain record %s: %v", name, err)
 	}
 }
 

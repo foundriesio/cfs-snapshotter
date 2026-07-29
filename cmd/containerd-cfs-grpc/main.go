@@ -34,11 +34,13 @@ const (
 )
 
 var (
-	address      = flag.String("address", defaultAddress, "address for the snapshotter's gRPC server")
-	rootDir      = flag.String("root", defaultRootDir, "path to the root directory for this snapshotter")
-	knarrRoot    = flag.String("knarr-root", "/var/lib/knarr", "path to the shared knarr image store root")
-	logLevel     = flag.String("log-level", log.InfoLevel.String(), "logging level [trace, debug, info, warn, error, fatal, panic]")
-	printVersion = flag.Bool("version", false, "print the version and exit")
+	address            = flag.String("address", defaultAddress, "address for the snapshotter's gRPC server")
+	rootDir            = flag.String("root", defaultRootDir, "path to the root directory for this snapshotter")
+	knarrRoot          = flag.String("knarr-root", "/var/lib/knarr", "path to the shared knarr image store root")
+	containerdAddress  = flag.String("containerd-address", "/run/containerd/containerd.sock", "address of containerd's gRPC server")
+	allowUnstagedPulls = flag.Bool("allow-unstaged-pulls", false, "stage every pull through containerd's content store instead of admitting only images already in the knarr store")
+	logLevel           = flag.String("log-level", log.InfoLevel.String(), "logging level [trace, debug, info, warn, error, fatal, panic]")
+	printVersion       = flag.Bool("version", false, "print the version and exit")
 )
 
 func main() {
@@ -59,15 +61,21 @@ func main() {
 	}
 
 	ctx := log.WithLogger(context.Background(), log.L)
-	if err := run(ctx, *address, *rootDir, *knarrRoot); err != nil {
+	cfg := snapshot.Config{
+		Root:               *rootDir,
+		KnarrRoot:          *knarrRoot,
+		AllowUnstagedPulls: *allowUnstagedPulls,
+		ContainerdAddress:  *containerdAddress,
+	}
+	if err := run(ctx, *address, cfg); err != nil {
 		log.G(ctx).WithError(err).Fatal("cfs-snapshotter exited with error")
 	}
 }
 
 // run builds the snapshotter, serves it over a gRPC unix socket, and blocks
 // until SIGINT/SIGTERM, then shuts down gracefully.
-func run(ctx context.Context, address, root, knarrRoot string) error {
-	sn, err := snapshot.NewSnapshotter(ctx, root, knarrRoot)
+func run(ctx context.Context, address string, cfg snapshot.Config) error {
+	sn, err := snapshot.NewSnapshotter(ctx, cfg)
 	if err != nil {
 		return fmt.Errorf("create snapshotter: %w", err)
 	}
