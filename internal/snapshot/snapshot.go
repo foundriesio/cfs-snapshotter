@@ -97,9 +97,26 @@ import (
 // admits a layer chain only when this reference resolves to a locally stored
 // image containing that chain, so a pull of an image the store does not hold
 // is declined at pull time instead of being silently answered.
+//
+// chainMemberLabel marks a snapshot as standing for a layer chain of an image
+// in the knarr store. It is what ends a mount's parent walk: the labeled
+// snapshot's image is the base of the overlay, so nothing below it is
+// consulted.
+//
+// stagingLabel marks a snapshot created to receive the layer content of a
+// staged pull. Staged content is unverified scratch, so such a snapshot's
+// mounts stack no image beneath it and require no fs-verity.
+//
+// The last two are private to this snapshotter. containerd hands a backend
+// Commit the containerd.io/snapshot.ref label and the containerd.io/snapshot/*
+// prefix and drops everything else, so Commit carries them over from the
+// active record itself.
 const (
 	intermediateSnapshotLabel = "containerd.io/snapshot.ref"
 	imageRefLabel             = "containerd.io/snapshot/cri.image-ref"
+	privateLabelPrefix        = "io.foundries.cfs/"
+	chainMemberLabel          = privateLabelPrefix + "chain-member"
+	stagingLabel              = privateLabelPrefix + "staging"
 )
 
 // snapshotter is the cfs-snapshotter implementation of snapshots.Snapshotter.
@@ -115,6 +132,9 @@ type snapshotter struct {
 	// mounted reports whether a path is a mount point; it is mountinfo.Mounted
 	// in production and is replaced in tests.
 	mounted func(string) (bool, error)
+	// allowUnstagedPulls stages every pull instead of admitting only images
+	// already in the knarr store.
+	allowUnstagedPulls bool
 	// mountMu serializes shared chain mount creation and teardown.
 	mountMu sync.Mutex
 }
@@ -122,17 +142,41 @@ type snapshotter struct {
 // Compile-time assertion that *snapshotter satisfies the containerd interface.
 var _ snapshots.Snapshotter = (*snapshotter)(nil)
 
-// NewSnapshotter returns a snapshots.Snapshotter rooted at root, serving
-// composefs images from the knarr store at knarrRoot.
-func NewSnapshotter(ctx context.Context, root, knarrRoot string) (snapshots.Snapshotter, error) {
-	engine, err := knarr.New(knarr.Config{Root: knarrRoot})
+// Config is the snapshotter's configuration.
+type Config struct {
+	// Root is the snapshotter's own root directory.
+	Root string
+	// KnarrRoot is the root of the knarr store the images are served from.
+	KnarrRoot string
+	// AllowUnstagedPulls selects the machine's work mode. False admits only
+	// images already in the knarr store, put there out of band, and declines
+	// every other pull. True stages every pull — even of an image the store
+	// already holds — so the runtime fetches and keeps each pulled image's
+	// layers in its own content store.
+	AllowUnstagedPulls bool
+	// ContainerdAddress is the address of containerd's gRPC socket.
+	ContainerdAddress string
+}
+
+// NewSnapshotter returns a snapshots.Snapshotter configured by cfg, serving
+// composefs images from the knarr store at cfg.KnarrRoot.
+//
+// Staging is refused: nothing turns staged layers into knarr content, so a
+// machine configured for it would serve unverified scratch in place of the
+// image. Only the mode that admits images already in the store is servable.
+func NewSnapshotter(ctx context.Context, cfg Config) (snapshots.Snapshotter, error) {
+	if cfg.AllowUnstagedPulls {
+		return nil, fmt.Errorf("cfs snapshotter: staging unheld pulls is not servable: staged layers are never turned into knarr content: %w", errdefs.ErrNotImplemented)
+	}
+	engine, err := knarr.New(knarr.Config{Root: cfg.KnarrRoot})
 	if err != nil {
 		return nil, fmt.Errorf("create knarr engine: %w", err)
 	}
-	return newSnapshotter(ctx, root, engine)
+	return newSnapshotter(ctx, cfg, engine)
 }
 
-func newSnapshotter(ctx context.Context, root string, engine engineAPI) (*snapshotter, error) {
+func newSnapshotter(ctx context.Context, cfg Config, engine engineAPI) (*snapshotter, error) {
+	root := cfg.Root
 	if root == "" {
 		return nil, fmt.Errorf("cfs snapshotter: root directory must not be empty: %w", errdefs.ErrInvalidArgument)
 	}
@@ -157,11 +201,12 @@ func newSnapshotter(ctx context.Context, root string, engine engineAPI) (*snapsh
 		return nil, fmt.Errorf("cfs snapshotter: create snapshots dir: %w", err)
 	}
 	return &snapshotter{
-		root:       root,
-		objectsDir: objectsDir,
-		ms:         ms,
-		engine:     engine,
-		mounted:    mountinfo.Mounted,
+		root:               root,
+		objectsDir:         objectsDir,
+		ms:                 ms,
+		engine:             engine,
+		mounted:            mountinfo.Mounted,
+		allowUnstagedPulls: cfg.AllowUnstagedPulls,
 	}, nil
 }
 
@@ -200,6 +245,13 @@ func (s *snapshotter) Stat(ctx context.Context, key string) (info snapshots.Info
 // fieldpaths, when given, restrict which fields are written. In practice the
 // caller is containerd's garbage collector flipping retention labels
 // (containerd.io/gc.*) on committed snapshots.
+//
+// The snapshotter's own labels survive the update on their own account: the
+// caller strips labels outside the containerd.io namespace from the map it
+// hands down, so a whole-map label write would silently take this
+// snapshotter's markers off the record — and with them the classification its
+// mounts depend on. Whatever the update leaves missing of the record's prior
+// private labels is put back.
 func (s *snapshotter) Update(ctx context.Context, info snapshots.Info, fieldpaths ...string) (_ snapshots.Info, err error) {
 	log.G(ctx).WithFields(log.Fields{
 		"name":       info.Name,
@@ -208,7 +260,30 @@ func (s *snapshotter) Update(ctx context.Context, info snapshots.Info, fieldpath
 		"fieldpaths": fieldpaths,
 	}).Trace("cfs snapshotter: update")
 	err = s.ms.WithTransaction(ctx, true, func(ctx context.Context) error {
+		_, prior, _, err := storage.GetInfo(ctx, info.Name)
+		if err != nil {
+			return err
+		}
 		info, err = storage.UpdateInfo(ctx, info, fieldpaths...)
+		if err != nil {
+			return err
+		}
+		restore := snapshots.Info{Name: info.Name, Labels: info.Labels}
+		var lost []string
+		for k, v := range privateLabels(prior.Labels) {
+			if _, ok := info.Labels[k]; ok {
+				continue
+			}
+			if restore.Labels == nil {
+				restore.Labels = map[string]string{}
+			}
+			restore.Labels[k] = v
+			lost = append(lost, "labels."+k)
+		}
+		if len(lost) == 0 {
+			return nil
+		}
+		info, err = storage.UpdateInfo(ctx, restore, lost...)
 		return err
 	})
 	if err != nil {
@@ -256,13 +331,16 @@ func (s *snapshotter) Mounts(ctx context.Context, key string) ([]mount.Mount, er
 
 // Prepare records a new active snapshot under key, descending from parent,
 // and returns its mounts. Both call shapes from the package contract land
-// here, and the snapshot.ref label decides the work: a handshake Prepare
-// needs only a metadata record — created and committed virtually in one
-// transaction, no directory ever provisioned — and is answered with
-// ErrAlreadyExists instead of mounts. Everything else gets a directory-backed
-// active snapshot and overlay mounts composing the image metadata, the knarr
-// objects, the uppers of its committed ancestors, and its own upper (see
-// mounts).
+// here, and the snapshot.ref label decides the work: a handshake Prepare for
+// a layer chain the knarr store holds needs only a metadata record — created
+// and committed virtually in one transaction, no directory ever provisioned —
+// and is answered with ErrAlreadyExists instead of mounts; one for a chain
+// the store does not hold is declined. Where staging is allowed, every
+// handshake instead gets a directory-backed staging snapshot to receive the
+// layer, whether or not the store holds its image. Everything else
+// gets a directory-backed active snapshot and overlay mounts composing the
+// image metadata, the knarr objects, the uppers of its committed ancestors,
+// and its own upper (see mounts).
 func (s *snapshotter) Prepare(ctx context.Context, key, parent string, opts ...snapshots.Opt) ([]mount.Mount, error) {
 	log.G(ctx).WithFields(log.Fields{"key": key, "parent": parent}).
 		WithFields(optFields(opts)).Trace("cfs snapshotter: prepare")
@@ -285,7 +363,18 @@ func (s *snapshotter) Prepare(ctx context.Context, key, parent string, opts ...s
 		// looked at. This answer, repeated per layer, is how a pull against
 		// pre-fetched content completes with zero layer downloads; the caller
 		// still fetches the image metadata (index, manifest, config, etc.).
-		return nil, s.createAndCommitIntermediateVirtualSnapshot(ctx, key, parent, name, base.Labels, opts)
+		err := s.createAndCommitIntermediateVirtualSnapshot(ctx, key, parent, name, base.Labels, opts)
+		if !errors.Is(err, errStagePull) {
+			return nil, err
+		}
+		// This daemon stages its pulls, so this Prepare instead returns a
+		// plain writable, still empty snapshot — the handshake's "not
+		// present" answer: the caller then fetches the layer, applies it
+		// into the snapshot, and commits it itself. It is marked as
+		// staging, which is what keeps its mounts from claiming an image
+		// beneath content nothing has verified.
+		return s.createSnapshot(ctx, snapshots.KindActive, key, parent,
+			append(opts, snapshots.WithLabels(map[string]string{stagingLabel: "true"})))
 	}
 
 	// Everything else asks for a real writable snapshot whose mounts will
@@ -309,18 +398,25 @@ func (s *snapshotter) View(ctx context.Context, key, parent string, opts ...snap
 // the unpacker commits an applied layer under its cumulative chainID, and
 // the docker daemon commits the init layer it populated under
 // <container-id>-init so it can parent the container rootfs on it. A
-// committed snapshot is immutable and exists to be a parent.
+// committed snapshot is immutable and exists to be a parent. The
+// snapshotter's own labels move across with it: the caller passes on only the
+// labels containerd defines, so a marker this snapshotter put on the active
+// record would otherwise be lost exactly when the record becomes something
+// other snapshots descend from.
 func (s *snapshotter) Commit(ctx context.Context, name, key string, opts ...snapshots.Opt) error {
 	log.G(ctx).WithFields(log.Fields{"name": name, "key": key}).
 		WithFields(optFields(opts)).Trace("cfs snapshotter: commit")
 	return s.ms.WithTransaction(ctx, true, func(ctx context.Context) error {
-		id, _, _, err := storage.GetInfo(ctx, key)
+		id, info, _, err := storage.GetInfo(ctx, key)
 		if err != nil {
 			return err
 		}
 		usage, err := fs.DiskUsage(ctx, s.getSnapshotDir(id))
 		if err != nil {
 			return err
+		}
+		if private := privateLabels(info.Labels); len(private) > 0 {
+			opts = append(opts, snapshots.WithLabels(private))
 		}
 		if _, err := storage.CommitActive(ctx, key, name, snapshots.Usage(usage), opts...); err != nil {
 			return fmt.Errorf("failed to commit snapshot: %w", err)
@@ -432,19 +528,52 @@ func optFields(opts []snapshots.Opt) log.Fields {
 	return fields
 }
 
-// createAndCommitIntermediateVirtualSnapshot answers the unpack handshake only
-// when the caller names a locally stored image containing the requested chain.
-// The snapshot is recorded as pure metadata — created and committed under the
-// requested name, with the caller's labels and zero usage, in one transaction
-// — and ErrAlreadyExists is reported so the caller skips fetching and applying
-// the layer. Nothing mounts an intermediate snapshot, so no directory is
-// provisioned, and a concurrent handshake that loses the commit race rolls
-// back whole, leaving nothing to clean up. The admission check runs before the
-// transaction, so a decline leaves no record.
+// privateLabels picks this snapshotter's own labels out of a snapshot's label
+// set, returning nil when there are none.
+func privateLabels(labels map[string]string) map[string]string {
+	var private map[string]string
+	for k, v := range labels {
+		if !strings.HasPrefix(k, privateLabelPrefix) {
+			continue
+		}
+		if private == nil {
+			private = make(map[string]string, len(labels))
+		}
+		private[k] = v
+	}
+	return private
+}
+
+// errStagePull reports that the unpack handshake arrived while pulls are
+// staged. Prepare answers it with a staging snapshot instead of a virtual one,
+// so the caller fetches and applies the layer itself.
+var errStagePull = errors.New("stage the pull")
+
+// createAndCommitIntermediateVirtualSnapshot answers the unpack handshake when
+// the caller names a locally stored image containing the requested chain. The
+// snapshot is recorded as pure metadata — created and committed under the
+// requested name, with the caller's labels, the chain-member marker, and zero
+// usage, in one transaction — and ErrAlreadyExists is reported so the caller
+// skips fetching and applying the layer. Nothing mounts an intermediate
+// snapshot, so no directory is provisioned, and a concurrent handshake that
+// loses the commit race rolls back whole, leaving nothing to clean up.
+//
+// A caller naming no image at all is refused: it is outside the protocol the
+// handshake belongs to. Where staging is allowed, every other handshake is
+// answered with errStagePull before the store is even consulted — a pull is
+// staged whether or not the store already holds its image, so the runtime's
+// own content store keeps the layers of everything it pulled. Otherwise the
+// store decides: an image it does not hold, or holds without the requested
+// chain (the shape a moved tag takes while the caller unpacks the manifest
+// the tag now points at), is declined. Every check runs before the
+// transaction, so no answer leaves a record behind.
 func (s *snapshotter) createAndCommitIntermediateVirtualSnapshot(ctx context.Context, key, parent, name string, labels map[string]string, opts []snapshots.Opt) error {
 	imageRef := labels[imageRefLabel]
 	if imageRef == "" {
 		return fmt.Errorf("image reference is required for layer chain %q: %w", name, errdefs.ErrFailedPrecondition)
+	}
+	if s.allowUnstagedPulls {
+		return errStagePull
 	}
 	info, err := s.engine.Inspect(ctx, imageRef)
 	if errors.Is(err, knarr.ErrNotFound) {
@@ -468,7 +597,11 @@ func (s *snapshotter) createAndCommitIntermediateVirtualSnapshot(ctx context.Con
 		if _, err := storage.CreateSnapshot(ctx, snapshots.KindActive, key, parent, opts...); err != nil {
 			return fmt.Errorf("create intermediate snapshot %q: %w", name, err)
 		}
-		if _, err := storage.CommitActive(ctx, key, name, snapshots.Usage{}, append(opts, snapshots.WithLabels(labels))...); err != nil {
+		chainLabels := []snapshots.Opt{
+			snapshots.WithLabels(labels),
+			snapshots.WithLabels(map[string]string{chainMemberLabel: "true"}),
+		}
+		if _, err := storage.CommitActive(ctx, key, name, snapshots.Usage{}, append(opts, chainLabels...)...); err != nil {
 			return fmt.Errorf("commit intermediate snapshot %q: %w", name, err)
 		}
 		return nil
@@ -557,21 +690,20 @@ func (s *snapshotter) getSnapshotDir(id string) string {
 
 // mounts returns the mounts exposing the filesystem of the snapshot identified
 // by key: one flat overlay over the lowers composed from its parent chain and,
-// for an active snapshot, its upper and work directories. No write transaction
-// may be opened while mountMu is held: Remove holds a write transaction while
-// waiting for that mutex, and bbolt serializes writers.
+// for an active snapshot, its upper and work directories. A staging snapshot,
+// which has no image to descend from, gets a plain overlay of the staged
+// uppers instead (see stagingMounts). No write transaction may be opened while
+// mountMu is held: Remove holds a write transaction while waiting for that
+// mutex, and bbolt serializes writers.
 func (s *snapshotter) mounts(ctx context.Context, key string) ([]mount.Mount, error) {
 	// Resolve the snapshot and its full ancestor list, nearest parent first,
 	// in one read transaction for a consistent view of the chain. The list
-	// mixes real deltas and virtual chain snapshots; the walk below tells
-	// them apart by disk layout, not by anything available here.
-	type ancestor struct {
-		id   string
-		name string
-	}
+	// mixes real deltas and image chain snapshots, and each ancestor's labels
+	// come along because they are what tells the two apart.
 	var (
 		id        string
 		kind      snapshots.Kind
+		staging   bool
 		ancestors []ancestor
 	)
 	err := s.ms.WithTransaction(ctx, false, func(ctx context.Context) error {
@@ -586,12 +718,13 @@ func (s *snapshotter) mounts(ctx context.Context, key string) ([]mount.Mount, er
 			return fmt.Errorf("requested snapshot %s has kind %s, want active or view: %w", key, info.Kind, errdefs.ErrFailedPrecondition)
 		}
 		kind = info.Kind
+		staging = info.Labels[stagingLabel] != ""
 		for name := info.Parent; name != ""; {
 			aid, ainfo, _, err := storage.GetInfo(ctx, name)
 			if err != nil {
 				return fmt.Errorf("resolve parent snapshot %s: %w", name, err)
 			}
-			ancestors = append(ancestors, ancestor{id: aid, name: name})
+			ancestors = append(ancestors, ancestor{id: aid, name: name, labels: ainfo.Labels})
 			name = ainfo.Parent
 		}
 		return nil
@@ -599,37 +732,17 @@ func (s *snapshotter) mounts(ctx context.Context, key string) ([]mount.Mount, er
 	if err != nil {
 		return nil, err
 	}
-	// Walk nearest parent first. An ancestor with an upper dir
-	// (provisionOverlayDirs made it) is a real delta: stack its upper as a
-	// lower and keep going. One with no upper is the image's own chain
-	// snapshot — unpack committed it as metadata only — so mount its EROFS
-	// metadata and stop: that mount is the whole image already flattened, so
-	// older, shorter chain snapshots above it add nothing (and have no
-	// directory to mount anyway). Stopping is also required for
-	// correctness: the image has no whiteout markers, so anything stacked
-	// below it would leak through wherever a layer deleted a file, and
-	// shared layer prefixes mean a longer image's chain sits above a
-	// shorter one's.
-	lowers := make([]string, 0, len(ancestors))
-	foundChain := false
-	for _, a := range ancestors {
-		dir := s.getSnapshotDir(a.id)
-		if upper := filepath.Join(dir, "upper"); pathExists(upper) {
-			lowers = append(lowers, upper)
-			continue
-		}
-		fsDir := filepath.Join(dir, "fs")
-		if err := s.ensureChainMounted(ctx, a.name, fsDir); err != nil {
-			return nil, err
-		}
-		lowers = append(lowers, fsDir)
-		foundChain = true
-		break // remaining ancestors are older chain snapshots; nothing more to mount
-	}
-	if !foundChain {
-		return nil, fmt.Errorf("snapshot has no image in its ancestry; scratch snapshots are not supported: %w", errdefs.ErrInvalidArgument)
+	lowers, foundChain, err := s.composeLowers(ctx, ancestors)
+	if err != nil {
+		return nil, err
 	}
 	dir := s.getSnapshotDir(id)
+	if !foundChain {
+		if !staging {
+			return nil, fmt.Errorf("snapshot has no image in its ancestry; scratch snapshots are not supported: %w", errdefs.ErrInvalidArgument)
+		}
+		return stagingMounts(dir, lowers), nil
+	}
 	opts := []string{
 		"lowerdir=" + strings.Join(lowers, ":") + "::" + s.objectsDir,
 		"redirect_dir=on",
@@ -643,6 +756,82 @@ func (s *snapshotter) mounts(ctx context.Context, key string) ([]mount.Mount, er
 		}, opts...)
 	}
 	return []mount.Mount{{Source: "overlay", Type: "overlay", Options: opts}}, nil
+}
+
+// ancestor is one entry of a snapshot's parent chain as the mount walk needs
+// it: where its directories live, what it is called, and the labels that
+// classify it.
+type ancestor struct {
+	id     string
+	name   string
+	labels map[string]string
+}
+
+// composeLowers walks a snapshot's ancestors, nearest parent first, collecting
+// the lower directories its mount stacks, and reports whether the walk reached
+// an image.
+//
+// A real delta contributes its upper directory (provisionOverlayDirs made it)
+// and the walk continues. An image chain member ends it: its EROFS metadata
+// mount is the last lower, and that mount is the whole image already
+// flattened, so older, shorter chain snapshots above it add nothing (and have
+// no directory to mount anyway). Stopping is also required for correctness:
+// the image has no whiteout markers, so anything stacked below it would leak
+// through wherever a layer deleted a file, and shared layer prefixes mean a
+// longer image's chain sits above a shorter one's.
+//
+// The chain member is mounted by the chainID its snapshot.ref label records,
+// never by its own name: a chain snapshot committed by the caller is named for
+// the caller's own bookkeeping, and only the label names the image content.
+func (s *snapshotter) composeLowers(ctx context.Context, ancestors []ancestor) ([]string, bool, error) {
+	lowers := make([]string, 0, len(ancestors))
+	for _, a := range ancestors {
+		dir := s.getSnapshotDir(a.id)
+		if !isChainMember(a.labels, dir) {
+			lowers = append(lowers, filepath.Join(dir, "upper"))
+			continue
+		}
+		chainID := a.labels[intermediateSnapshotLabel]
+		if chainID == "" {
+			return nil, false, fmt.Errorf("image snapshot %s names no layer chain in its %s label: %w", a.name, intermediateSnapshotLabel, errdefs.ErrFailedPrecondition)
+		}
+		fsDir := filepath.Join(dir, "fs")
+		if err := s.ensureChainMounted(ctx, chainID, fsDir); err != nil {
+			return nil, false, err
+		}
+		return append(lowers, fsDir), true, nil
+	}
+	return lowers, false, nil
+}
+
+// isChainMember reports whether an ancestor snapshot stands for an image layer
+// chain, given its labels and the directory backing it. The chain-member label
+// decides it, so a leftover directory cannot mislead the walk. A record
+// committed before that label existed has none to read and falls back to how
+// it looks on disk: an image chain snapshot is metadata only, while every
+// delta owns the upper and work directories its content lives in.
+func isChainMember(labels map[string]string, dir string) bool {
+	if labels[chainMemberLabel] != "" {
+		return true
+	}
+	return !pathExists(filepath.Join(dir, "upper")) && !pathExists(filepath.Join(dir, "work"))
+}
+
+// stagingMounts returns the mounts for a staging snapshot in dir over the
+// staged uppers below it: a plain overlay, or a bind of its own upper when
+// nothing is below it. Staged layers are scratch nothing has verified yet, so
+// the mount stacks neither an image nor the knarr objects under them and asks
+// the kernel for no fs-verity.
+func stagingMounts(dir string, lowers []string) []mount.Mount {
+	upper := filepath.Join(dir, "upper")
+	if len(lowers) == 0 {
+		return []mount.Mount{{Source: upper, Type: "bind", Options: []string{"rw", "rbind"}}}
+	}
+	return []mount.Mount{{Source: "overlay", Type: "overlay", Options: []string{
+		"workdir=" + filepath.Join(dir, "work"),
+		"upperdir=" + upper,
+		"lowerdir=" + strings.Join(lowers, ":"),
+	}}}
 }
 
 // ensureChainMounted mounts an image's read-only EROFS metadata at fsDir if the
