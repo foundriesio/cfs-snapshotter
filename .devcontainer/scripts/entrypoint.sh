@@ -84,12 +84,14 @@ start_runtime_daemons() {
 	# One loop-backed ext4 with fs-verity hosts the knarr store and every
 	# snapshotter root; loop nodes are scarce in the container's tmpfs /dev.
 	mount_loop_ext4 "${SHARED_ROOT_IMG}" "${SHARED_ROOT}"
-	bind_root cfs "${CFS_ROOT}"
-	bind_root knarr "${KNARR_ROOT}"
+	bind_root "${CFS_ROOT}"
+	bind_root "${KNARR_ROOT}"
 	rm -f "${CFS_SOCKET}"
 	start_daemon containerd-cfs-grpc "${LOG_DIR}/containerd-cfs-grpc.pid" "${LOG_DIR}/containerd-cfs-grpc.log" \
-		"${CONTAINERD_CFS_GRPC_BIN}" -log-level "${CFS_LOG_LEVEL}" -knarr-root "${KNARR_ROOT}"
-	printf '%s\n' "${CFS_LOG_LEVEL} ${KNARR_ROOT}" >"${CFS_STATE_FILE}"
+		"${CONTAINERD_CFS_GRPC_BIN}" -log-level "${CFS_LOG_LEVEL}" -root "${CFS_ROOT}" -knarr-root "${KNARR_ROOT}" \
+		-allow-unstaged-pulls
+	# The state line run-cfs.sh reconciles against: log level, stores, work mode.
+	printf '%s\n' "${CFS_LOG_LEVEL} ${KNARR_ROOT} ${CFS_ROOT} 1" >"${CFS_STATE_FILE}"
 	wait_for cfs-snapshotter test -S "${CFS_SOCKET}"
 
 	# Enable the built-in erofs snapshotter only when the kernel supports
@@ -101,7 +103,7 @@ start_runtime_daemons() {
 		if ! grep -q 'snapshotter = "erofs"' /etc/containerd/config.toml; then
 			cat /etc/containerd/containerd-erofs-unpack.toml >>/etc/containerd/config.toml
 		fi
-		bind_root erofs "${EROFS_ROOT}"
+		bind_root "${EROFS_ROOT}"
 	else
 		echo "host kernel lacks EROFS; erofs snapshotter comparison disabled"
 	fi

@@ -16,6 +16,7 @@ SEED_NONCE=${SEED_NONCE:-}
 SEED_KEEP_LAYOUT=${SEED_KEEP_LAYOUT:-}
 SEED_RUNNABLE=${SEED_RUNNABLE:-}
 SEED_ALTERNATE_CONFIG=${SEED_ALTERNATE_CONFIG:-}
+SEED_LAYER_BYTES=${SEED_LAYER_BYTES:-}
 
 work=""
 
@@ -110,6 +111,12 @@ EOF
 		rm -rf "${source_dir}" || echo "warning: failed to remove ${source_dir}" >&2
 	fi
 	printf 'cfs e2e layer %s %s\n' "${layer}" "${SEED_NONCE}" >"${rootfs}/layer-${layer}.txt"
+	# Bulk goes in the last layer only, and is incompressible, so a pull of the
+	# image spends its transfer time where a test wants a wide window: after
+	# the earlier layers have been applied.
+	if [ -n "${SEED_LAYER_BYTES}" ] && [ "${layer}" = "${SEED_LAYER_COUNT}" ]; then
+		head -c "${SEED_LAYER_BYTES}" /dev/urandom >"${rootfs}/bulk.bin"
+	fi
 }
 
 write_image_layout() {

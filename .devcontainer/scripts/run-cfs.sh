@@ -14,7 +14,8 @@ CONTAINERD_CFS_GRPC_BIN="${ROOT_DIR}/bin/containerd-cfs-grpc"
 CFS_SOCKET=/run/containerd-cfs-grpc/containerd-cfs-grpc.sock
 CONTAINERD_SOCKET=/run/containerd/containerd.sock
 CFS_LOG_LEVEL="${CFS_LOG_LEVEL:-trace}"
-CFS_ROOT=/var/lib/containerd-cfs-grpc
+CFS_ROOT="${CFS_ROOT:-/var/lib/containerd-cfs-grpc}"
+CFS_ALLOW_UNSTAGED_PULLS="${CFS_ALLOW_UNSTAGED_PULLS:-1}"
 CFS_PIDFILE="${LOG_DIR}/containerd-cfs-grpc.pid"
 CFS_LOGFILE="${LOG_DIR}/containerd-cfs-grpc.log"
 CFS_STATE_FILE="${LOG_DIR}/containerd-cfs-grpc.env"
@@ -136,17 +137,19 @@ main() {
 		/run/containerd \
 		/run/containerd-cfs-grpc \
 		/var/lib/containerd \
-		/var/lib/containerd-cfs-grpc \
 		/var/lib/docker \
-		/var/lib/knarr \
+		"${CFS_ROOT}" \
+		"${KNARR_ROOT}" \
 		"${LOG_DIR}"
 
 	git config --global --add safe.directory "${ROOT_DIR}" || true
 	mount_loop_ext4 "${SHARED_ROOT_IMG}" "${SHARED_ROOT}"
-	bind_root cfs "${CFS_ROOT}"
-	bind_root knarr "${KNARR_ROOT}"
+	bind_root "${CFS_ROOT}"
+	bind_root "${KNARR_ROOT}"
 	local old_hash new_hash old_state new_state
-	new_state="${CFS_LOG_LEVEL} ${KNARR_ROOT}"
+	# The daemon's work mode and its stores are part of the state a restart
+	# reconciles: changing any of them makes the running daemon the wrong one.
+	new_state="${CFS_LOG_LEVEL} ${KNARR_ROOT} ${CFS_ROOT} ${CFS_ALLOW_UNSTAGED_PULLS}"
 	old_hash="$(file_hash "${CONTAINERD_CFS_GRPC_BIN}")"
 	old_state="$(cat "${CFS_STATE_FILE}" 2>/dev/null || true)"
 	make -C "${ROOT_DIR}" build
@@ -159,12 +162,19 @@ main() {
 		[ "${old_state}" = "${new_state}" ]; then
 		echo "cfs snapshotter binary unchanged; keeping pid $(cat "${CFS_PIDFILE}")"
 	else
+		local args=(-log-level "${CFS_LOG_LEVEL}" -root "${CFS_ROOT}" -knarr-root "${KNARR_ROOT}")
+		# Always explicit: the mode is part of the reconciled state, so the
+		# daemon must be started with the value the state line records.
+		if [ "${CFS_ALLOW_UNSTAGED_PULLS}" = "1" ]; then
+			args+=(-allow-unstaged-pulls)
+		else
+			args+=(-allow-unstaged-pulls=false)
+		fi
 		restart_daemon containerd-cfs-grpc \
 			"${CFS_PIDFILE}" \
 			"${CFS_SOCKET}" \
 			"${CFS_LOGFILE}" \
-			"${CONTAINERD_CFS_GRPC_BIN}" -log-level "${CFS_LOG_LEVEL}" \
-			-knarr-root "${KNARR_ROOT}"
+			"${CONTAINERD_CFS_GRPC_BIN}" "${args[@]}"
 		printf '%s\n' "${new_state}" >"${CFS_STATE_FILE}"
 	fi
 	wait_for cfs-snapshotter test -S "${CFS_SOCKET}"
@@ -177,6 +187,8 @@ main() {
 
 	echo "cfs snapshotter is running"
 	echo "log level: ${CFS_LOG_LEVEL}"
+	echo "roots: ${CFS_ROOT} ${KNARR_ROOT}"
+	echo "allow unstaged pulls: ${CFS_ALLOW_UNSTAGED_PULLS}"
 	echo "logs: ${CFS_LOGFILE}"
 }
 

@@ -36,6 +36,12 @@ install: build
 test:
 	$(GO) test $(GOFLAGS) ./...
 
+# root-test runs containerd's snapshotter conformance suite. It mounts, so it
+# needs real root; without -test.root the suite is skipped.
+.PHONY: root-test
+root-test:
+	$(GO) test $(GOFLAGS) -v -run TestSnapshotterConformance ./internal/snapshot -test.root
+
 # test-e2e runs the composefs data-plane test from inside the devcontainer.
 .PHONY: test-e2e
 test-e2e: run-cfs

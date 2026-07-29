@@ -6,13 +6,18 @@ container rootfs from content-addressed, composefs-backed storage — using
 `mount` syscall instead of unpacking and stacking layers.
 
 > **Status: early development.** The snapshotter serves real image content
-> from a local [knarr](https://github.com/foundriesio/knarr) store. Pulls
-> routed to cfs download no layers (`ctr` and `docker` still fetch the image
-> metadata: index, manifest, config, etc.), and `docker run` mounts the
-> image's EROFS metadata once per image and gives each container one flat
-> overlay whose data comes from the store's fs-verity-backed objects. Images
-> enter the store out of band — `knarr pull`, pinned by digest — never through
-> the snapshotter.
+> from a local [knarr](https://github.com/foundriesio/knarr) store: `docker
+> run` mounts the image's EROFS metadata once per image and gives each
+> container one flat overlay whose data comes from the store's
+> fs-verity-backed objects. By default a plain `docker pull` fills the
+> store: containerd fetches the layers as it always would, the snapshotter
+> stages them, and the whole image is built into the store when the last
+> layer is committed. A machine started with `-allow-unstaged-pulls=false`
+> instead admits only images put in the store out of band — `knarr pull`,
+> pinned by digest — and declines every other pull; the pulls it admits
+> download no layers (`ctr` and `docker` still fetch the image metadata:
+> index, manifest, config, etc.). Either way a container gets the same
+> mounts.
 
 ## Build and run
 
@@ -39,15 +44,22 @@ Inside the container:
 
 ```sh
 make run-cfs      # rebuild and restart the snapshotter after editing code
+                  # (CFS_ALLOW_UNSTAGED_PULLS=0 selects the out-of-band mode;
+                  # unset, it restarts in the default staged mode)
 make test         # unit tests
-make test-e2e     # end to end: knarr pull -> zero-fetch docker run of real content
+make test-e2e     # end to end, both work modes: out-of-band zero-fetch
+                  # and staged cold pull
 ```
 
-To test manually, stage an image in the knarr store first, then drive the
-snapshotter with plain `docker` and `ctr` commands — both are preconfigured
-to use cfs. Seed the local registry with a runnable test image and stage it:
+To test manually, drive the snapshotter with plain `docker` and `ctr`
+commands — both are preconfigured to use cfs. The devcontainer boots in the
+default staged mode, so a `docker pull` of any seeded image just works. The
+walkthrough below shows the out-of-band mode instead: switch the daemon,
+seed the local registry with a runnable test image, and stage it:
 
 ```sh
+CFS_ALLOW_UNSTAGED_PULLS=0 make run-cfs   # switch to the out-of-band mode
+
 layout=$(mktemp -d)
 SEED_RUNNABLE=1 SEED_KEEP_LAYOUT="${layout}" \
     .devcontainer/scripts/seed-registry.sh 127.0.0.1:5000/cfs/demo:latest

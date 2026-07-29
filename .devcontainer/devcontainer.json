@@ -30,7 +30,8 @@
     "GOCACHE": "/tmp/cfs-gocache",
     "GOMODCACHE": "/tmp/cfs-gomodcache",
     "PATH": "/opt/cfs-dev/bin:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-    "CONTAINERD_SNAPSHOTTER": "cfs"
+    "CONTAINERD_SNAPSHOTTER": "cfs",
+    "CFS_SHARED_ROOT_SIZE_MB": "${localEnv:CFS_SHARED_ROOT_SIZE_MB}"
   },
   "customizations": {
     "vscode": {

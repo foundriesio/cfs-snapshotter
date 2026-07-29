@@ -8,16 +8,20 @@ unix socket. containerd — and Docker, which uses the same containerd — is po
 at it through one `proxy_plugins` entry.
 
 > **Status:** the snapshotter serves real image content from a local
-> [knarr](https://github.com/foundriesio/knarr) store. It answers the
-> unpacker's per-layer handshake only when the runtime-stamped image
-> reference resolves to a held image containing the requested chain, so an
-> admitted pull routed to cfs downloads no layers (`ctr` and `docker` still
-> fetch the image metadata: index, manifest, config, etc.). A container
+> [knarr](https://github.com/foundriesio/knarr) store. A container
 > snapshot mounts the image's read-only EROFS metadata — once per image,
 > shared by all its containers — and gets one flat overlay whose data comes
-> from the store's fs-verity-backed objects (`verity=require`). The
-> snapshotter never pulls: images enter the store out of band via
-> `knarr pull`, pinned by digest.
+> from the store's fs-verity-backed objects (`verity=require`). By default
+> the runtime's own pull fills the store: containerd fetches the layers as
+> it always would and the snapshotter builds them into a composefs image;
+> see [Pulling without staging first](#pulling-without-staging-first). A
+> machine set up the other way (`-allow-unstaged-pulls=false`) never fills
+> the store itself: images enter it out of band via `knarr pull`, pinned by
+> digest, and the snapshotter answers the unpacker's per-layer handshake
+> only when the runtime-stamped image reference resolves to a held image
+> containing the requested chain — an admitted pull routed to cfs downloads
+> no layers (`ctr` and `docker` still fetch the image metadata: index,
+> manifest, config, etc.), and every other pull is declined.
 
 ## 1. Build and start the daemon
 
@@ -26,10 +30,16 @@ make build
 sudo ./bin/containerd-cfs-grpc -knarr-root /var/lib/knarr &
 ```
 
-`-knarr-root` points at the knarr store the out-of-band `knarr pull` writes
-(default `/var/lib/knarr`). The other defaults (socket
-`/run/containerd-cfs-grpc/containerd-cfs-grpc.sock`, root
-`/var/lib/containerd-cfs-grpc`) match the config below. See `-help` for flags.
+The defaults match the config below; see `-help` for the full list.
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `-address` | `/run/containerd-cfs-grpc/containerd-cfs-grpc.sock` | The snapshotter's own gRPC socket, named again in containerd's `proxy_plugins` entry. |
+| `-root` | `/var/lib/containerd-cfs-grpc` | Where the snapshotter keeps its metadata and each snapshot's directories. |
+| `-knarr-root` | `/var/lib/knarr` | The knarr store images are served from. |
+| `-containerd-address` | `/run/containerd/containerd.sock` | containerd's gRPC socket, whose content store the layers of a staged pull are read back from. |
+| `-allow-unstaged-pulls` | `true` | Selects the machine's work mode: stage every pull through containerd's content store and build it into the knarr store, instead of admitting only images already there. `=false` selects the out-of-band mode. |
+| `-log-level` | `info` | `trace`, `debug`, `info`, `warn`, `error`, `fatal`, `panic`. |
 
 The snapshotter root hosts each container's overlay upper and work
 directories, so it must live on a regular filesystem (ext4, xfs, …) — overlay
@@ -84,6 +94,11 @@ the containerd image store and select cfs in `/etc/docker/daemon.json`, then
 
 ## 4. Stage, pull, run
 
+This flow is the out-of-band mode: it needs the daemon started with
+`-allow-unstaged-pulls=false` (with the staged default, a pull fetches its
+layers instead; see
+[Pulling without staging first](#pulling-without-staging-first)).
+
 Stage the image in the knarr store first (from a registry or, as in the
 devcontainer's tests, from an OCI layout directory):
 
@@ -116,6 +131,55 @@ Pulling an image the store does not hold fails during the pull at the
 snapshotter's admission gate, and running an image whose layer chain is not
 in the store fails with an error asking you to pull it by digest out of band.
 
+## Pulling without staging first
+
+By default the store fills from the runtime's own pull instead of from an
+out-of-band one — no `knarr pull` first:
+
+```sh
+sudo ./bin/containerd-cfs-grpc -knarr-root /var/lib/knarr &
+
+docker pull <registry>/<repo>@sha256:<manifest-digest>
+docker run --rm <registry>/<repo>@sha256:<manifest-digest>
+```
+
+Nothing else changes: the pull is a plain `docker pull`, with its usual
+per-layer progress, and the container gets the same mounts an out-of-band pull
+would have given it. What differs is where the content comes from. containerd
+fetches the layers it always would; the snapshotter stages each one into the
+snapshot the unpacker prepared for it, and when the chain's last layer is
+committed it builds the whole image into the knarr store — reading the layers
+back out of containerd's content store, so nothing is fetched twice — and
+discards the staged copies. From then on a container mounts the image's
+composefs like any other. A later pull of the same reference, after the
+runtime dropped it, fetches the layers again like any docker pull would — on a
+staging machine the runtime's content store keeps the layers of everything it
+lists, which is what lets a pull that extends an already-present image read
+the shared layers back instead of failing over their absence — and the
+rebuilt image converges on the same single composefs image in the store.
+
+The image is pinned in the store for as long as the runtime lists it. A
+`knarr remove` of an image a runtime is holding declines and names the holder;
+`docker rmi`, once containerd has forgotten the image's snapshots, drops the
+pin.
+
+The two work modes are exclusive, and the flag defaults to on:
+
+- **Out of band (`-allow-unstaged-pulls=false`).** Only images already in the
+  store are admitted; every other pull is declined at the snapshotter's
+  gate. What runs on the machine is decided by whatever put the images
+  there — an update agent pulling digests it verified — and not by whoever
+  can reach the runtime.
+- **Staged (default).** Any pull the runtime accepts fills the store, and
+  every pull is staged — even of an image the store already holds.
+  The content is still verified as it is built, mounted under fs-verity, and
+  identical on disk to an out-of-band pull; what staged mode gives up is the
+  gate deciding *which* images may arrive, and the out-of-band mode's
+  zero-download answer to a pull of a store-held image.
+
+Pick one per machine and keep it: a store filled one way and then served the
+other has records made against a posture that no longer holds.
+
 ## Image-reference stamping and admission
 
 The handshake uses `containerd.io/snapshot/cri.image-ref`. Supported runtime
@@ -127,12 +191,17 @@ paths stamp it as follows:
 | CRI local pull | Set `disable_snapshot_annotations = false`; the Unix default is `true`. |
 | CRI transfer-service pull | Keep the mandatory `enable_remote_snapshot_annotations = "true"` proxy-plugin export shown above. |
 
-The stamped value is the reference exactly as invoked, and the snapshotter
-resolves it against the knarr store: a digest reference must be held, and a tag
-reference resolves to the digest knarr's most recent pull by that tag recorded —
-a tag knarr holds no alias for is declined. A missing annotation is also
-declined; non-stamping configurations are unsupported for image-identity
-admission. If an unsupported client can forge the annotation, chain membership
+The stamped value is the reference exactly as invoked. In the out-of-band
+mode the snapshotter resolves it against the knarr store: a digest reference
+must be held, and a tag reference resolves to the digest knarr's most recent
+pull by that tag recorded — a tag knarr holds no alias for is declined. A
+staging machine stages the pull without consulting the store, but the
+reference and manifest digest still anchor the conversion. A missing
+annotation is declined in both modes; non-stamping configurations are
+unsupported for image-identity
+admission. Staged mode turns the two declines that mean "the store
+does not hold this" into admissions that stage the pull; a reference the
+runtime does not stamp at all is still declined, in either mode. If an unsupported client can forge the annotation, chain membership
 still limits it to rootfs content belonging to the named held image, but the
 snapshotter cannot establish the unheld config's identity.
 
