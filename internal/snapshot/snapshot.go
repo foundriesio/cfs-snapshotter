@@ -12,10 +12,12 @@
 // first image chain snapshot, whose data plane — the image's read-only EROFS
 // metadata mount, with the knarr object directory stacked below it as a
 // data-only lower requiring fs-verity — is the base lower. The snapshot's own
-// upper receives its writes. The image content is staged out of band in the
-// knarr store; the snapshotter only reads and mounts it, and every unpack
-// handshake is answered as if the content were already present locally (see
-// the calling contract below).
+// upper receives its writes. Image content reaches the knarr store one of two
+// ways: it is put there out of band, in which case every unpack handshake is
+// answered as if the content were already present locally, or it is staged
+// into the snapshot directories as the runtime fetches it and built into the
+// store when the chain's last layer is committed (see the calling contract
+// below).
 //
 // # Calling contract
 //
@@ -68,6 +70,7 @@ package snapshot
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -82,6 +85,9 @@ import (
 	"github.com/containerd/log"
 	"github.com/foundriesio/knarr/pkg/knarr"
 	"github.com/moby/sys/mountinfo"
+	"github.com/opencontainers/go-digest"
+	"github.com/opencontainers/image-spec/identity"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
 	"github.com/containerd/continuity/fs"
 )
@@ -98,6 +104,10 @@ import (
 // image containing that chain, so a pull of an image the store does not hold
 // is declined at pull time instead of being silently answered.
 //
+// manifestDigestLabel carries the digest of the manifest the runtime resolved
+// the reference to. It is the trust anchor a staged chain is built against: the
+// reference names the image, the digest fixes which image it is.
+//
 // chainMemberLabel marks a snapshot as standing for a layer chain of an image
 // in the knarr store. It is what ends a mount's parent walk: the labeled
 // snapshot's image is the base of the overlay, so nothing below it is
@@ -107,17 +117,29 @@ import (
 // staged pull. Staged content is unverified scratch, so such a snapshot's
 // mounts stack no image beneath it and require no fs-verity.
 //
-// The last two are private to this snapshotter. containerd hands a backend
+// rootDigestLabel records the root digest a snapshot's image is held under, so
+// the hold is released against the digest that was taken rather than against a
+// reference a tag may have moved in the meantime.
+//
+// The last three are private to this snapshotter. containerd hands a backend
 // Commit the containerd.io/snapshot.ref label and the containerd.io/snapshot/*
 // prefix and drops everything else, so Commit carries them over from the
 // active record itself.
 const (
 	intermediateSnapshotLabel = "containerd.io/snapshot.ref"
 	imageRefLabel             = "containerd.io/snapshot/cri.image-ref"
+	manifestDigestLabel       = "containerd.io/snapshot/cri.manifest-digest"
 	privateLabelPrefix        = "io.foundries.cfs/"
 	chainMemberLabel          = privateLabelPrefix + "chain-member"
 	stagingLabel              = privateLabelPrefix + "staging"
+	rootDigestLabel           = privateLabelPrefix + "root-digest"
 )
+
+// cfsHolder names this snapshotter among the knarr store's holders. Every image
+// the snapshotter hands containerd a record for is held under it until
+// containerd forgets the record, so a knarr remove cannot take content away
+// from underneath a runtime that is counting on it.
+const cfsHolder = "cfs"
 
 // snapshotter is the cfs-snapshotter implementation of snapshots.Snapshotter.
 type snapshotter struct {
@@ -129,6 +151,9 @@ type snapshotter struct {
 	ms *storage.MetaStore
 	// engine provides access to images in the local knarr store.
 	engine engineAPI
+	// blobs reads image blobs out of containerd's content store, the source a
+	// staged chain is built from.
+	blobs *contentBlobs
 	// mounted reports whether a path is a mount point; it is mountinfo.Mounted
 	// in production and is replaced in tests.
 	mounted func(string) (bool, error)
@@ -151,23 +176,18 @@ type Config struct {
 	// AllowUnstagedPulls selects the machine's work mode. False admits only
 	// images already in the knarr store, put there out of band, and declines
 	// every other pull. True stages every pull — even of an image the store
-	// already holds — so the runtime fetches and keeps each pulled image's
-	// layers in its own content store.
+	// already holds — and builds it into the store once the chain is
+	// complete, so the runtime fetches and keeps each pulled image's layers
+	// in its own content store.
 	AllowUnstagedPulls bool
-	// ContainerdAddress is the address of containerd's gRPC socket.
+	// ContainerdAddress is the address of containerd's gRPC socket, whose
+	// content store the layers of a staged pull are read back from.
 	ContainerdAddress string
 }
 
 // NewSnapshotter returns a snapshots.Snapshotter configured by cfg, serving
 // composefs images from the knarr store at cfg.KnarrRoot.
-//
-// Staging is refused: nothing turns staged layers into knarr content, so a
-// machine configured for it would serve unverified scratch in place of the
-// image. Only the mode that admits images already in the store is servable.
 func NewSnapshotter(ctx context.Context, cfg Config) (snapshots.Snapshotter, error) {
-	if cfg.AllowUnstagedPulls {
-		return nil, fmt.Errorf("cfs snapshotter: staging unheld pulls is not servable: staged layers are never turned into knarr content: %w", errdefs.ErrNotImplemented)
-	}
 	engine, err := knarr.New(knarr.Config{Root: cfg.KnarrRoot})
 	if err != nil {
 		return nil, fmt.Errorf("create knarr engine: %w", err)
@@ -205,19 +225,26 @@ func newSnapshotter(ctx context.Context, cfg Config, engine engineAPI) (*snapsho
 		objectsDir:         objectsDir,
 		ms:                 ms,
 		engine:             engine,
+		blobs:              newContentBlobs(cfg.ContainerdAddress),
 		mounted:            mountinfo.Mounted,
 		allowUnstagedPulls: cfg.AllowUnstagedPulls,
 	}, nil
 }
 
 // engineAPI is the subset of knarr.Engine the snapshotter uses: reading the
-// local store (Inspect, ObjectsDir) and mounting an image chain from it
-// (MountChain, Unmount). Pull, Publish, and Remove are deliberately excluded —
-// content is fetched, built, and deleted out of band, never by the
-// snapshotter, which only reads and mounts — so snapshotter code cannot
-// casually reach for them. The narrow surface is also the seam the tests fake.
+// local store (Inspect, ObjectsDir), mounting an image chain from it
+// (MountChain, Unmount), building an image out of layers the runtime already
+// fetched (Pull), and pinning what it hands containerd for as long as
+// containerd references it (Hold, Release). Building happens at Commit, once a
+// chain is whole; a Prepare still never reaches for content over the network.
+// Publish and Remove are deliberately excluded — the snapshotter publishes
+// nothing and deletes nobody's image — so snapshotter code cannot casually
+// reach for them. The narrow surface is also the seam the tests fake.
 type engineAPI interface {
 	Inspect(ctx context.Context, ref string) (*knarr.ImageInfo, error)
+	Pull(ctx context.Context, ref string, opts ...knarr.PullOption) (*knarr.Image, error)
+	Hold(ctx context.Context, ref, holder string) error
+	Release(ctx context.Context, ref, holder string) error
 	MountChain(ctx context.Context, chainID, target string, opts ...knarr.MountOption) error
 	Unmount(ctx context.Context, target string) error
 	ObjectsDir() (string, error)
@@ -292,11 +319,16 @@ func (s *snapshotter) Update(ctx context.Context, info snapshots.Info, fieldpath
 	return info, nil
 }
 
-// Usage reports the disk usage of the snapshot identified by key. For an active
-// snapshot it is measured from the snapshot directory; for a committed snapshot
-// the usage recorded at commit time is returned. After an unpack the caller
-// queries every member of the image's chain in turn to price the image, so a
-// Usage(chainID)+Stat(chainID) pair per layer is the normal post-pull pattern.
+// Usage reports the disk usage of the snapshot identified by key. An active
+// snapshot is measured from its directory. A committed one is priced from what
+// it actually costs now rather than from what it cost when it was committed,
+// because neither figure can be rewritten afterwards: a snapshot standing for
+// an image costs that image's composefs blob, and a staged record whose
+// directories were discarded once its chain was built costs nothing. Only a
+// record that is neither — a container's own layer — reports the usage
+// recorded at commit time. After an unpack the caller queries every member of
+// the image's chain in turn to price the image, so a Usage(chainID)+Stat(chainID)
+// pair per layer is the normal post-pull pattern.
 func (s *snapshotter) Usage(ctx context.Context, key string) (usage snapshots.Usage, err error) {
 	log.G(ctx).WithField("key", key).Trace("cfs snapshotter: usage")
 	var (
@@ -310,12 +342,23 @@ func (s *snapshotter) Usage(ctx context.Context, key string) (usage snapshots.Us
 	if err != nil {
 		return snapshots.Usage{}, err
 	}
+	dir := s.getSnapshotDir(id)
 	if info.Kind == snapshots.KindActive {
-		du, err := fs.DiskUsage(ctx, s.getSnapshotDir(id))
+		du, err := fs.DiskUsage(ctx, dir)
 		if err != nil {
 			return snapshots.Usage{}, err
 		}
-		usage = snapshots.Usage(du)
+		return snapshots.Usage(du), nil
+	}
+	if root := info.Labels[rootDigestLabel]; root != "" {
+		image, err := s.engine.Inspect(ctx, root)
+		if err != nil {
+			return snapshots.Usage{}, fmt.Errorf("inspect image %s to price snapshot %q: %w", root, key, err)
+		}
+		return snapshots.Usage{Size: image.Composefs.Size}, nil
+	}
+	if !pathExists(filepath.Join(dir, "upper")) {
+		return snapshots.Usage{}, nil
 	}
 	return usage, nil
 }
@@ -403,26 +446,46 @@ func (s *snapshotter) View(ctx context.Context, key, parent string, opts ...snap
 // labels containerd defines, so a marker this snapshotter put on the active
 // record would otherwise be lost exactly when the record becomes something
 // other snapshots descend from.
+//
+// Committing a staged snapshot is also where staged layers become an image.
+// The chain being committed is read from the record's own snapshot.ref label,
+// never from the name: containerd hands the backend names of its own making,
+// and only the label says which layer chain the record stands for. Everything
+// but the chain's last layer is filed as it stands; the last one is where the
+// whole chain is built into the knarr store out of the layers the runtime
+// fetched, pinned there for as long as containerd references it, and recorded
+// as an image chain member — from which instant a mount over it composes the
+// image and not the staged directories, whether or not those have been swept
+// yet.
 func (s *snapshotter) Commit(ctx context.Context, name, key string, opts ...snapshots.Opt) error {
 	log.G(ctx).WithFields(log.Fields{"name": name, "key": key}).
 		WithFields(optFields(opts)).Trace("cfs snapshotter: commit")
-	return s.ms.WithTransaction(ctx, true, func(ctx context.Context) error {
-		id, info, _, err := storage.GetInfo(ctx, key)
-		if err != nil {
-			return err
-		}
-		usage, err := fs.DiskUsage(ctx, s.getSnapshotDir(id))
-		if err != nil {
-			return err
-		}
-		if private := privateLabels(info.Labels); len(private) > 0 {
-			opts = append(opts, snapshots.WithLabels(private))
-		}
-		if _, err := storage.CommitActive(ctx, key, name, snapshots.Usage(usage), opts...); err != nil {
-			return fmt.Errorf("failed to commit snapshot: %w", err)
-		}
-		return nil
+	var labels map[string]string
+	err := s.ms.WithTransaction(ctx, false, func(ctx context.Context) error {
+		_, info, _, err := storage.GetInfo(ctx, key)
+		labels = info.Labels
+		return err
 	})
+	if err != nil {
+		return err
+	}
+	if labels[stagingLabel] == "" {
+		return s.commitRecord(ctx, name, key, nil, opts)
+	}
+
+	root, err := s.buildStagedChain(ctx, labels)
+	if err != nil {
+		return err
+	}
+	if root == "" {
+		return s.commitRecord(ctx, name, key, nil, opts)
+	}
+	private := map[string]string{chainMemberLabel: "true", rootDigestLabel: root}
+	if err := s.commitRecord(ctx, name, key, private, opts); err != nil {
+		return err
+	}
+	s.sweepStagedChain(ctx, name)
+	return nil
 }
 
 // Remove abandons the snapshot identified by key, dropping its metadata record
@@ -431,13 +494,25 @@ func (s *snapshotter) Commit(ctx context.Context, name, key string, opts ...snap
 // containerd's garbage collector children-first — a container's rootfs
 // snapshot goes before its init layer, and image chains unwind leaf-first
 // once no image references them.
+//
+// A record that pinned an image in the knarr store releases it here, against
+// the root digest the record itself carries rather than any reference that may
+// have moved since. The release is idempotent and names only this
+// snapshotter's own hold, so removing a record that never took one, or a
+// mid-chain member that shares an image with records still standing, changes
+// nothing; the image is let go once containerd has forgotten the last of them.
 func (s *snapshotter) Remove(ctx context.Context, key string) (err error) {
 	log.G(ctx).WithField("key", key).Trace("cfs snapshotter: remove")
 	var (
-		renamed, path string
-		restore       bool
+		renamed, path, root string
+		restore             bool
 	)
 	err = s.ms.WithTransaction(ctx, true, func(ctx context.Context) error {
+		_, info, _, err := storage.GetInfo(ctx, key)
+		if err != nil {
+			return fmt.Errorf("failed to get snapshot info: %w", err)
+		}
+		root = info.Labels[rootDigestLabel]
 		id, _, err := storage.Remove(ctx, key)
 		if err != nil {
 			return fmt.Errorf("failed to remove: %w", err)
@@ -478,6 +553,13 @@ func (s *snapshotter) Remove(ctx context.Context, key string) (err error) {
 			log.G(ctx).WithError(err).WithField("path", renamed).Warn("failed to remove snapshot directory")
 		}
 	}
+	if root != "" {
+		if err := s.engine.Release(ctx, root, cfsHolder); err != nil {
+			// The record is already gone, so the caller has nothing to retry;
+			// what is left behind is an image held longer than it need be.
+			log.G(ctx).WithError(err).WithField("digest", root).Warn("failed to release the image hold")
+		}
+	}
 	return nil
 }
 
@@ -492,14 +574,16 @@ func (s *snapshotter) Walk(ctx context.Context, fn snapshots.WalkFunc, filters .
 	})
 }
 
-// Close releases the snapshotter's metadata store. It is safe to call on an
+// Close releases the snapshotter's metadata store and the containerd
+// connection it reads image blobs over. It is safe to call on an
 // already-closed snapshotter.
 func (s *snapshotter) Close() error {
 	log.L.Trace("cfs snapshotter: close")
-	if s.ms == nil {
-		return nil
+	err := s.blobs.Close()
+	if s.ms != nil {
+		err = errors.Join(err, s.ms.Close())
 	}
-	return s.ms.Close()
+	return err
 }
 
 // optFields renders the snapshot info fields the given opts set. An Opt
@@ -567,6 +651,14 @@ var errStagePull = errors.New("stage the pull")
 // chain (the shape a moved tag takes while the caller unpacks the manifest
 // the tag now points at), is declined. Every check runs before the
 // transaction, so no answer leaves a record behind.
+//
+// Admitting the image's last chain also pins the image under this
+// snapshotter. From then on containerd holds a durable record standing for
+// content it will only mount later, and the hold is what stops a knarr remove
+// from taking that content away in between — a pull followed by a remove
+// followed by a run would otherwise fail at the run. The hold is taken before
+// the record exists: a hold with nothing to release it over-protects, while a
+// record with no hold would leave content containerd counts on reclaimable.
 func (s *snapshotter) createAndCommitIntermediateVirtualSnapshot(ctx context.Context, key, parent, name string, labels map[string]string, opts []snapshots.Opt) error {
 	imageRef := labels[imageRefLabel]
 	if imageRef == "" {
@@ -593,13 +685,21 @@ func (s *snapshotter) createAndCommitIntermediateVirtualSnapshot(ctx context.Con
 		return fmt.Errorf("layer chain %q does not belong to image %q: %w", name, imageRef, errdefs.ErrFailedPrecondition)
 	}
 
+	private := map[string]string{chainMemberLabel: "true"}
+	if n := len(info.Layers); info.Layers[n-1].ChainID.String() == name {
+		if err := s.engine.Hold(ctx, info.Root.String(), cfsHolder); err != nil {
+			return fmt.Errorf("hold image %q: %w", imageRef, err)
+		}
+		private[rootDigestLabel] = info.Root.String()
+	}
+
 	err = s.ms.WithTransaction(ctx, true, func(ctx context.Context) error {
 		if _, err := storage.CreateSnapshot(ctx, snapshots.KindActive, key, parent, opts...); err != nil {
 			return fmt.Errorf("create intermediate snapshot %q: %w", name, err)
 		}
 		chainLabels := []snapshots.Opt{
 			snapshots.WithLabels(labels),
-			snapshots.WithLabels(map[string]string{chainMemberLabel: "true"}),
+			snapshots.WithLabels(private),
 		}
 		if _, err := storage.CommitActive(ctx, key, name, snapshots.Usage{}, append(opts, chainLabels...)...); err != nil {
 			return fmt.Errorf("commit intermediate snapshot %q: %w", name, err)
@@ -615,6 +715,173 @@ func (s *snapshotter) createAndCommitIntermediateVirtualSnapshot(ctx context.Con
 		"parent": parent,
 	}).Info("committed intermediate virtual snapshot")
 	return fmt.Errorf("intermediate virtual snapshot %q: %w", name, errdefs.ErrAlreadyExists)
+}
+
+// commitRecord commits the active snapshot under key as name, recording the
+// disk usage of its directory. private names this snapshotter's own labels the
+// committed record is to carry; nil carries over whatever the active record
+// already had.
+func (s *snapshotter) commitRecord(ctx context.Context, name, key string, private map[string]string, opts []snapshots.Opt) error {
+	return s.ms.WithTransaction(ctx, true, func(ctx context.Context) error {
+		id, info, _, err := storage.GetInfo(ctx, key)
+		if err != nil {
+			return err
+		}
+		usage, err := fs.DiskUsage(ctx, s.getSnapshotDir(id))
+		if err != nil {
+			return err
+		}
+		own := private
+		if own == nil {
+			own = privateLabels(info.Labels)
+		}
+		if len(own) > 0 {
+			opts = append(opts, snapshots.WithLabels(own))
+		}
+		if _, err := storage.CommitActive(ctx, key, name, snapshots.Usage(usage), opts...); err != nil {
+			return fmt.Errorf("failed to commit snapshot: %w", err)
+		}
+		return nil
+	})
+}
+
+// buildStagedChain builds the composefs image of a staged layer chain out of
+// the blobs the runtime fetched, and pins it in the knarr store. It returns the
+// root digest the image was built and held under, or an empty digest when the
+// chain being committed is not the image's last one — an image is worth
+// building once, whole, and the earlier chains of the same pull are only steps
+// towards it.
+//
+// The labels the runtime attached are what the build is anchored on: the
+// reference names the image, the manifest digest fixes which image that is, and
+// the chain says where in it this record sits. A build always runs; the knarr
+// store recognizing content it already has, verified, is what makes a repeat
+// cheap, and no cheaper shortcut can vouch for a store that has been damaged
+// since.
+func (s *snapshotter) buildStagedChain(ctx context.Context, labels map[string]string) (string, error) {
+	chainID := labels[intermediateSnapshotLabel]
+	if chainID == "" {
+		return "", fmt.Errorf("staged snapshot names no layer chain in its %s label: %w", intermediateSnapshotLabel, errdefs.ErrFailedPrecondition)
+	}
+	imageRef := labels[imageRefLabel]
+	if imageRef == "" {
+		return "", fmt.Errorf("staged layer chain %q names no image in its %s label: %w", chainID, imageRefLabel, errdefs.ErrFailedPrecondition)
+	}
+	root := labels[manifestDigestLabel]
+	if root == "" {
+		return "", fmt.Errorf("staged layer chain %q names no manifest in its %s label: %w", chainID, manifestDigestLabel, errdefs.ErrFailedPrecondition)
+	}
+
+	leaf, err := s.leafChainID(ctx, digest.Digest(root))
+	if err != nil {
+		return "", err
+	}
+	if leaf.String() != chainID {
+		return "", nil
+	}
+	if _, err := s.engine.Pull(ctx, imageRef, knarr.WithBlobSource(s.blobs), knarr.WithResolvedRoot(digest.Digest(root))); err != nil {
+		return "", fmt.Errorf("build image %q from the staged layers of chain %s: %w", imageRef, chainID, err)
+	}
+	if err := s.engine.Hold(ctx, root, cfsHolder); err != nil {
+		return "", fmt.Errorf("hold image %q: %w", imageRef, err)
+	}
+	return root, nil
+}
+
+// leafChainID returns the cumulative chain identity of the last layer of the
+// manifest at root, which is the identity of the whole image.
+func (s *snapshotter) leafChainID(ctx context.Context, root digest.Digest) (digest.Digest, error) {
+	var manifest ocispec.Manifest
+	if err := s.decodeBlob(ctx, root, &manifest); err != nil {
+		return "", fmt.Errorf("read manifest %s: %w", root, err)
+	}
+	var config ocispec.Image
+	if err := s.decodeBlob(ctx, manifest.Config.Digest, &config); err != nil {
+		return "", fmt.Errorf("read image config %s: %w", manifest.Config.Digest, err)
+	}
+	if len(config.RootFS.DiffIDs) == 0 {
+		return "", fmt.Errorf("image config %s declares no layers: %w", manifest.Config.Digest, errdefs.ErrFailedPrecondition)
+	}
+	return identity.ChainID(config.RootFS.DiffIDs), nil
+}
+
+// decodeBlob reads the JSON document dgst names out of containerd's content
+// store into v.
+func (s *snapshotter) decodeBlob(ctx context.Context, dgst digest.Digest, v any) error {
+	r, err := s.blobs.Open(ctx, ocispec.Descriptor{Digest: dgst})
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err := r.Close(); err != nil {
+			log.G(ctx).WithError(err).WithField("digest", dgst).Warn("failed to close content store blob")
+		}
+	}()
+	return json.NewDecoder(r).Decode(v)
+}
+
+// sweepStagedChain discards the overlay directories of the staged chain that
+// was built into the image now committed as name. Their content lives in the
+// knarr store from here on, and every mount over the chain composes the image
+// instead, so the directories are duplicate bytes. Failing to discard them
+// costs disk, never correctness, which is why it is reported and not returned.
+func (s *snapshotter) sweepStagedChain(ctx context.Context, name string) {
+	dirs, err := s.stagedChainDirs(ctx, name)
+	if err != nil {
+		log.G(ctx).WithError(err).WithField("name", name).Warn("failed to resolve the staged chain to discard")
+		return
+	}
+	for _, dir := range dirs {
+		for _, sub := range []string{"upper", "work"} {
+			path := filepath.Join(dir, sub)
+			if err := os.RemoveAll(path); err != nil {
+				log.G(ctx).WithError(err).WithField("path", path).Warn("failed to discard staged directory")
+			}
+		}
+	}
+}
+
+// stagedChainDirs returns the directories of the record committed as name and
+// of the staged records below it, nearest first. The walk stops at the first
+// record another snapshot outside the chain descends from: a concurrent pull of
+// an image sharing this prefix may still be applying layers over that record's
+// upper, and that pull discards what it staged when its own records are
+// removed.
+func (s *snapshotter) stagedChainDirs(ctx context.Context, name string) ([]string, error) {
+	var dirs []string
+	err := s.ms.WithTransaction(ctx, false, func(ctx context.Context) error {
+		children := map[string]int{}
+		if err := storage.WalkInfo(ctx, func(_ context.Context, info snapshots.Info) error {
+			if info.Parent != "" {
+				children[info.Parent]++
+			}
+			return nil
+		}); err != nil {
+			return fmt.Errorf("count snapshot children: %w", err)
+		}
+		// The committed record is expected to have no children at all; each
+		// record below it has the one the walk arrived from.
+		key, inChain := name, 0
+		for key != "" {
+			id, info, _, err := storage.GetInfo(ctx, key)
+			if err != nil {
+				return fmt.Errorf("resolve staged snapshot %s: %w", key, err)
+			}
+			if key != name && info.Labels[stagingLabel] == "" {
+				return nil
+			}
+			if children[key] > inChain {
+				return nil
+			}
+			dirs = append(dirs, s.getSnapshotDir(id))
+			key, inChain = info.Parent, 1
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return dirs, nil
 }
 
 // createSnapshot records an active or view snapshot in the metadata store

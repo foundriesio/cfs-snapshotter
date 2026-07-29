@@ -3,21 +3,28 @@
 package snapshot
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 
+	"github.com/containerd/containerd/v2/core/content"
 	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/containerd/containerd/v2/core/snapshots"
 	"github.com/containerd/containerd/v2/core/snapshots/storage"
+	"github.com/containerd/containerd/v2/pkg/namespaces"
 	"github.com/containerd/errdefs"
 	"github.com/foundriesio/knarr/pkg/knarr"
 	"github.com/opencontainers/go-digest"
+	"github.com/opencontainers/image-spec/identity"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
 func TestOptFieldsExposesLabels(t *testing.T) {
@@ -39,20 +46,21 @@ func TestNewSnapshotterRejectsEmptyRoot(t *testing.T) {
 	}
 }
 
-// TestNewSnapshotterRefusesUnstagedPulls covers that a snapshotter configured
-// to stage unheld pulls does not come up at all, since nothing turns staged
-// layers into knarr content.
-func TestNewSnapshotterRefusesUnstagedPulls(t *testing.T) {
+// TestNewSnapshotterServesUnstagedPulls covers that a snapshotter configured
+// to stage unheld pulls comes up: staged layers are turned into knarr content
+// when their chain completes.
+func TestNewSnapshotterServesUnstagedPulls(t *testing.T) {
 	sn, err := NewSnapshotter(context.Background(), Config{
 		Root:               t.TempDir(),
 		KnarrRoot:          t.TempDir(),
 		AllowUnstagedPulls: true,
+		ContainerdAddress:  "/run/containerd/containerd.sock",
 	})
-	if !errdefs.IsNotImplemented(err) {
-		t.Fatalf("NewSnapshotter() error = %v, want not implemented", err)
+	if err != nil {
+		t.Fatalf("NewSnapshotter() error = %v", err)
 	}
-	if sn != nil {
-		t.Fatal("NewSnapshotter() returned a snapshotter along with the error")
+	if err := sn.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
 	}
 }
 
@@ -642,30 +650,425 @@ func TestPrepareStagesPulls(t *testing.T) {
 // from the active record onto the committed one, and that labels it does not
 // own are left to the caller.
 func TestCommitCarriesPrivateLabels(t *testing.T) {
-	ctx := context.Background()
+	ctx := pullNamespace()
 	sn := newStagingSnapshotter(t, fakeEngineForImages())
-	chain := digest.FromString("staged-chain").String()
+	root, chains := stageImage(t, sn, digest.FromString("layer-1"), digest.FromString("layer-2"))
+	labels := stagedLabels(digest.FromString("unheld-image").String(), root, chains[0])
+	labels["other"] = "not ours"
 
-	if _, err := sn.Prepare(ctx, "extract", "", snapshots.WithLabels(map[string]string{
-		intermediateSnapshotLabel: chain,
-		imageRefLabel:             digest.FromString("unheld-image").String(),
-		"other":                   "not ours",
-	})); err != nil {
+	if _, err := sn.Prepare(ctx, "extract", "", snapshots.WithLabels(labels)); err != nil {
 		t.Fatalf("handshake Prepare error = %v", err)
 	}
-	if err := sn.Commit(ctx, chain, "extract"); err != nil {
+	if err := sn.Commit(ctx, chains[0].String(), "extract"); err != nil {
 		t.Fatalf("Commit() error = %v", err)
 	}
 
-	info, err := sn.Stat(ctx, chain)
+	info, err := sn.Stat(ctx, chains[0].String())
 	if err != nil {
-		t.Fatalf("Stat(%q) error = %v", chain, err)
+		t.Fatalf("Stat(%q) error = %v", chains[0], err)
 	}
 	if info.Labels[stagingLabel] == "" {
 		t.Fatalf("committed snapshot labels = %v, want the staging marker carried over", info.Labels)
 	}
 	if _, ok := info.Labels["other"]; ok {
 		t.Fatalf("committed snapshot labels = %v, want only the snapshotter's own carried over", info.Labels)
+	}
+}
+
+// TestCommitBuildsStagedLeaf covers the conversion a cold pull ends with: the
+// chain the record stands for is read from its snapshot.ref label rather than
+// from the name containerd files it under, the image is built from the blobs
+// the runtime fetched and pinned under this snapshotter, the record becomes an
+// image chain member carrying the held digest, and the staged directories the
+// chain no longer needs are discarded.
+func TestCommitBuildsStagedLeaf(t *testing.T) {
+	ctx := pullNamespace()
+	engine := fakeEngineForImages()
+	sn := newStagingSnapshotter(t, engine)
+	root, chains := stageImage(t, sn, digest.FromString("layer-1"), digest.FromString("layer-2"))
+	const imageRef = "registry.example/app:v1"
+
+	dirs := make([]string, len(chains))
+	parent := ""
+	for i, chain := range chains {
+		key := fmt.Sprintf("extract-%d", i)
+		if _, err := sn.Prepare(ctx, key, parent, snapshots.WithLabels(stagedLabels(imageRef, root, chain))); err != nil {
+			t.Fatalf("Prepare(%s) error = %v", key, err)
+		}
+		id, _, err := sn.snapshotInfo(ctx, key)
+		if err != nil {
+			t.Fatalf("snapshotInfo(%s) error = %v", key, err)
+		}
+		dirs[i] = sn.getSnapshotDir(id)
+		// containerd names a backend record for its own bookkeeping, never by
+		// the chain the record stands for.
+		parent = fmt.Sprintf("moby/%d/%s", i, chain)
+		if err := sn.Commit(ctx, parent, key); err != nil {
+			t.Fatalf("Commit(%s) error = %v", parent, err)
+		}
+	}
+
+	if len(engine.pulls) != 1 {
+		t.Fatalf("engine Pull calls = %+v, want only the leaf", engine.pulls)
+	}
+	pull := engine.pulls[0]
+	if pull.ref != imageRef || pull.opts.ResolvedRoot != root || pull.opts.BlobSource != knarr.BlobSource(sn.blobs) {
+		t.Fatalf("Pull(%q, %+v), want %q rooted at %s from the content store", pull.ref, pull.opts, imageRef, root)
+	}
+	want := []holdCall{{ref: root.String(), holder: cfsHolder}}
+	if !slices.Equal(engine.holds, want) {
+		t.Fatalf("engine Hold calls = %+v, want %+v", engine.holds, want)
+	}
+
+	leaf, err := sn.Stat(ctx, parent)
+	if err != nil {
+		t.Fatalf("Stat(%q) error = %v", parent, err)
+	}
+	if leaf.Labels[chainMemberLabel] == "" || leaf.Labels[rootDigestLabel] != root.String() {
+		t.Fatalf("leaf labels = %v, want an image chain member holding %s", leaf.Labels, root)
+	}
+	if leaf.Labels[stagingLabel] != "" {
+		t.Fatalf("leaf labels = %v, want the staging marker gone", leaf.Labels)
+	}
+	for i, dir := range dirs {
+		for _, sub := range []string{"upper", "work"} {
+			if _, err := os.Stat(filepath.Join(dir, sub)); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("staged %s of chain %d error = %v, want discarded", sub, i, err)
+			}
+		}
+	}
+}
+
+// TestCommitLeavesNonLeafStagedChainAlone covers that only the chain's last
+// layer builds an image: an earlier one is filed as it stands, still staging,
+// with its directories intact for the layers stacking on top of it.
+func TestCommitLeavesNonLeafStagedChainAlone(t *testing.T) {
+	ctx := pullNamespace()
+	engine := fakeEngineForImages()
+	sn := newStagingSnapshotter(t, engine)
+	root, chains := stageImage(t, sn, digest.FromString("layer-1"), digest.FromString("layer-2"))
+
+	if _, err := sn.Prepare(ctx, "extract", "", snapshots.WithLabels(stagedLabels("app:v1", root, chains[0]))); err != nil {
+		t.Fatalf("Prepare() error = %v", err)
+	}
+	id, _, err := sn.snapshotInfo(ctx, "extract")
+	if err != nil {
+		t.Fatalf("snapshotInfo(extract) error = %v", err)
+	}
+	if err := sn.Commit(ctx, chains[0].String(), "extract"); err != nil {
+		t.Fatalf("Commit() error = %v", err)
+	}
+
+	if len(engine.pulls) != 0 || len(engine.holds) != 0 {
+		t.Fatalf("engine pulls = %+v, holds = %+v; want neither for a non-leaf chain", engine.pulls, engine.holds)
+	}
+	info, err := sn.Stat(ctx, chains[0].String())
+	if err != nil {
+		t.Fatalf("Stat() error = %v", err)
+	}
+	if info.Labels[stagingLabel] == "" || info.Labels[chainMemberLabel] != "" {
+		t.Fatalf("committed labels = %v, want a staging record", info.Labels)
+	}
+	if _, err := os.Stat(filepath.Join(sn.getSnapshotDir(id), "upper")); err != nil {
+		t.Fatalf("staged upper: %v, want it kept for the layers above", err)
+	}
+}
+
+// TestCommitDeclinesUnanchoredStagedChain covers the labels a conversion is
+// anchored on: without the manifest digest there is nothing to build against,
+// and without a namespace there is no content store to read.
+func TestCommitDeclinesUnanchoredStagedChain(t *testing.T) {
+	root, chains := digest.FromString("root"), []digest.Digest{digest.FromString("chain")}
+	tests := []struct {
+		name    string
+		ctx     context.Context
+		labels  map[string]string
+		wantErr func(error) bool
+	}{
+		{
+			name: "no manifest digest",
+			ctx:  pullNamespace(),
+			labels: map[string]string{
+				intermediateSnapshotLabel: chains[0].String(),
+				imageRefLabel:             "app:v1",
+			},
+			wantErr: errdefs.IsFailedPrecondition,
+		},
+		{
+			name:    "no namespace",
+			ctx:     context.Background(),
+			labels:  stagedLabels("app:v1", root, chains[0]),
+			wantErr: errdefs.IsFailedPrecondition,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			engine := fakeEngineForImages()
+			sn := newStagingSnapshotter(t, engine)
+			stageImage(t, sn, digest.FromString("layer-1"))
+
+			if _, err := sn.Prepare(tt.ctx, "extract", "", snapshots.WithLabels(tt.labels)); err != nil {
+				t.Fatalf("Prepare() error = %v", err)
+			}
+			err := sn.Commit(tt.ctx, "moby/1/chain", "extract")
+			if err == nil || !tt.wantErr(err) {
+				t.Fatalf("Commit() error = %v, want a declined conversion", err)
+			}
+			if len(engine.pulls) != 0 {
+				t.Fatalf("engine pulls = %+v, want none", engine.pulls)
+			}
+			if _, err := sn.Stat(context.Background(), "moby/1/chain"); !errdefs.IsNotFound(err) {
+				t.Fatalf("Stat() after declined commit = %v, want not found", err)
+			}
+		})
+	}
+}
+
+// TestCommitPropagatesBuildFailure covers that a conversion that cannot
+// complete fails the commit rather than filing a record for content the store
+// does not have.
+func TestCommitPropagatesBuildFailure(t *testing.T) {
+	ctx := pullNamespace()
+	buildErr := errors.New("build failed")
+	engine := fakeEngineForImages()
+	engine.pullFunc = func(context.Context, string, ...knarr.PullOption) (*knarr.Image, error) {
+		return nil, buildErr
+	}
+	sn := newStagingSnapshotter(t, engine)
+	root, chains := stageImage(t, sn, digest.FromString("layer-1"))
+
+	if _, err := sn.Prepare(ctx, "extract", "", snapshots.WithLabels(stagedLabels("app:v1", root, chains[0]))); err != nil {
+		t.Fatalf("Prepare() error = %v", err)
+	}
+	name := "moby/1/" + chains[0].String()
+	if err := sn.Commit(ctx, name, "extract"); !errors.Is(err, buildErr) {
+		t.Fatalf("Commit() error = %v, want %v", err, buildErr)
+	}
+	if len(engine.holds) != 0 {
+		t.Fatalf("engine holds = %+v, want none for a failed build", engine.holds)
+	}
+	if _, err := sn.Stat(ctx, name); !errdefs.IsNotFound(err) {
+		t.Fatalf("Stat() after failed commit = %v, want not found", err)
+	}
+}
+
+// TestCommitConvergesOnDuplicateLeaves covers two pulls of the same image
+// racing to commit the chain: both build it, which the content-addressed store
+// deduplicates, and only one record survives.
+func TestCommitConvergesOnDuplicateLeaves(t *testing.T) {
+	ctx := pullNamespace()
+	engine := fakeEngineForImages()
+	sn := newStagingSnapshotter(t, engine)
+	root, chains := stageImage(t, sn, digest.FromString("layer-1"))
+	name := "moby/1/" + chains[0].String()
+
+	for _, key := range []string{"extract-a", "extract-b"} {
+		if _, err := sn.Prepare(ctx, key, "", snapshots.WithLabels(stagedLabels("app:v1", root, chains[0]))); err != nil {
+			t.Fatalf("Prepare(%s) error = %v", key, err)
+		}
+	}
+	errs := make(chan error, 2)
+	var start sync.WaitGroup
+	start.Add(1)
+	for _, key := range []string{"extract-a", "extract-b"} {
+		go func() {
+			start.Wait()
+			errs <- sn.Commit(ctx, name, key)
+		}()
+	}
+	start.Done()
+
+	var failed int
+	for range 2 {
+		if err := <-errs; err != nil {
+			if !errdefs.IsAlreadyExists(err) {
+				t.Fatalf("Commit() error = %v, want already exists", err)
+			}
+			failed++
+		}
+	}
+	if failed != 1 {
+		t.Fatalf("%d of 2 concurrent commits failed, want exactly 1", failed)
+	}
+	if len(engine.pulls) != 2 {
+		t.Fatalf("engine Pull calls = %d, want both commits to build", len(engine.pulls))
+	}
+	info, err := sn.Stat(ctx, name)
+	if err != nil {
+		t.Fatalf("Stat(%q) error = %v", name, err)
+	}
+	if info.Labels[rootDigestLabel] != root.String() {
+		t.Fatalf("committed labels = %v, want the built image's digest", info.Labels)
+	}
+}
+
+// TestCommitKeepsStagedAncestorWithOutsideChild covers the sweep stopping at a
+// record another pull still stages on top of: its upper is a lower of that
+// pull's mounts, and discarding it would pull the ground out from under a
+// layer still being applied.
+func TestCommitKeepsStagedAncestorWithOutsideChild(t *testing.T) {
+	ctx := pullNamespace()
+	sn := newStagingSnapshotter(t, fakeEngineForImages())
+	root, chains := stageImage(t, sn, digest.FromString("layer-1"), digest.FromString("layer-2"))
+
+	if _, err := sn.Prepare(ctx, "extract-base", "", snapshots.WithLabels(stagedLabels("app:v1", root, chains[0]))); err != nil {
+		t.Fatalf("Prepare(extract-base) error = %v", err)
+	}
+	baseID, _, err := sn.snapshotInfo(ctx, "extract-base")
+	if err != nil {
+		t.Fatalf("snapshotInfo(extract-base) error = %v", err)
+	}
+	base := "moby/1/" + chains[0].String()
+	if err := sn.Commit(ctx, base, "extract-base"); err != nil {
+		t.Fatalf("Commit(base) error = %v", err)
+	}
+	// A second pull shares the prefix and is still applying its own layer on
+	// top of the base while this pull completes.
+	if _, err := sn.Prepare(ctx, "extract-other", base, snapshots.WithLabels(stagedLabels("other:v1", root, digest.FromString("other-chain")))); err != nil {
+		t.Fatalf("Prepare(extract-other) error = %v", err)
+	}
+	if _, err := sn.Prepare(ctx, "extract-leaf", base, snapshots.WithLabels(stagedLabels("app:v1", root, chains[1]))); err != nil {
+		t.Fatalf("Prepare(extract-leaf) error = %v", err)
+	}
+	leafID, _, err := sn.snapshotInfo(ctx, "extract-leaf")
+	if err != nil {
+		t.Fatalf("snapshotInfo(extract-leaf) error = %v", err)
+	}
+	if err := sn.Commit(ctx, "moby/2/"+chains[1].String(), "extract-leaf"); err != nil {
+		t.Fatalf("Commit(leaf) error = %v", err)
+	}
+
+	if _, err := os.Stat(filepath.Join(sn.getSnapshotDir(baseID), "upper")); err != nil {
+		t.Fatalf("shared staged upper: %v, want it kept for the other pull", err)
+	}
+	if _, err := os.Stat(filepath.Join(sn.getSnapshotDir(leafID), "upper")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("converted leaf upper error = %v, want discarded", err)
+	}
+}
+
+// TestRemoveReleasesByRecordedDigest covers that the hold a record took is
+// released against the digest the record itself carries, so a reference that
+// moved on to another image in the meantime cannot make the release land on
+// the wrong one.
+func TestRemoveReleasesByRecordedDigest(t *testing.T) {
+	ctx := pullNamespace()
+	engine := fakeEngineForImages()
+	sn := newStagingSnapshotter(t, engine)
+	root, chains := stageImage(t, sn, digest.FromString("layer-1"))
+	name := "moby/1/" + chains[0].String()
+
+	if _, err := sn.Prepare(ctx, "extract", "", snapshots.WithLabels(stagedLabels("app:latest", root, chains[0]))); err != nil {
+		t.Fatalf("Prepare() error = %v", err)
+	}
+	if err := sn.Commit(ctx, name, "extract"); err != nil {
+		t.Fatalf("Commit() error = %v", err)
+	}
+	// The tag now points at another image; the release must not follow it.
+	stageImage(t, sn, digest.FromString("layer-1"), digest.FromString("layer-2"))
+
+	if err := sn.Remove(ctx, name); err != nil {
+		t.Fatalf("Remove() error = %v", err)
+	}
+	want := []holdCall{{ref: root.String(), holder: cfsHolder}}
+	if !slices.Equal(engine.releases, want) {
+		t.Fatalf("engine Release calls = %+v, want %+v", engine.releases, want)
+	}
+}
+
+// TestPrepareHoldsAdmittedImage covers that admitting a pull of an image the
+// store already holds pins it too, and only once: the handshake for the last
+// chain is the one that stands for the whole image, and the earlier ones are
+// steps towards it.
+func TestPrepareHoldsAdmittedImage(t *testing.T) {
+	ctx := context.Background()
+	base := digest.FromString("base-chain")
+	leaf := digest.FromString("leaf-chain")
+	image := testImageInfo("image", base, leaf)
+	engine := fakeEngineForImages(image)
+	sn := newSnapshotterForTest(t, engine, notMounted)
+
+	seedChainRecord(t, ctx, sn, base.String(), "", image.Root.String())
+	if len(engine.holds) != 0 {
+		t.Fatalf("engine holds = %+v after a non-leaf handshake, want none", engine.holds)
+	}
+	if info, err := sn.Stat(ctx, base.String()); err != nil {
+		t.Fatalf("Stat(%q) error = %v", base, err)
+	} else if info.Labels[rootDigestLabel] != "" {
+		t.Fatalf("non-leaf labels = %v, want no held digest", info.Labels)
+	}
+
+	seedChainRecord(t, ctx, sn, leaf.String(), base.String(), image.Root.String())
+	want := []holdCall{{ref: image.Root.String(), holder: cfsHolder}}
+	if !slices.Equal(engine.holds, want) {
+		t.Fatalf("engine Hold calls = %+v, want %+v", engine.holds, want)
+	}
+	info, err := sn.Stat(ctx, leaf.String())
+	if err != nil {
+		t.Fatalf("Stat(%q) error = %v", leaf, err)
+	}
+	if info.Labels[rootDigestLabel] != image.Root.String() {
+		t.Fatalf("leaf labels = %v, want the held digest %s", info.Labels, image.Root)
+	}
+}
+
+// TestUsageIsComputedForCommittedRecords covers the two committed records
+// whose recorded usage cannot be trusted: one standing for an image costs that
+// image's composefs blob, and one whose staged directories were discarded
+// costs nothing.
+func TestUsageIsComputedForCommittedRecords(t *testing.T) {
+	ctx := pullNamespace()
+	engine := fakeEngineForImages()
+	sn := newStagingSnapshotter(t, engine)
+	root, chains := stageImage(t, sn, digest.FromString("layer-1"), digest.FromString("layer-2"))
+	engine.infos[root.String()] = &knarr.ImageInfo{
+		Root:      root,
+		Composefs: ocispec.Descriptor{Size: 4096},
+	}
+
+	parent := ""
+	names := make([]string, len(chains))
+	for i, chain := range chains {
+		key := fmt.Sprintf("extract-%d", i)
+		if _, err := sn.Prepare(ctx, key, parent, snapshots.WithLabels(stagedLabels("app:v1", root, chain))); err != nil {
+			t.Fatalf("Prepare(%s) error = %v", key, err)
+		}
+		names[i] = fmt.Sprintf("moby/%d/%s", i, chain)
+		if err := sn.Commit(ctx, names[i], key); err != nil {
+			t.Fatalf("Commit(%s) error = %v", names[i], err)
+		}
+		parent = names[i]
+	}
+
+	if usage, err := sn.Usage(ctx, names[1]); err != nil {
+		t.Fatalf("Usage(leaf) error = %v", err)
+	} else if usage.Size != 4096 {
+		t.Fatalf("Usage(leaf) = %+v, want the composefs size", usage)
+	}
+	if usage, err := sn.Usage(ctx, names[0]); err != nil {
+		t.Fatalf("Usage(staged) error = %v", err)
+	} else if usage != (snapshots.Usage{}) {
+		t.Fatalf("Usage(staged) = %+v, want nothing after the sweep", usage)
+	}
+}
+
+// TestCloseIsIdempotent covers tearing the snapshotter down twice, which the
+// containerd connection would otherwise report as already closed.
+func TestCloseIsIdempotent(t *testing.T) {
+	sn, err := newSnapshotter(context.Background(), Config{
+		Root:              t.TempDir(),
+		ContainerdAddress: filepath.Join(t.TempDir(), "containerd.sock"),
+	}, fakeEngineForImages())
+	if err != nil {
+		t.Fatalf("newSnapshotter() error = %v", err)
+	}
+	if _, err := sn.blobs.contentStore(); err != nil {
+		t.Fatalf("contentStore() error = %v", err)
+	}
+	for i := range 2 {
+		if err := sn.Close(); err != nil {
+			t.Fatalf("Close() call %d error = %v", i+1, err)
+		}
 	}
 }
 
@@ -708,15 +1111,15 @@ func TestUpdateKeepsPrivateLabels(t *testing.T) {
 // ancestors: a plain overlay of their uppers, nearest parent first, with no
 // image, no knarr objects, and no fs-verity beneath it.
 func TestStagingMountsComposeStagedUppers(t *testing.T) {
-	ctx := context.Background()
+	ctx := pullNamespace()
 	sn := newStagingSnapshotter(t, fakeEngineForImages())
+	root, chains := stageImage(t, sn,
+		digest.FromString("layer-1"), digest.FromString("layer-2"),
+		digest.FromString("layer-3"), digest.FromString("layer-4"))
 	imageRef := digest.FromString("unheld-image").String()
-	stage := func(key, parent, chain string) ([]mount.Mount, string) {
+	stage := func(key, parent string, chain digest.Digest) ([]mount.Mount, string) {
 		t.Helper()
-		mounts, err := sn.Prepare(ctx, key, parent, snapshots.WithLabels(map[string]string{
-			intermediateSnapshotLabel: chain,
-			imageRefLabel:             imageRef,
-		}))
+		mounts, err := sn.Prepare(ctx, key, parent, snapshots.WithLabels(stagedLabels(imageRef, root, chain)))
 		if err != nil {
 			t.Fatalf("Prepare(%s) error = %v", key, err)
 		}
@@ -727,15 +1130,15 @@ func TestStagingMountsComposeStagedUppers(t *testing.T) {
 		return mounts, sn.getSnapshotDir(id)
 	}
 
-	_, first := stage("extract-1", "", "chain-1")
-	if err := sn.Commit(ctx, "chain-1", "extract-1"); err != nil {
+	_, first := stage("extract-1", "", chains[0])
+	if err := sn.Commit(ctx, chains[0].String(), "extract-1"); err != nil {
 		t.Fatalf("Commit(chain-1) error = %v", err)
 	}
-	_, second := stage("extract-2", "chain-1", "chain-2")
-	if err := sn.Commit(ctx, "chain-2", "extract-2"); err != nil {
+	_, second := stage("extract-2", chains[0].String(), chains[1])
+	if err := sn.Commit(ctx, chains[1].String(), "extract-2"); err != nil {
 		t.Fatalf("Commit(chain-2) error = %v", err)
 	}
-	mounts, third := stage("extract-3", "chain-2", "chain-3")
+	mounts, third := stage("extract-3", chains[1].String(), chains[2])
 
 	want := []string{
 		"workdir=" + filepath.Join(third, "work"),
@@ -1061,7 +1464,14 @@ type fakeEngine struct {
 	inspectFunc    func(context.Context, string) (*knarr.ImageInfo, error)
 	mountChainFunc func(context.Context, string, string, ...knarr.MountOption) error
 	unmountFunc    func(context.Context, string) error
+	pullFunc       func(context.Context, string, ...knarr.PullOption) (*knarr.Image, error)
 	objectsDir     string
+
+	// mu guards the call records, which concurrent commits append to.
+	mu       sync.Mutex
+	pulls    []pullCall
+	holds    []holdCall
+	releases []holdCall
 }
 
 var _ engineAPI = (*fakeEngine)(nil)
@@ -1078,6 +1488,34 @@ func (e *fakeEngine) Inspect(ctx context.Context, ref string) (*knarr.ImageInfo,
 		return nil, fmt.Errorf("inspect %s: %w", ref, knarr.ErrNotFound)
 	}
 	return info, nil
+}
+
+func (e *fakeEngine) Pull(ctx context.Context, ref string, opts ...knarr.PullOption) (*knarr.Image, error) {
+	var pullOpts knarr.PullOptions
+	for _, opt := range opts {
+		opt(&pullOpts)
+	}
+	e.mu.Lock()
+	e.pulls = append(e.pulls, pullCall{ref: ref, opts: pullOpts})
+	e.mu.Unlock()
+	if e.pullFunc != nil {
+		return e.pullFunc(ctx, ref, opts...)
+	}
+	return &knarr.Image{Ref: ref, Digest: pullOpts.ResolvedRoot.String()}, nil
+}
+
+func (e *fakeEngine) Hold(_ context.Context, ref, holder string) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.holds = append(e.holds, holdCall{ref: ref, holder: holder})
+	return nil
+}
+
+func (e *fakeEngine) Release(_ context.Context, ref, holder string) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.releases = append(e.releases, holdCall{ref: ref, holder: holder})
+	return nil
 }
 
 func (e *fakeEngine) MountChain(ctx context.Context, chainID, target string, opts ...knarr.MountOption) error {
@@ -1125,6 +1563,90 @@ type mountCall struct {
 	chainID string
 	target  string
 	opts    knarr.MountOptions
+}
+
+type pullCall struct {
+	ref  string
+	opts knarr.PullOptions
+}
+
+type holdCall struct {
+	ref    string
+	holder string
+}
+
+// fakeContent serves canned blobs the way containerd's content store does.
+// Only the read a conversion makes is implemented; anything else panics on the
+// nil embedded store.
+type fakeContent struct {
+	content.Store
+	blobs map[digest.Digest][]byte
+}
+
+func (f fakeContent) ReaderAt(_ context.Context, desc ocispec.Descriptor) (content.ReaderAt, error) {
+	blob, ok := f.blobs[desc.Digest]
+	if !ok {
+		return nil, fmt.Errorf("content %s: %w", desc.Digest, errdefs.ErrNotFound)
+	}
+	return fakeReaderAt{Reader: bytes.NewReader(blob)}, nil
+}
+
+type fakeReaderAt struct {
+	*bytes.Reader
+}
+
+func (r fakeReaderAt) Size() int64 { return r.Reader.Size() }
+
+func (fakeReaderAt) Close() error { return nil }
+
+// stageImage puts the manifest and config of an image with the given layer
+// diff IDs in the snapshotter's content store, and returns the manifest digest
+// the runtime would label a pull with along with the chain ID of each layer.
+func stageImage(t *testing.T, sn *snapshotter, diffIDs ...digest.Digest) (digest.Digest, []digest.Digest) {
+	t.Helper()
+	config, err := json.Marshal(ocispec.Image{
+		RootFS: ocispec.RootFS{Type: "layers", DiffIDs: diffIDs},
+	})
+	if err != nil {
+		t.Fatalf("marshal config: %v", err)
+	}
+	configDigest := digest.FromBytes(config)
+	manifest, err := json.Marshal(ocispec.Manifest{
+		MediaType: ocispec.MediaTypeImageManifest,
+		Config: ocispec.Descriptor{
+			MediaType: ocispec.MediaTypeImageConfig,
+			Digest:    configDigest,
+			Size:      int64(len(config)),
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal manifest: %v", err)
+	}
+	root := digest.FromBytes(manifest)
+	sn.blobs.store = fakeContent{blobs: map[digest.Digest][]byte{
+		root:         manifest,
+		configDigest: config,
+	}}
+	chains := make([]digest.Digest, len(diffIDs))
+	copy(chains, diffIDs)
+	identity.ChainIDs(chains)
+	return root, chains
+}
+
+// stagedLabels are the labels the runtime attaches to a pull of an image the
+// knarr store does not hold, which Prepare answers with a staging snapshot.
+func stagedLabels(imageRef string, root, chainID digest.Digest) map[string]string {
+	return map[string]string{
+		intermediateSnapshotLabel: chainID.String(),
+		imageRefLabel:             imageRef,
+		manifestDigestLabel:       root.String(),
+	}
+}
+
+// pullNamespace returns a context naming the namespace a docker pull is served
+// in, which is where its blobs live in the content store.
+func pullNamespace() context.Context {
+	return namespaces.WithNamespace(context.Background(), "moby")
 }
 
 func newSnapshotterForTest(t *testing.T, engine *fakeEngine, mounted func(string) (bool, error)) *snapshotter {

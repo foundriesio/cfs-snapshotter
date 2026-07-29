@@ -8,9 +8,10 @@ require (
 	github.com/containerd/continuity v0.5.0
 	github.com/containerd/errdefs v1.0.0
 	github.com/containerd/log v0.1.0
-	github.com/foundriesio/knarr v0.0.0-20260722113912-3b5b16693094
+	github.com/foundriesio/knarr v0.0.0-20260729141853-a2a82b8458e4
 	github.com/moby/sys/mountinfo v0.7.2
 	github.com/opencontainers/go-digest v1.0.0
+	github.com/opencontainers/image-spec v1.1.1
 	golang.org/x/sys v0.47.0
 	google.golang.org/grpc v1.82.1
 )
@@ -27,9 +28,8 @@ require (
 	github.com/gogo/protobuf v1.3.2 // indirect
 	github.com/golang/groupcache v0.0.0-20241129210726-2c02b8208cf8 // indirect
 	github.com/google/go-containerregistry v0.21.6 // indirect
-	github.com/klauspost/compress v1.19.0 // indirect
+	github.com/klauspost/compress v1.19.1 // indirect
 	github.com/moby/sys/userns v0.1.0 // indirect
-	github.com/opencontainers/image-spec v1.1.1 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/sirupsen/logrus v1.9.4 // indirect
 	go.etcd.io/bbolt v1.4.3 // indirect
