@@ -38,7 +38,7 @@ var (
 	rootDir            = flag.String("root", defaultRootDir, "path to the root directory for this snapshotter")
 	knarrRoot          = flag.String("knarr-root", "/var/lib/knarr", "path to the shared knarr image store root")
 	containerdAddress  = flag.String("containerd-address", "/run/containerd/containerd.sock", "address of containerd's gRPC server")
-	allowUnstagedPulls = flag.Bool("allow-unstaged-pulls", false, "stage every pull through containerd's content store instead of admitting only images already in the knarr store")
+	allowUnstagedPulls = flag.Bool("allow-unstaged-pulls", true, "stage every pull through containerd's content store and build it into the knarr store, instead of admitting only images already there")
 	logLevel           = flag.String("log-level", log.InfoLevel.String(), "logging level [trace, debug, info, warn, error, fatal, panic]")
 	printVersion       = flag.Bool("version", false, "print the version and exit")
 )
