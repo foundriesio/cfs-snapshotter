@@ -45,8 +45,8 @@ github.com/envoyproxy/go-control-plane v0.9.4/go.mod h1:6rpuAdCZL397s3pYoYcLgu1m
 github.com/envoyproxy/protoc-gen-validate v0.1.0/go.mod h1:iSmxcyjqTsJpI2R4NaDN7+kN2VEUnK/pcBlmesArF7c=
 github.com/felixge/httpsnoop v1.0.4 h1:NFTV2Zj1bL4mc9sqWACXbQFVBBg2W3GPvqp8/ESS2Wg=
 github.com/felixge/httpsnoop v1.0.4/go.mod h1:m8KPJKqk1gH5J9DgRY2ASl2lWCfGKXixSwevea8zH2U=
-github.com/foundriesio/knarr v0.0.0-20260729141853-a2a82b8458e4 h1:VwhdH1cCCvgfKXWkG765SXMgcX+yp0ql7cldZauValE=
-github.com/foundriesio/knarr v0.0.0-20260729141853-a2a82b8458e4/go.mod h1:jYWwtM45rKMqrfj54u2unspgzB3+VY+oCAuh6L70UOs=
+github.com/foundriesio/knarr v0.0.0-20260731142159-96cce85a5f03 h1:4X1YjmWoYrtq1ZJS/yiU6+1hs6SjjGu8/vuKR/KEKWg=
+github.com/foundriesio/knarr v0.0.0-20260731142159-96cce85a5f03/go.mod h1:jYWwtM45rKMqrfj54u2unspgzB3+VY+oCAuh6L70UOs=
 github.com/go-logr/logr v1.2.2/go.mod h1:jdQByPbusPIv2/zmleS9BjJVeZ6kBagPoEUsqbVz/1A=
 github.com/go-logr/logr v1.4.3 h1:CjnDlHq8ikf6E492q6eKboGOC0T8CDaOvkHCIg8idEI=
 github.com/go-logr/logr v1.4.3/go.mod h1:9T104GzyrTigFIr8wt5mBrctHMim0Nb2HLGrmQ40KvY=
