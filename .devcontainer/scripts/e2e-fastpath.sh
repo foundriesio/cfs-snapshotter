@@ -921,7 +921,10 @@ cold_phase() {
 }
 
 main() {
-	[ -x "${KNARR_BIN}" ] || fail "knarr CLI not found at ${KNARR_BIN}"
+	[ -x "${KNARR_BIN}" ] ||
+		fail "knarr CLI not found at ${KNARR_BIN}; run the e2e from the host as
+./devshell.sh make test-e2e — devshell builds the knarr CLI there and
+mounts it into the container (a container started any other way has none)"
 	work="$(mktemp -d)"
 	trap cleanup EXIT
 	local nonce="${RANDOM}${RANDOM}"
