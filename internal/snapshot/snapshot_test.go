@@ -853,6 +853,32 @@ func TestCommitPropagatesBuildFailure(t *testing.T) {
 	}
 }
 
+// TestCommitFailsClosedWhenHoldFails covers a built image that cannot be
+// pinned: without the hold nothing keeps a knarr remove from taking the
+// content away, so the commit must fail rather than file the record.
+func TestCommitFailsClosedWhenHoldFails(t *testing.T) {
+	ctx := pullNamespace()
+	holdErr := errors.New("hold failed")
+	engine := fakeEngineForImages()
+	engine.holdErr = holdErr
+	sn := newStagingSnapshotter(t, engine)
+	root, chains := stageImage(t, sn, digest.FromString("layer-1"))
+
+	if _, err := sn.Prepare(ctx, "extract", "", snapshots.WithLabels(stagedLabels("app:v1", root, chains[0]))); err != nil {
+		t.Fatalf("Prepare() error = %v", err)
+	}
+	name := "moby/1/" + chains[0].String()
+	if err := sn.Commit(ctx, name, "extract"); !errors.Is(err, holdErr) {
+		t.Fatalf("Commit() error = %v, want %v", err, holdErr)
+	}
+	if len(engine.pulls) != 1 {
+		t.Fatalf("engine Pull calls = %d, want the build to have run", len(engine.pulls))
+	}
+	if _, err := sn.Stat(ctx, name); !errdefs.IsNotFound(err) {
+		t.Fatalf("Stat() after failed commit = %v, want not found", err)
+	}
+}
+
 // TestCommitConvergesOnDuplicateLeaves covers two pulls of the same image
 // racing to commit the chain: both build it, which the content-addressed store
 // deduplicates, and only one record survives.
@@ -976,6 +1002,36 @@ func TestRemoveReleasesByRecordedDigest(t *testing.T) {
 	}
 }
 
+// TestRemoveToleratesReleaseFailure covers removing a record whose image hold
+// cannot be released: the record is already gone and the caller has nothing
+// to retry, so the removal reports success and the hold lingers for a later
+// release to clear.
+func TestRemoveToleratesReleaseFailure(t *testing.T) {
+	ctx := pullNamespace()
+	engine := fakeEngineForImages()
+	engine.releaseErr = errors.New("release failed")
+	sn := newStagingSnapshotter(t, engine)
+	root, chains := stageImage(t, sn, digest.FromString("layer-1"))
+	name := "moby/1/" + chains[0].String()
+
+	if _, err := sn.Prepare(ctx, "extract", "", snapshots.WithLabels(stagedLabels("app:latest", root, chains[0]))); err != nil {
+		t.Fatalf("Prepare() error = %v", err)
+	}
+	if err := sn.Commit(ctx, name, "extract"); err != nil {
+		t.Fatalf("Commit() error = %v", err)
+	}
+	if err := sn.Remove(ctx, name); err != nil {
+		t.Fatalf("Remove() error = %v, want success despite the failed release", err)
+	}
+	want := []holdCall{{ref: root.String(), holder: cfsHolder}}
+	if !slices.Equal(engine.releases, want) {
+		t.Fatalf("engine Release calls = %+v, want %+v", engine.releases, want)
+	}
+	if _, err := sn.Stat(ctx, name); !errdefs.IsNotFound(err) {
+		t.Fatalf("Stat() after remove = %v, want not found", err)
+	}
+}
+
 // TestPrepareHoldsAdmittedImage covers that admitting a pull of an image the
 // store already holds pins it too, and only once: the handshake for the last
 // chain is the one that stands for the whole image, and the earlier ones are
@@ -1009,6 +1065,30 @@ func TestPrepareHoldsAdmittedImage(t *testing.T) {
 	}
 	if info.Labels[rootDigestLabel] != image.Root.String() {
 		t.Fatalf("leaf labels = %v, want the held digest %s", info.Labels, image.Root)
+	}
+}
+
+// TestPrepareAdmissionFailsClosedWhenHoldFails covers admitting a leaf whose
+// image cannot be pinned: the handshake must fail rather than record a chain
+// a knarr remove could then take the content away from.
+func TestPrepareAdmissionFailsClosedWhenHoldFails(t *testing.T) {
+	ctx := context.Background()
+	holdErr := errors.New("hold failed")
+	chain := digest.FromString("leaf-chain")
+	image := testImageInfo("image", chain)
+	engine := fakeEngineForImages(image)
+	engine.holdErr = holdErr
+	sn := newSnapshotterForTest(t, engine, notMounted)
+
+	labels := map[string]string{
+		intermediateSnapshotLabel: chain.String(),
+		imageRefLabel:             image.Root.String(),
+	}
+	if _, err := sn.Prepare(ctx, "extract", "", snapshots.WithLabels(labels)); !errors.Is(err, holdErr) {
+		t.Fatalf("Prepare() error = %v, want %v", err, holdErr)
+	}
+	if _, err := sn.Stat(ctx, chain.String()); !errdefs.IsNotFound(err) {
+		t.Fatalf("Stat(%q) error = %v, want not found", chain, err)
 	}
 }
 
@@ -1466,6 +1546,8 @@ type fakeEngine struct {
 	unmountFunc    func(context.Context, string) error
 	pullFunc       func(context.Context, string, ...knarr.PullOption) (*knarr.Image, error)
 	objectsDir     string
+	holdErr        error
+	releaseErr     error
 
 	// mu guards the call records, which concurrent commits append to.
 	mu       sync.Mutex
@@ -1508,14 +1590,14 @@ func (e *fakeEngine) Hold(_ context.Context, ref, holder string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.holds = append(e.holds, holdCall{ref: ref, holder: holder})
-	return nil
+	return e.holdErr
 }
 
 func (e *fakeEngine) Release(_ context.Context, ref, holder string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.releases = append(e.releases, holdCall{ref: ref, holder: holder})
-	return nil
+	return e.releaseErr
 }
 
 func (e *fakeEngine) MountChain(ctx context.Context, chainID, target string, opts ...knarr.MountOption) error {
