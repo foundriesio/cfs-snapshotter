@@ -83,9 +83,16 @@ run_new_container() {
 	# This also populates /tmp/cfs-gomodcache with the pinned knarr module, so the
 	# container's own `go build` (same GOMODCACHE, bind-mounted below) finds it
 	# without needing network access.
+	# Both go commands run against the shared module cache rather than the
+	# caller's: the version probe needs the pinned module's go.mod, and a
+	# caller cache that misses it would send the probe to the network — where
+	# a not-yet-pushed pin does not resolve. GOFLAGS is cleared because flags
+	# like -mod are rejected by `go install pkg@version`, and a stray export
+	# would fail the build.
+	local knarr_goenv=(GOMODCACHE=/tmp/cfs-gomodcache GOTOOLCHAIN=auto GOPRIVATE=github.com/foundriesio GOFLAGS=)
 	local knarr_version
-	if knarr_version="$(cd "${ROOT_DIR}" && go list -m -f '{{.Version}}' github.com/foundriesio/knarr 2>/dev/null)" &&
-		GOBIN=/tmp/cfs-knarr-bin GOMODCACHE=/tmp/cfs-gomodcache GOTOOLCHAIN=auto GOPRIVATE=github.com/foundriesio go install "github.com/foundriesio/knarr/cmd/knarr@${knarr_version}"; then
+	if knarr_version="$(cd "${ROOT_DIR}" && env "${knarr_goenv[@]}" go list -m -f '{{.Version}}' github.com/foundriesio/knarr)" &&
+		env "${knarr_goenv[@]}" GOBIN=/tmp/cfs-knarr-bin go install "github.com/foundriesio/knarr/cmd/knarr@${knarr_version}"; then
 		run_flags+=(-v /tmp/cfs-knarr-bin/knarr:/opt/cfs-dev/bin/knarr:ro)
 	else
 		echo "warning: could not build the knarr CLI on the host; any e2e that needs it will fail" >&2
