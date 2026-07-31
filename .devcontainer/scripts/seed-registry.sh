@@ -17,6 +17,7 @@ SEED_KEEP_LAYOUT=${SEED_KEEP_LAYOUT:-}
 SEED_RUNNABLE=${SEED_RUNNABLE:-}
 SEED_ALTERNATE_CONFIG=${SEED_ALTERNATE_CONFIG:-}
 SEED_LAYER_BYTES=${SEED_LAYER_BYTES:-}
+SEED_INDEX_ROOT=${SEED_INDEX_ROOT:-}
 
 work=""
 
@@ -166,8 +167,24 @@ EOF
 	manifest_size="$(size_file "${work}/manifest.json")"
 	cp "${work}/manifest.json" "${oci}/blobs/sha256/${manifest_digest}"
 
+	local root_type="application/vnd.oci.image.manifest.v1+json"
+	local root_digest="${manifest_digest}" root_size="${manifest_size}"
+	if [ -n "${SEED_INDEX_ROOT}" ]; then
+		# The tag points at a one-entry image index instead of the bare
+		# manifest — the shape a multi-platform registry image has, where a
+		# tag resolves to an index digest while the runtime records the
+		# platform manifest it picked.
+		cat >"${work}/manifest-index.json" <<EOF
+{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:${manifest_digest}","size":${manifest_size},"platform":{"architecture":"${architecture}","os":"linux"}}]}
+EOF
+		root_type="application/vnd.oci.image.index.v1+json"
+		root_digest="$(digest_file "${work}/manifest-index.json")"
+		root_size="$(size_file "${work}/manifest-index.json")"
+		cp "${work}/manifest-index.json" "${oci}/blobs/sha256/${root_digest}"
+	fi
+
 	cat >"${oci}/index.json" <<EOF
-{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:${manifest_digest}","size":${manifest_size},"platform":{"architecture":"${architecture}","os":"linux"},"annotations":{"org.opencontainers.image.ref.name":"${tag}"}}]}
+{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"mediaType":"${root_type}","digest":"sha256:${root_digest}","size":${root_size},"platform":{"architecture":"${architecture}","os":"linux"},"annotations":{"org.opencontainers.image.ref.name":"${tag}"}}]}
 EOF
 	printf '{"imageLayoutVersion":"1.0.0"}\n' >"${oci}/oci-layout"
 	tar -C "${oci}" -cf "${work}/image.oci.tar" .

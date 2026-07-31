@@ -336,15 +336,43 @@ knarr_remove_when_released() {
 
 seed_image() {
 	local nonce="$1" ref="$2" layer_count="$3" layout="$4"
-	local alternate_config="${5:-}" layer_bytes="${6:-}"
+	local alternate_config="${5:-}" layer_bytes="${6:-}" index_root="${7:-}"
 	SEED_LAYER_COUNT="${layer_count}" SEED_NONCE="${nonce}" SEED_RUNNABLE=1 \
 		SEED_ALTERNATE_CONFIG="${alternate_config}" SEED_LAYER_BYTES="${layer_bytes}" \
+		SEED_INDEX_ROOT="${index_root}" \
 		SEED_KEEP_LAYOUT="${layout}" "${SCRIPT_DIR}/seed-registry.sh" "${ref}" >&2 ||
 		fail "cannot seed ${ref}"
 }
 
 manifest_digest() {
 	jq -r '.manifests[0].digest' "${1}/index.json"
+}
+
+# indexed_manifest_digest reports the platform manifest an index-rooted
+# layout's tag resolves to: the sole entry of the index blob the layout's
+# top-level index points at.
+indexed_manifest_digest() {
+	local layout="$1" idx
+	idx="$(manifest_digest "${layout}")" || return 1
+	jq -r '.manifests[0].digest' "${layout}/blobs/sha256/${idx#sha256:}"
+}
+
+# ref_record_field reads one field of the record the knarr store keeps for a
+# reference, straight from the on-disk refs tree.
+ref_record_field() {
+	local ref="$1" field="$2" value
+	value="$(jq -r --arg r "${ref}" "select(.ref == \$r) | ${field}" \
+		"${knarr_root}"/refs/sha256/*/*.json 2>/dev/null)" ||
+		fail "cannot read the ref records under ${knarr_root}"
+	[ -n "${value}" ] || fail "the knarr store has no ref record for ${ref}"
+	printf '%s\n' "${value}"
+}
+
+# no_image_binding reports whether the store holds no composefs binding for a
+# root digest — the shape image_bindings treats as a test failure.
+no_image_binding() {
+	local hex="${1#sha256:}"
+	[ ! -d "${knarr_root}/images/sha256/${hex:0:2}/${hex:2}" ]
 }
 
 pinned_ref() {
@@ -482,6 +510,43 @@ assert_warm_hold_released() {
 	ref="$(knarr_ref_for_digest "$(manifest_digest "${work}/layout")")"
 	knarr_remove_when_released "${ref}"
 	echo "PASS: removing the image from the runtime released the cfs hold"
+}
+
+# assert_warm_tag_identity stages an index-rooted image by TAG through the
+# registry door and lets the runtime pull the same tag: the tag resolves to
+# an index digest, but the image is keyed by the platform manifest the index
+# selects, so admission, the zero-fetch answer, the hold, and the removal
+# all meet on that one identity.
+assert_warm_tag_identity() {
+	local nonce="$1" repo="cfs/e2e-tag" layout="${work}/tag-layout"
+	local tag_ref idx mdigest manifest config digest output
+	tag_ref="${REGISTRY}/${repo}:${nonce}"
+	seed_image "${nonce}-tag" "${tag_ref}" 2 "${layout}" "" "" 1
+	idx="$(manifest_digest "${layout}")" || fail "cannot read the index digest"
+	mdigest="$(indexed_manifest_digest "${layout}")" || fail "cannot read the platform manifest digest"
+	[ "${idx}" != "${mdigest}" ] || fail "the seeded tag does not resolve through an index"
+
+	knarr_cli pull "${tag_ref}" >&2 || fail "knarr pull by tag failed"
+	[ "$(knarr_cli inspect --format json "${tag_ref}" | jq -r '.root')" = "${mdigest}" ] ||
+		fail "the tag pull is not keyed by the platform manifest"
+	[ "$(ref_record_field "${tag_ref}" '.resolved.digest')" = "${idx}" ] ||
+		fail "the ref record does not keep the index as provenance"
+	no_image_binding "${idx}" || fail "the store built a binding under the index digest"
+
+	manifest="$(cat "${layout}/blobs/sha256/${mdigest#sha256:}")"
+	config="$(jq -r '.config.digest' <<<"${manifest}")"
+	docker pull "${tag_ref}" >/dev/null || fail "docker pull of the staged tag failed"
+	while read -r digest; do
+		content_has "${digest}" && fail "layer was fetched: ${digest}"
+	done < <(jq -r '.layers[].digest' <<<"${manifest}")
+	content_has "${config}" || fail "image config was not fetched"
+	output="$(docker run --rm --network=none "${tag_ref}")" || fail "docker run of the tag failed"
+	[ "${output}" = "cfs hello ${nonce}-tag" ] || fail "unexpected container output: ${output}"
+
+	assert_knarr_remove_declines "${tag_ref}"
+	docker rmi "${tag_ref}" >/dev/null || fail "docker rmi of the tag failed"
+	knarr_remove_when_released "${tag_ref}"
+	echo "PASS: a tag staged out of band admitted, held, and removed by its manifest identity"
 }
 
 assert_concurrent_shared_mount() {
@@ -761,6 +826,47 @@ assert_interrupted_pull_converges() {
 	echo "PASS: an interrupted cold pull left nothing behind and a re-pull converged"
 }
 
+# assert_cold_mixed_door covers the two doors meeting on one image: the
+# runtime stages a tag pull and holds the platform manifest it stamped, then
+# a knarr pull of the same tag resolves its index down to that same manifest
+# — updating the reference's provenance, not adding a second image — and a
+# knarr remove of the tag declines on the runtime's hold instead of
+# orphaning it.
+assert_cold_mixed_door() {
+	local nonce="$1" repo="cfs/e2e-mixed" layout="${work}/mixed-layout"
+	local tag_ref idx mdigest resolved output
+	tag_ref="${REGISTRY}/${repo}:${nonce}"
+	seed_image "${nonce}-mixed" "${tag_ref}" 2 "${layout}" "" "" 1
+	idx="$(manifest_digest "${layout}")" || fail "cannot read the index digest"
+	mdigest="$(indexed_manifest_digest "${layout}")" || fail "cannot read the platform manifest digest"
+	[ "${idx}" != "${mdigest}" ] || fail "the seeded tag does not resolve through an index"
+
+	docker pull "${tag_ref}" >/dev/null || fail "docker pull of the index-rooted tag failed"
+	[ "$(image_bindings "${mdigest}")" -eq 1 ] ||
+		fail "the staged pull did not build exactly one composefs image"
+	resolved="$(ref_record_field "${tag_ref}" '.resolved.digest')"
+	[ "${resolved}" = "${mdigest}" ] ||
+		fail "the staged record's provenance is ${resolved}, want the stamped manifest"
+
+	knarr_cli pull "${tag_ref}" >&2 || fail "knarr pull of the staged tag failed"
+	[ "$(image_bindings "${mdigest}")" -eq 1 ] ||
+		fail "the knarr pull built a second composefs image"
+	no_image_binding "${idx}" || fail "the knarr pull built a binding under the index digest"
+	[ "$(ref_record_field "${tag_ref}" '.identity.digest')" = "${mdigest}" ] ||
+		fail "the knarr pull re-keyed the image away from the manifest identity"
+	[ "$(ref_record_field "${tag_ref}" '.resolved.digest')" = "${idx}" ] ||
+		fail "the knarr pull did not record the index as provenance"
+
+	assert_knarr_remove_declines "${tag_ref}"
+	output="$(docker run --rm --network=none "${tag_ref}")" ||
+		fail "docker run after the declined removal failed"
+	[ "${output}" = "cfs hello ${nonce}-mixed" ] || fail "unexpected container output: ${output}"
+
+	docker rmi "${tag_ref}" >/dev/null || fail "docker rmi of the mixed-door image failed"
+	knarr_remove_when_released "${tag_ref}"
+	echo "PASS: a knarr pull of a runtime-staged tag kept one held image and remove declined"
+}
+
 warm_phase() {
 	local nonce="$1" chainfs
 	echo "== warm phase: images enter the store out of band =="
@@ -782,6 +888,7 @@ warm_phase() {
 	assert_gc_teardown "${chainfs}"
 	assert_tamper_fails_at_open
 	assert_warm_hold_released
+	assert_warm_tag_identity "${nonce}"
 }
 
 cold_phase() {
@@ -804,6 +911,7 @@ cold_phase() {
 	assert_cold_hold_released
 	assert_cold_prefix_dedup "${nonce}"
 	assert_interrupted_pull_converges "${nonce}"
+	assert_cold_mixed_door "${nonce}"
 
 	drain_runtime_images
 	CFS_ALLOW_UNSTAGED_PULLS=1 CFS_ROOT="${WARM_CFS_ROOT}" KNARR_ROOT="${WARM_KNARR_ROOT}" \
@@ -820,7 +928,8 @@ main() {
 	warm_phase "${nonce}"
 	cold_phase "${nonce}"
 	echo "E2E PASS: handshake identity, real content, recovery, concurrency, teardown," \
-		"tamper enforcement, holds, cold conversion, dedup, and interrupted-pull recovery"
+		"tamper enforcement, holds, tag identity, cold conversion, dedup," \
+		"interrupted-pull recovery, and mixed-door identity"
 }
 
 main "$@"
