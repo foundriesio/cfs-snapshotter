@@ -1,0 +1,27 @@
+# SPDX-License-Identifier: Apache-2.0
+name: Qualcomm Preflight Checks
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  qcom-preflight-checks:
+    uses: qualcomm/qcom-reusable-workflows/.github/workflows/reusable-qcom-preflight-checks-orchestrator.yml@v2
+    with:
+      enable-semgrep-scan: true
+      enable-dependency-review: true
+      enable-repolinter-check: true
+      enable-copyright-license-check: true
+      # Disabled: the reusable commit-email-check job only grants itself
+      # `contents: read`, but the underlying action needs `pull-requests: read`
+      # to list a PR's commits via the API. That's fine on public repos (PR
+      # data is public), but this repo is internal, so the check 403s. Revisit
+      # once qualcomm/qcom-reusable-workflows grants that permission upstream.
+      enable-commit-email-check: false
+      enable-commit-msg-check: false
+    permissions:
+      contents: read
+      security-events: write
