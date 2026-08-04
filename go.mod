@@ -8,7 +8,7 @@ require (
 	github.com/containerd/continuity v0.5.0
 	github.com/containerd/errdefs v1.0.0
 	github.com/containerd/log v0.1.0
-	github.com/foundriesio/knarr v0.0.0-20260731142159-96cce85a5f03
+	github.com/foundriesio/knarr v0.0.0-20260804110238-b6ee283d7a77
 	github.com/moby/sys/mountinfo v0.7.2
 	github.com/opencontainers/go-digest v1.0.0
 	github.com/opencontainers/image-spec v1.1.1
@@ -29,6 +29,7 @@ require (
 	github.com/docker/cli v29.4.3+incompatible // indirect
 	github.com/docker/docker-credential-helpers v0.9.3 // indirect
 	github.com/docker/go-units v0.5.0 // indirect
+	github.com/erofs/go-erofs v0.3.1 // indirect
 	github.com/felixge/httpsnoop v1.0.4 // indirect
 	github.com/go-logr/logr v1.4.3 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect

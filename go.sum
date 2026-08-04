@@ -43,10 +43,12 @@ github.com/envoyproxy/go-control-plane v0.9.0/go.mod h1:YTl/9mNaCwkRvm6d1a2C3ymF
 github.com/envoyproxy/go-control-plane v0.9.1-0.20191026205805-5f8ba28d4473/go.mod h1:YTl/9mNaCwkRvm6d1a2C3ymFceY/DCBVvsKhRF0iEA4=
 github.com/envoyproxy/go-control-plane v0.9.4/go.mod h1:6rpuAdCZL397s3pYoYcLgu1mIlRU8Am5FuJP05cCM98=
 github.com/envoyproxy/protoc-gen-validate v0.1.0/go.mod h1:iSmxcyjqTsJpI2R4NaDN7+kN2VEUnK/pcBlmesArF7c=
+github.com/erofs/go-erofs v0.3.1 h1:Sux82Jq9yvyYhIoLgSHDp741p/+370HsOj9dAh1+VVs=
+github.com/erofs/go-erofs v0.3.1/go.mod h1:XkSeN9MHszGd4+3gcEjadJLYHCQpWzJ7/8yznzMuzJs=
 github.com/felixge/httpsnoop v1.0.4 h1:NFTV2Zj1bL4mc9sqWACXbQFVBBg2W3GPvqp8/ESS2Wg=
 github.com/felixge/httpsnoop v1.0.4/go.mod h1:m8KPJKqk1gH5J9DgRY2ASl2lWCfGKXixSwevea8zH2U=
-github.com/foundriesio/knarr v0.0.0-20260731142159-96cce85a5f03 h1:4X1YjmWoYrtq1ZJS/yiU6+1hs6SjjGu8/vuKR/KEKWg=
-github.com/foundriesio/knarr v0.0.0-20260731142159-96cce85a5f03/go.mod h1:jYWwtM45rKMqrfj54u2unspgzB3+VY+oCAuh6L70UOs=
+github.com/foundriesio/knarr v0.0.0-20260804110238-b6ee283d7a77 h1:rvE/nNQyJwkuwtas4/+3uPtzNb5ADjKZBVEbxUCVHH4=
+github.com/foundriesio/knarr v0.0.0-20260804110238-b6ee283d7a77/go.mod h1:fHbsuO+UAdS7rRC3RoLstzCH4xvshBNF7q3ebHmjQ4A=
 github.com/go-logr/logr v1.2.2/go.mod h1:jdQByPbusPIv2/zmleS9BjJVeZ6kBagPoEUsqbVz/1A=
 github.com/go-logr/logr v1.4.3 h1:CjnDlHq8ikf6E492q6eKboGOC0T8CDaOvkHCIg8idEI=
 github.com/go-logr/logr v1.4.3/go.mod h1:9T104GzyrTigFIr8wt5mBrctHMim0Nb2HLGrmQ40KvY=
