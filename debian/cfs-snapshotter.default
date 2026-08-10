@@ -1,0 +1,4 @@
+# Extra flags for containerd-cfs-grpc; see `containerd-cfs-grpc -help` for
+# the full list. Example - serve only images staged out of band with knarr:
+#   CFS_OPTS="-allow-unstaged-pulls=false"
+CFS_OPTS=""

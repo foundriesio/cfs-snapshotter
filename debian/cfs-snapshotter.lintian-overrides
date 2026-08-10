@@ -1,0 +1,5 @@
+# The binary is deliberately fully static (cgo disabled): release artifacts
+# must run on any Linux of the right architecture, without a libc dependency.
+cfs-snapshotter: statically-linked-binary [usr/bin/containerd-cfs-grpc]
+# No manual page yet.
+cfs-snapshotter: no-manual-page [usr/bin/containerd-cfs-grpc]
