@@ -16,15 +16,16 @@ DESTDIR ?=
 # Version stamping: derive from git, fall back to "dev"/"none".
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 REVISION ?= $(shell git rev-parse HEAD 2>/dev/null || echo none)
-LDFLAGS := -X $(PKG)/pkg/version.Version=$(VERSION) -X $(PKG)/pkg/version.Revision=$(REVISION)
+LDFLAGS := -s -w -X $(PKG)/pkg/version.Version=$(VERSION) -X $(PKG)/pkg/version.Revision=$(REVISION)
 
 .PHONY: all
 all: fmt vet lint test build
 
-# build compiles the snapshotter daemon into bin/.
+# build compiles the snapshotter daemon into bin/. cgo is disabled so the
+# binary is fully static and runs on any Linux of the right architecture.
 .PHONY: build
 build:
-	$(GO) build $(GOFLAGS) -ldflags "$(LDFLAGS)" -o $(BIN)/$(CMD) ./cmd/$(CMD)
+	CGO_ENABLED=0 $(GO) build $(GOFLAGS) -trimpath -ldflags "$(LDFLAGS)" -o $(BIN)/$(CMD) ./cmd/$(CMD)
 
 # install places the daemon under $(DESTDIR)$(PREFIX)/bin.
 .PHONY: install
