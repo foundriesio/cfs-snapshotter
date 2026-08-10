@@ -58,8 +58,9 @@ sudo install -m 0755 cfs-snapshotter_<ver>_linux_<arch>/containerd-cfs-grpc \
     /usr/local/bin/containerd-cfs-grpc
 ```
 
-The archive carries no systemd unit: start the daemon from your init
-system (the packaged unit,
+The archive also carries `containerd-cfs.toml` (the containerd
+configuration block used below) but no systemd unit: start the daemon
+from your init system (the packaged unit,
 [debian/cfs-snapshotter.service](debian/cfs-snapshotter.service), is a
 ready template) or by hand:
 
@@ -88,8 +89,32 @@ the archive path above.
 
 ## Connect containerd (and Docker)
 
-containerd reaches the daemon through one `proxy_plugins` entry. Add this
-to `/etc/containerd/config.toml`, then `sudo systemctl restart containerd`:
+containerd reaches the daemon through one `proxy_plugins` entry. The
+required block ships with the package as `containerd-cfs.toml` — at
+`/usr/share/doc/cfs-snapshotter/containerd-cfs.toml` from the .deb, at
+the top level of the binary archive, and as
+[docs/containerd-cfs.toml](docs/containerd-cfs.toml) in a checkout.
+Apply it one of two ways, then `sudo systemctl restart containerd`:
+
+- If your `config.toml` declares an `imports` glob (e.g.
+  `imports = ["/etc/containerd/conf.d/*.toml"]`), copy the file there:
+
+  ```sh
+  sudo cp /usr/share/doc/cfs-snapshotter/containerd-cfs.toml /etc/containerd/conf.d/
+  ```
+
+- Otherwise append it to the main config — and if `config.toml` already
+  has a `version` line, delete the duplicate from the appended block:
+
+  ```sh
+  sudo tee -a /etc/containerd/config.toml < /usr/share/doc/cfs-snapshotter/containerd-cfs.toml
+  ```
+
+The package never edits `/etc/containerd/config.toml` itself: the file
+belongs to containerd, and the `unpack_config` list below *replaces*
+containerd's built-in default (which is why overlayfs is listed
+alongside cfs), so merging it is an explicit administrator step. This is
+the whole block:
 
 ```toml
 version = 2

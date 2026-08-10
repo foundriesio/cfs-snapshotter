@@ -43,6 +43,7 @@ containerd-cfs-grpc -help 2>&1 | grep -q allow-unstaged-pulls
 [ -f /usr/lib/systemd/system/cfs-snapshotter.service ] \
     || [ -f /lib/systemd/system/cfs-snapshotter.service ]
 grep -q CFS_OPTS /etc/default/cfs-snapshotter
+grep -q proxy_plugins /usr/share/doc/cfs-snapshotter/containerd-cfs.toml
 
 # Installing the same package again exercises the upgrade path.
 apt-get install -y --reinstall --no-install-recommends "$deb"
