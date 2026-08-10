@@ -1,0 +1,31 @@
+#!/usr/bin/make -f
+#
+# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+# SPDX-License-Identifier: Apache-2.0
+
+export DH_VERBOSE = 1
+export CGO_ENABLED = 0
+export GOFLAGS = -buildvcs=false -mod=vendor
+
+%:
+	dh $@
+
+# Debian exports C/C++ hardening LDFLAGS (e.g. -Wl,-z,relro) that must not
+# reach the Go linker.
+override_dh_auto_build:
+	env -u LDFLAGS $(MAKE) build
+
+# The unit suite runs in the dev container; the packaging build only compiles.
+override_dh_auto_test:
+	:
+
+override_dh_auto_install:
+	install -D -m 0755 bin/containerd-cfs-grpc debian/cfs-snapshotter/usr/bin/containerd-cfs-grpc
+	install -D -m 0644 debian/cfs-snapshotter.default debian/cfs-snapshotter/etc/default/cfs-snapshotter
+
+override_dh_auto_clean:
+	rm -rf bin
+
+# The binary is already stripped (-s -w); there is no DWARF for dwz.
+override_dh_dwz:
+	:

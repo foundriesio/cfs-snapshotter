@@ -1,0 +1,17 @@
+[Unit]
+Description=composefs-backed remote snapshotter for containerd
+Documentation=https://github.com/foundriesio/cfs-snapshotter
+# Start before the runtimes that consult the snapshotter. Ordering only, not
+# a dependency: both sides reconnect, so either order eventually works.
+Before=containerd.service docker.service
+
+[Service]
+Type=exec
+EnvironmentFile=-/etc/default/cfs-snapshotter
+ExecStart=/usr/bin/containerd-cfs-grpc $CFS_OPTS
+Restart=always
+RestartSec=2
+RuntimeDirectory=containerd-cfs-grpc
+
+[Install]
+WantedBy=multi-user.target
