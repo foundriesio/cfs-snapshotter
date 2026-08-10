@@ -1,0 +1,222 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Release pipeline. Two modes:
+#  - a v* tag push builds, validates, and publishes a GitHub release
+#    (draft until every asset is attached, so an interrupted run never
+#    leaves a visible half-release);
+#  - a pull request touching packaging/release files, or a manual
+#    dispatch, runs the identical build and validation as a snapshot and
+#    publishes nothing.
+# Third-party actions are pinned to full commit SHAs (tag in the comment).
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - debian/**
+      - Makefile
+      - .github/workflows/release.yml
+      - scripts/release-artifacts.sh
+      - scripts/release-check.sh
+      - scripts/deb-test.sh
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # knarr is an internal module; the public proxy can't serve it, so builds
+  # resolve it directly over git using a token that can read the repo.
+  GOPRIVATE: github.com/foundriesio/knarr
+
+jobs:
+  build:
+    name: build (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+
+      # actions/checkout replaces annotated tags with lightweight ones and
+      # fetches a single ref; the force-fetch restores the real tag objects
+      # and the full tag list that version derivation and the release-notes
+      # steps read.
+      - name: Restore tags
+        run: git fetch --tags --force
+
+      - name: Validate the release tag
+        if: github.event_name == 'push'
+        run: |
+          echo "$GITHUB_REF_NAME" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$' \
+            || { echo "not a release tag: $GITHUB_REF_NAME" >&2; exit 1; }
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: go.mod
+
+      - name: Authenticate to the internal knarr module
+        run: git config --global url."https://x-access-token:${{ secrets.KNARR_TOKEN }}@github.com/foundriesio/".insteadOf "https://github.com/foundriesio/"
+
+      # The devcontainer has no credentials for the internal knarr module, so
+      # pre-fetch it here into the module cache the container bind-mounts and
+      # reuses; the build inside then resolves knarr offline.
+      - name: Pre-fetch modules into the shared devcontainer cache
+        run: GOMODCACHE=/tmp/cfs-gomodcache go mod download
+
+      # Build and test the exact tagged revision in the same devcontainer CI
+      # uses — the full suite plus the composefs e2e data plane; tags do not
+      # trigger ci.yml, so this is the test gate.
+      - name: Build and test in the dev container
+        run: ./devshell.sh sh -c 'make all && make test-e2e'
+
+      # The dev container runs as root, leaving bin/ root-owned on the
+      # host; later host-side steps write under bin/ and dist/.
+      - name: Reclaim workspace ownership
+        run: sudo chown -R "$(id -u):$(id -g)" .
+
+      - name: Compute versions
+        id: ver
+        run: |
+          echo "expected=$(git describe --tags --always)" >> "$GITHUB_OUTPUT"
+          echo "revision=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "artifact=$(./scripts/release-artifacts.sh version)" >> "$GITHUB_OUTPUT"
+
+      - name: Validate the binary
+        env:
+          EXPECTED_VERSION: ${{ steps.ver.outputs.expected }}
+          EXPECTED_REVISION: ${{ steps.ver.outputs.revision }}
+        run: ./scripts/release-check.sh binary ${{ matrix.arch }}
+
+      - name: Build and test the deb
+        run: make deb deb-lint deb-test
+
+      - name: Assemble and validate the archive
+        run: |
+          ./scripts/release-artifacts.sh archive ${{ matrix.arch }}
+          ./scripts/release-check.sh archive \
+            "dist/cfs-snapshotter_${{ steps.ver.outputs.artifact }}_linux_${{ matrix.arch }}.tar.gz" \
+            ${{ matrix.arch }}
+
+      # INSTALL.md's archive steps on clean containers — alpine has no
+      # glibc, so this also proves the static-linkage claim at runtime.
+      - name: Install-test the archive
+        run: |
+          ./scripts/release-check.sh install \
+            "dist/cfs-snapshotter_${{ steps.ver.outputs.artifact }}_linux_${{ matrix.arch }}.tar.gz"
+
+      - name: Generate the SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
+        with:
+          file: bin/containerd-cfs-grpc
+          format: spdx-json
+          output-file: dist/cfs-snapshotter_${{ steps.ver.outputs.artifact }}_linux_${{ matrix.arch }}.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+
+      - name: Collect the deb
+        run: cp bin/deb/cfs-snapshotter_*.deb dist/
+
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: cfs-snapshotter-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+
+  create-release:
+    # Tag pushes only: a workflow_dispatch run from a tag ref must never
+    # publish, and published releases are immutable — a failed run is
+    # recovered by re-running its failed jobs, never by re-running the
+    # whole workflow (see RELEASING.md).
+    if: github.event_name == 'push'
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+
+      - name: Restore tags
+        run: git fetch --tags --force
+
+      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+        with:
+          path: dist
+          merge-multiple: true
+
+      # Generate, then verify the same way INSTALL.md tells users to.
+      - name: Generate and verify checksums
+        run: |
+          ./scripts/release-artifacts.sh checksums
+          cd dist && sha256sum --check --ignore-missing cfs-snapshotter_*_checksums.txt
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-path: dist/*
+
+      # Verify an attestation the same way INSTALL.md tells users to,
+      # before anything publishes.
+      - name: Verify the attestation
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for f in dist/cfs-snapshotter_*.tar.gz dist/cfs-snapshotter_*.deb; do
+            gh attestation verify "$f" --repo "$GITHUB_REPOSITORY"
+          done
+
+      # Release body = the annotated tag message (the maintainer-written
+      # summary, see RELEASING.md), plus GitHub-generated notes only when a
+      # previous stable release exists to diff against — so the first
+      # release carries the hand-written summary alone, and rc tags never
+      # serve as the comparison base.
+      - name: Assemble release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          {
+            git tag -l --format='%(contents:subject)' "$GITHUB_REF_NAME"
+            echo
+            git tag -l --format='%(contents:body)' "$GITHUB_REF_NAME"
+          } > notes.md
+          prev=$(git tag --list 'v*' --sort=-version:refname \
+            | grep -Ev -- '-rc\.' | grep -Fxv "$GITHUB_REF_NAME" | head -n 1 || true)
+          if [ -n "$prev" ]; then
+            printf '\n---\n\n' >> notes.md
+            gh api "repos/$GITHUB_REPOSITORY/releases/generate-notes" \
+              -f tag_name="$GITHUB_REF_NAME" -f previous_tag_name="$prev" \
+              --jq .body >> notes.md
+          fi
+          grep -q '[^[:space:]]' notes.md || echo "cfs-snapshotter $GITHUB_REF_NAME" > notes.md
+
+      - name: Create the draft release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          draft: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          body_path: notes.md
+          files: dist/*
+          fail_on_unmatched_files: true
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "$GITHUB_REF_NAME" --draft=false
