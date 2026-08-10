@@ -19,7 +19,10 @@ container rootfs from content-addressed, composefs-backed storage — using
 > index, manifest, config, etc.). Either way a container gets the same
 > mounts.
 
-## Build and run
+## Install or build
+
+Released binaries and .deb packages: see [INSTALL.md](INSTALL.md). To build
+from a checkout:
 
 ```sh
 make build            # writes bin/containerd-cfs-grpc
