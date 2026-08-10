@@ -1,0 +1,29 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# containerd configuration for the cfs snapshotter. Merge this into
+# /etc/containerd/config.toml (see INSTALL.md for the two ways to do
+# that), then restart containerd. If your config.toml already has a
+# version line, drop the one below.
+
+version = 2
+
+# Register the cfs proxy snapshotter (address must match the daemon).
+[proxy_plugins.cfs]
+  type = "snapshot"
+  address = "/run/containerd-cfs-grpc/containerd-cfs-grpc.sock"
+
+# Required: without this export, transfer-service pulls do not stamp the
+# image identity the cfs admission gate needs, and are declined.
+[proxy_plugins.cfs.exports]
+  enable_remote_snapshot_annotations = "true"
+
+# `ctr pull` unpacks via the transfer service, which only unpacks for the
+# snapshotters listed here. Listing any entry replaces the built-in
+# default, so keep overlayfs alongside cfs.
+[[plugins."io.containerd.transfer.v1.local".unpack_config]]
+  platform = "linux"
+  snapshotter = "overlayfs"
+
+[[plugins."io.containerd.transfer.v1.local".unpack_config]]
+  platform = "linux"
+  snapshotter = "cfs"
