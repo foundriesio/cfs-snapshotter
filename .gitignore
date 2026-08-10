@@ -25,3 +25,6 @@ AGENTS.local.md
 .aider*
 .continue/
 .windsurf/
+
+# Release artifacts assembled by scripts/release-artifacts.sh.
+/dist/
