@@ -63,10 +63,12 @@ vet:
 lint: fmt
 	$(GOLANGCI_LINT) run
 
-# fmt verifies that all Go sources are gofmt-clean; CI rejects unformatted code.
+# fmt verifies that all Go sources are gofmt-clean; CI rejects unformatted
+# code. Scoped to the source trees so build artifacts under bin/ (e.g. the
+# deb target's vendored modules) are not scanned.
 .PHONY: fmt
 fmt:
-	@files=$$(gofmt -l .); \
+	@files=$$(gofmt -l cmd internal pkg); \
 	if [ -n "$$files" ]; then \
 		echo "gofmt needs to be run on:"; \
 		echo "$$files"; \
@@ -77,3 +79,60 @@ fmt:
 .PHONY: clean
 clean:
 	rm -rf $(BIN)
+
+# --- Debian packaging ---------------------------------------------------
+#
+# The .deb is built by debuild inside a local container image (debian/
+# Dockerfile) so no Debian toolchain is needed on the host. The knarr
+# dependency is not fetchable from inside that container, so the deb target
+# vendors the module tree on the host first and the packaging build runs
+# fully offline. The Debian version comes from the release tag (v0.1.0 ->
+# 0.1.0, v0.1.0-rc.1 -> 0.1.0~rc.1 so finals sort after candidates); an
+# untagged checkout gets a never-releasable snapshot version instead.
+
+DEB_IMAGE ?= cfs-snapshotter-debuild:trixie
+DEB_OUT ?= $(BIN)/deb
+# Dot-prefixed so go tooling (./... patterns, gofmt) never scans the
+# vendored upstream sources as part of this module.
+DEB_VENDOR := $(BIN)/.deb-vendor
+
+RELEASE_TAG := $(shell git describe --tags --exact-match --match 'v*' 2>/dev/null)
+ifeq ($(RELEASE_TAG),)
+DEB_VERSION ?= 0.0.0~snap.g$(shell git rev-parse --short HEAD 2>/dev/null || echo none)
+else
+DEB_VERSION ?= $(subst -rc.,~rc.,$(patsubst v%,%,$(RELEASE_TAG)))
+endif
+
+# deb-image builds the packaging container image.
+.PHONY: deb-image
+deb-image:
+	docker build -t $(DEB_IMAGE) debian
+
+# deb builds the .deb (plus .changes/.buildinfo) into $(DEB_OUT). VERSION,
+# REVISION and DEB_VERSION are passed in explicitly: inside the container the
+# git-derived defaults would silently fall back to "dev".
+.PHONY: deb
+deb: deb-image
+	mkdir -p $(DEB_OUT)
+	rm -rf $(DEB_VENDOR)
+	GOPRIVATE=github.com/foundriesio $(GO) mod vendor -o $(DEB_VENDOR)
+	docker run --rm \
+		-v "$(CURDIR)":/src:ro \
+		-v "$(CURDIR)/$(DEB_VENDOR)":/vendor:ro \
+		-v "$(CURDIR)/$(DEB_OUT)":/out \
+		-e VERSION=$(VERSION) -e REVISION=$(REVISION) -e DEB_VERSION=$(DEB_VERSION) \
+		$(DEB_IMAGE) /src/debian/build-in-docker.sh
+
+# deb-lint runs lintian over the built package.
+.PHONY: deb-lint
+deb-lint:
+	docker run --rm -u "$$(id -u):$$(id -g)" \
+		-v "$(CURDIR)/$(DEB_OUT)":/out:ro $(DEB_IMAGE) \
+		sh -c 'lintian -I /out/*.changes'
+
+# deb-test install-tests the .deb on clean Debian and Ubuntu containers:
+# control fields, install, stamped version, unit and env file, reinstall,
+# remove, purge.
+.PHONY: deb-test
+deb-test:
+	DEB_VERSION=$(DEB_VERSION) VERSION=$(VERSION) ./scripts/deb-test.sh $(DEB_OUT)
