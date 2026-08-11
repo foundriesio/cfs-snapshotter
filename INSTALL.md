@@ -96,19 +96,39 @@ the top level of the binary archive, and as
 [docs/containerd-cfs.toml](docs/containerd-cfs.toml) in a checkout.
 Apply it one of two ways, then `sudo systemctl restart containerd`:
 
-- If your `config.toml` declares an `imports` glob (e.g.
-  `imports = ["/etc/containerd/conf.d/*.toml"]`), copy the file there:
+- Keep the block in its own file: copy it to a drop-in directory and make
+  sure the main config imports that directory. `imports` is a top-level
+  TOML key — it must sit **above any `[section]` header** in
+  `config.toml`; appended at the end of the file it lands inside the last
+  section and is silently ignored.
 
   ```sh
+  sudo mkdir -p /etc/containerd/conf.d
   sudo cp /usr/share/doc/cfs-snapshotter/containerd-cfs.toml /etc/containerd/conf.d/
   ```
 
-- Otherwise append it to the main config — and if `config.toml` already
+  ```toml
+  # first lines of /etc/containerd/config.toml, before any [section]
+  version = 2
+  imports = ["/etc/containerd/conf.d/*.toml"]
+  ```
+
+- Or append the block to the main config — and if `config.toml` already
   has a `version` line, delete the duplicate from the appended block:
 
   ```sh
   sudo tee -a /etc/containerd/config.toml < /usr/share/doc/cfs-snapshotter/containerd-cfs.toml
   ```
+
+After the restart, containerd must list the plugin:
+
+```sh
+sudo ctr plugins ls | grep cfs    # io.containerd.snapshotter.v1  cfs  -  ok
+```
+
+No `cfs` row means containerd did not read the block — recheck the
+`imports` placement above, or `sudo containerd config dump | grep -A3
+proxy_plugins` to see what it actually merged.
 
 The package never edits `/etc/containerd/config.toml` itself: the file
 belongs to containerd, and the `unpack_config` list below *replaces*
@@ -180,12 +200,20 @@ Installation works on any Linux; *running* the snapshotter needs:
 - **Kernel: Linux 6.6 or newer** — EROFS, fs-verity, and overlayfs with
   data-only lower layers and verity validation. A vendor kernel carrying
   the same support also works.
-- **A knarr store filesystem with fs-verity enabled.** ext4 needs a
-  4096-byte block size and the `verity` feature; btrfs supports fs-verity
-  out of the box.
-- **containerd** (and optionally Docker on top of it). The .deb declares
-  it as a Recommends so an existing installation from any source is
-  accepted.
+- **fs-verity enabled on the filesystem holding the knarr store**
+  (`-knarr-root`, `/var/lib/knarr` by default). ext4 needs a 4096-byte
+  block size and the `verity` feature; btrfs supports fs-verity out of
+  the box.
+- **containerd 2.1 or newer** — the transfer service forwards the unpack
+  handshake and image-identity annotations to proxy snapshotters starting
+  with containerd 2.1. On anything older (distro archives often still
+  ship 1.7) every pull fails with `snapshot has no image in its ancestry;
+  scratch snapshots are not supported`. The .deb declares containerd as a
+  Recommends so an existing installation from any source is accepted —
+  check yours with `containerd --version`.
+- **Docker Engine 29 or newer, if Docker is used** — Docker reaches the
+  snapshotter through its containerd image store, selected by
+  `storage-driver` (tested with Docker 29.3).
 - **`mkcomposefs`** (from the
   [composefs](https://github.com/composefs/composefs) project) — needed by
   the default staged-pull mode, which builds pulled images into the store.
