@@ -32,7 +32,8 @@ archive() {
     trap 'rm -rf "$stage"' EXIT
     mkdir -p "$stage/$base" dist
     install -m 0755 bin/containerd-cfs-grpc "$stage/$base/containerd-cfs-grpc"
-    install -m 0644 LICENSE README.md INSTALL.md docs/containerd-cfs.toml "$stage/$base/"
+    install -m 0644 LICENSE README.md INSTALL.md docs/containerd-cfs.toml \
+        debian/cfs-snapshotter.service "$stage/$base/"
 
     # Deterministic contents: fixed order, numeric root ownership, commit
     # time as mtime, no gzip timestamp — a retried build of the same commit

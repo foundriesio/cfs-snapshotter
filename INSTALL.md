@@ -59,10 +59,19 @@ sudo install -m 0755 cfs-snapshotter_<ver>_linux_<arch>/containerd-cfs-grpc \
 ```
 
 The archive also carries `containerd-cfs.toml` (the containerd
-configuration block used below) but no systemd unit: start the daemon
-from your init system (the packaged unit,
-[debian/cfs-snapshotter.service](debian/cfs-snapshotter.service), is a
-ready template) or by hand:
+configuration block used below) and the `cfs-snapshotter` systemd unit
+as a ready template:
+
+```sh
+sudo install -m 0644 cfs-snapshotter_<ver>_linux_<arch>/cfs-snapshotter.service \
+    /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now cfs-snapshotter
+```
+
+(The unit starts `/usr/bin/containerd-cfs-grpc`; adjust `ExecStart` if
+you installed the binary under `/usr/local/bin`.) Without systemd,
+start the daemon from your init system or by hand:
 
 ```sh
 sudo containerd-cfs-grpc &
