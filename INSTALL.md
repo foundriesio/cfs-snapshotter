@@ -181,8 +181,16 @@ flags, and the two work modes.
 containerd-cfs-grpc -version
 ```
 
-prints `containerd-cfs-grpc v<ver> (<commit>)` for a release build. With
-the service running and containerd connected (default staged mode):
+prints `containerd-cfs-grpc v<ver> (<commit>)` for a release build. One
+command verifies the whole setup — the staged-mode prerequisites and the
+containerd wiring — and exits non-zero on any failure:
+
+```sh
+sudo containerd-cfs-grpc -check
+```
+
+Then, with the service running and containerd connected (default staged
+mode):
 
 ```sh
 sudo systemctl --no-pager status cfs-snapshotter
