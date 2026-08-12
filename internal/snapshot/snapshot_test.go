@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -47,13 +48,34 @@ func TestNewSnapshotterRejectsEmptyRoot(t *testing.T) {
 	}
 }
 
+// verityKnarrRoot returns a fresh knarr root on the dev container's shared
+// fs-verity filesystem, skipping where that filesystem is absent. Staged mode
+// refuses roots that cannot enable fs-verity, so its tests cannot use
+// t.TempDir.
+func verityKnarrRoot(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("/var/lib/cfs-shared-root", "knarr-test-*")
+	if err != nil {
+		t.Skipf("verity-capable filesystem unavailable: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := os.RemoveAll(dir); err != nil {
+			t.Errorf("remove %s: %v", dir, err)
+		}
+	})
+	return dir
+}
+
 // TestNewSnapshotterServesUnstagedPulls covers that a snapshotter configured
 // to stage unheld pulls comes up: staged layers are turned into knarr content
 // when their chain completes.
 func TestNewSnapshotterServesUnstagedPulls(t *testing.T) {
+	if _, err := exec.LookPath("mkcomposefs"); err != nil {
+		t.Skip("mkcomposefs not found in PATH")
+	}
 	sn, err := NewSnapshotter(context.Background(), Config{
 		Root:               t.TempDir(),
-		KnarrRoot:          t.TempDir(),
+		KnarrRoot:          verityKnarrRoot(t),
 		AllowUnstagedPulls: true,
 		ContainerdAddress:  "/run/containerd/containerd.sock",
 	})
@@ -62,6 +84,25 @@ func TestNewSnapshotterServesUnstagedPulls(t *testing.T) {
 	}
 	if err := sn.Close(); err != nil {
 		t.Fatalf("Close() error = %v", err)
+	}
+}
+
+// TestNewSnapshotterFailsFastWithoutStagedPrerequisites covers the fail-fast
+// gate: a staged-mode snapshotter refuses to come up when the host lacks what
+// staging needs, instead of failing at the first pull.
+func TestNewSnapshotterFailsFastWithoutStagedPrerequisites(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
+	_, err := NewSnapshotter(context.Background(), Config{
+		Root:               t.TempDir(),
+		KnarrRoot:          t.TempDir(),
+		AllowUnstagedPulls: true,
+		ContainerdAddress:  "/run/containerd/containerd.sock",
+	})
+	if err == nil || !strings.Contains(err.Error(), "mkcomposefs") {
+		t.Fatalf("NewSnapshotter() error = %v, want staged-pull prerequisites failure naming mkcomposefs", err)
+	}
+	if !errors.Is(err, ErrPrerequisites) {
+		t.Fatalf("NewSnapshotter() error = %v, want ErrPrerequisites so the daemon exits with the no-restart status", err)
 	}
 }
 

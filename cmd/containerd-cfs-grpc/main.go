@@ -69,9 +69,20 @@ func main() {
 		ContainerdAddress:  *containerdAddress,
 	}
 	if err := run(ctx, *address, cfg); err != nil {
+		if errors.Is(err, snapshot.ErrPrerequisites) {
+			log.G(ctx).WithError(err).
+				Error("cfs-snapshotter exiting: install or configure the missing prerequisite, then systemctl restart cfs-snapshotter")
+			os.Exit(exitPrerequisites)
+		}
 		log.G(ctx).WithError(err).Fatal("cfs-snapshotter exited with error")
 	}
 }
+
+// exitPrerequisites is the exit status for unmet runtime prerequisites. The
+// packaged unit lists it in RestartPreventExitStatus, so the service lands in
+// the failed state at once instead of cycling through automatic restarts that
+// cannot succeed until an administrator fixes the host or containerd.
+const exitPrerequisites = 3
 
 // run builds the snapshotter, serves it over a gRPC unix socket, and blocks
 // until SIGINT/SIGTERM, then shuts down gracefully.
