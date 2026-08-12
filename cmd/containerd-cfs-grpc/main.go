@@ -118,11 +118,14 @@ func run(ctx context.Context, address string, cfg snapshot.Config) error {
 		}
 	}()
 
+	notify(ctx, "READY=1\nSTATUS=serving")
+
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, unix.SIGINT, unix.SIGTERM)
 	select {
 	case sig := <-sigCh:
 		log.G(ctx).WithField("signal", sig).Info("shutting down")
+		notify(ctx, "STOPPING=1")
 		// GracefulStop waits for in-flight RPCs indefinitely; force a hard
 		// stop if it does not finish in time or a second signal arrives, so a
 		// stuck mount or store operation cannot wedge the shutdown.
