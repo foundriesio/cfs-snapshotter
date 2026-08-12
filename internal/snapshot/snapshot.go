@@ -663,7 +663,7 @@ var errStagePull = errors.New("stage the pull")
 func (s *snapshotter) createAndCommitIntermediateVirtualSnapshot(ctx context.Context, key, parent, name string, labels map[string]string, opts []snapshots.Opt) error {
 	imageRef := labels[imageRefLabel]
 	if imageRef == "" {
-		return fmt.Errorf("image reference is required for layer chain %q: %w", name, errdefs.ErrFailedPrecondition)
+		return fmt.Errorf("layer chain %q was pulled without image-identity annotations; containerd forwards them only when its config sets enable_remote_snapshot_annotations = \"true\" under [proxy_plugins.cfs.exports]: %w", name, errdefs.ErrFailedPrecondition)
 	}
 	if s.allowUnstagedPulls {
 		return errStagePull
@@ -1007,7 +1007,7 @@ func (s *snapshotter) mounts(ctx context.Context, key string) ([]mount.Mount, er
 	dir := s.getSnapshotDir(id)
 	if !foundChain {
 		if !staging {
-			return nil, fmt.Errorf("snapshot has no image in its ancestry; scratch snapshots are not supported: %w", errdefs.ErrInvalidArgument)
+			return nil, fmt.Errorf("snapshot has no image in its ancestry; scratch snapshots are not supported (a pull failing here means containerd sent no unpack handshake: containerd 2.1+ with the cfs unpack_config entry is required): %w", errdefs.ErrInvalidArgument)
 		}
 		return stagingMounts(dir, lowers), nil
 	}
