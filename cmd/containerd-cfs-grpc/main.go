@@ -42,6 +42,7 @@ var (
 	allowUnstagedPulls = flag.Bool("allow-unstaged-pulls", true, "stage every pull through containerd's content store and build it into the knarr store, instead of admitting only images already there")
 	logLevel           = flag.String("log-level", log.InfoLevel.String(), "logging level [trace, debug, info, warn, error, fatal, panic]")
 	printVersion       = flag.Bool("version", false, "print the version and exit")
+	runChecks          = flag.Bool("check", false, "check the runtime prerequisites and the containerd wiring instead of serving, and exit non-zero on any failure")
 )
 
 func main() {
@@ -67,6 +68,14 @@ func main() {
 		KnarrRoot:          *knarrRoot,
 		AllowUnstagedPulls: *allowUnstagedPulls,
 		ContainerdAddress:  *containerdAddress,
+	}
+	if *runChecks {
+		// Bounded: a check answers now, it does not wait for containerd the
+		// way the serving daemon's probe does. The window still spans a few
+		// of the probe's retry beats for a containerd that is just starting.
+		ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		defer cancel()
+		os.Exit(runCheck(ctx, os.Stdout, cfg, *address))
 	}
 	if err := run(ctx, *address, cfg); err != nil {
 		if errors.Is(err, snapshot.ErrPrerequisites) {

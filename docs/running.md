@@ -40,6 +40,7 @@ The defaults match the config below; see `-help` for the full list.
 | `-containerd-address` | `/run/containerd/containerd.sock` | containerd's gRPC socket, whose content store the layers of a staged pull are read back from. |
 | `-allow-unstaged-pulls` | `true` | Selects the machine's work mode: stage every pull through containerd's content store and build it into the knarr store, instead of admitting only images already there. `=false` selects the out-of-band mode. |
 | `-log-level` | `info` | `trace`, `debug`, `info`, `warn`, `error`, `fatal`, `panic`. |
+| `-check` | off | Check the runtime prerequisites and the containerd wiring instead of serving — one verdict line per aspect, non-zero exit on any failure. |
 
 The snapshotter root hosts each container's overlay upper and work
 directories, so it must live on a regular filesystem (ext4, xfs, …) — overlay
