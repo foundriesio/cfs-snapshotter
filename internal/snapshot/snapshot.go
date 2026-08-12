@@ -168,6 +168,14 @@ type snapshotter struct {
 // Compile-time assertion that *snapshotter satisfies the containerd interface.
 var _ snapshots.Snapshotter = (*snapshotter)(nil)
 
+// ErrPrerequisites marks a failure whose cause is an unmet runtime
+// prerequisite — a host or containerd misconfiguration an administrator must
+// fix — rather than a fault in the snapshotter. The daemon exits with a
+// dedicated status on it, which the packaged unit excludes from automatic
+// restart so the service lands in the failed state until the fix and a
+// manual restart.
+var ErrPrerequisites = errors.New("runtime prerequisites not met")
+
 // Config is the snapshotter's configuration.
 type Config struct {
 	// Root is the snapshotter's own root directory.
@@ -192,6 +200,15 @@ func NewSnapshotter(ctx context.Context, cfg Config) (snapshots.Snapshotter, err
 	engine, err := knarr.New(knarr.Config{Root: cfg.KnarrRoot})
 	if err != nil {
 		return nil, fmt.Errorf("create knarr engine: %w", err)
+	}
+	// Staged mode builds every pull into the knarr store, so a host missing
+	// mkcomposefs or fs-verity fails every pull; refusing to start reports
+	// the misconfiguration at install time instead of at the first image.
+	// Out-of-band mode builds nothing locally and needs neither.
+	if cfg.AllowUnstagedPulls {
+		if err := errors.Join(engine.PreflightTools(), engine.PreflightStore()); err != nil {
+			return nil, fmt.Errorf("staged-pull prerequisites: %w: %w", ErrPrerequisites, err)
+		}
 	}
 	return newSnapshotter(ctx, cfg, engine)
 }
