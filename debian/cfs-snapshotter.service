@@ -6,7 +6,9 @@ Documentation=https://github.com/foundriesio/cfs-snapshotter
 Before=containerd.service docker.service
 
 [Service]
-Type=exec
+# notify: the daemon reports readiness and pushes the containerd probe's
+# verdict as the status line systemctl status shows.
+Type=notify
 EnvironmentFile=-/etc/default/cfs-snapshotter
 ExecStart=/usr/bin/containerd-cfs-grpc $CFS_OPTS
 Restart=always
