@@ -118,11 +118,22 @@ func run(ctx context.Context, address string, cfg snapshot.Config) error {
 		}
 	}()
 
+	// The probe's first verdict is binding (see probeContainerd): a
+	// containerd that cannot drive this snapshotter ends the daemon through
+	// the same error path as any other startup failure.
+	probeErrCh := make(chan error, 1)
+	go func() {
+		if probeErr := probeContainerd(ctx, cfg.ContainerdAddress, address); probeErr != nil {
+			probeErrCh <- probeErr
+		}
+	}()
 	notify(ctx, "READY=1\nSTATUS=serving")
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, unix.SIGINT, unix.SIGTERM)
 	select {
+	case err := <-probeErrCh:
+		return err
 	case sig := <-sigCh:
 		log.G(ctx).WithField("signal", sig).Info("shutting down")
 		notify(ctx, "STOPPING=1")
