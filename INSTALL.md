@@ -37,8 +37,17 @@ sudo apt install ./cfs-snapshotter_<ver>_<arch>.deb
 ```
 
 This installs `/usr/bin/containerd-cfs-grpc` and a `cfs-snapshotter`
-systemd service, enabled and started. Daemon flags (for example the
-out-of-band mode, `-allow-unstaged-pulls=false`) go in
+systemd service, enabled and started. The daemon refuses to run until
+its prerequisites are met, and the unit shows as **failed** until they
+are: the staged-mode store tools immediately (most visibly
+`mkcomposefs`, since the composefs package is not yet in the Debian or
+Ubuntu archives), and the containerd side — version 2.1+ and the
+[wiring below](#connect-containerd-and-docker) — as soon as containerd
+is up to answer. Once the
+[runtime requirements](#runtime-requirements) and the wiring are in
+place, `sudo systemctl restart cfs-snapshotter` recovers the unit.
+Daemon flags (for example the out-of-band mode,
+`-allow-unstaged-pulls=false`, which needs no local build tools) go in
 `/etc/default/cfs-snapshotter`, followed by
 `sudo systemctl restart cfs-snapshotter`.
 
@@ -207,6 +216,16 @@ docker pull alpine
 docker run --rm alpine echo it works
 ```
 
+The service's `Status:` line carries the daemon's own verdict on the
+containerd side, re-checked every few minutes — `ok: wired to
+containerd v2.2.3 (proxy plugin cfs)` when everything matches, or a
+`degraded: ...` line naming what to fix. A containerd problem already
+present when the daemon starts puts the unit in the **failed** state
+instead (fix it, then `sudo systemctl restart cfs-snapshotter`); drift
+that appears *after* a healthy start only degrades the status, and
+there fixing containerd and restarting *containerd alone* is enough —
+the status flips back to ok by itself.
+
 The pull is staged and built into the knarr store by the snapshotter, and
 the container's root filesystem is served from it as a composefs mount.
 
@@ -233,9 +252,10 @@ Installation works on any Linux; *running* the snapshotter needs:
   `storage-driver` (tested with Docker 29.3).
 - **`mkcomposefs`** (from the
   [composefs](https://github.com/composefs/composefs) project) — needed by
-  the default staged-pull mode, which builds pulled images into the store.
-  The .deb declares the `composefs` package as a Recommends because it is
-  not yet in the Debian-stable or Ubuntu archives.
+  the default staged-pull mode, which builds pulled images into the store;
+  the daemon refuses to start in that mode without it. The .deb declares
+  the `composefs` package as a Recommends because it is not yet in the
+  Debian-stable or Ubuntu archives.
 - **[knarr](https://github.com/foundriesio/knarr)** — only for the
   out-of-band mode (`-allow-unstaged-pulls=false`), where images enter the
   store via `knarr pull` before the runtime asks for them.
