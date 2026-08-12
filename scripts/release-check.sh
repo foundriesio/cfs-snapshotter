@@ -67,11 +67,12 @@ archive() {
     tmp=$(mktemp -d)
     trap 'rm -rf "$tmp"' EXIT
     tar -C "$tmp" -xzf "$tarball"
-    for f in containerd-cfs-grpc LICENSE README.md INSTALL.md containerd-cfs.toml; do
+    for f in containerd-cfs-grpc LICENSE README.md INSTALL.md containerd-cfs.toml \
+        cfs-snapshotter.service; do
         [ -f "$tmp/$base/$f" ] || fail "missing $f in $tarball"
     done
     count=$(find "$tmp/$base" -type f | wc -l)
-    [ "$count" -eq 5 ] || fail "unexpected files in $tarball ($count != 5)"
+    [ "$count" -eq 6 ] || fail "unexpected files in $tarball ($count != 6)"
     [ -x "$tmp/$base/containerd-cfs-grpc" ] \
         || fail "containerd-cfs-grpc is not executable in $tarball"
 
