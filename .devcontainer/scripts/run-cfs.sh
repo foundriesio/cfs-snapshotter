@@ -16,6 +16,8 @@ CONTAINERD_SOCKET=/run/containerd/containerd.sock
 CFS_LOG_LEVEL="${CFS_LOG_LEVEL:-trace}"
 CFS_ROOT="${CFS_ROOT:-/var/lib/containerd-cfs-grpc}"
 CFS_ALLOW_UNSTAGED_PULLS="${CFS_ALLOW_UNSTAGED_PULLS:-1}"
+# 0 selects the daemon's default worker count.
+CFS_INGEST_WORKERS="${CFS_INGEST_WORKERS:-0}"
 CFS_PIDFILE="${LOG_DIR}/containerd-cfs-grpc.pid"
 CFS_LOGFILE="${LOG_DIR}/containerd-cfs-grpc.log"
 CFS_STATE_FILE="${LOG_DIR}/containerd-cfs-grpc.env"
@@ -147,9 +149,10 @@ main() {
 	bind_root "${CFS_ROOT}"
 	bind_root "${KNARR_ROOT}"
 	local old_hash new_hash old_state new_state
-	# The daemon's work mode and its stores are part of the state a restart
-	# reconciles: changing any of them makes the running daemon the wrong one.
-	new_state="${CFS_LOG_LEVEL} ${KNARR_ROOT} ${CFS_ROOT} ${CFS_ALLOW_UNSTAGED_PULLS}"
+	# The daemon's work mode, its stores and its worker count are part of the
+	# state a restart reconciles: changing any of them makes the running
+	# daemon the wrong one.
+	new_state="${CFS_LOG_LEVEL} ${KNARR_ROOT} ${CFS_ROOT} ${CFS_ALLOW_UNSTAGED_PULLS} ${CFS_INGEST_WORKERS}"
 	old_hash="$(file_hash "${CONTAINERD_CFS_GRPC_BIN}")"
 	old_state="$(cat "${CFS_STATE_FILE}" 2>/dev/null || true)"
 	make -C "${ROOT_DIR}" build
@@ -162,7 +165,8 @@ main() {
 		[ "${old_state}" = "${new_state}" ]; then
 		echo "cfs snapshotter binary unchanged; keeping pid $(cat "${CFS_PIDFILE}")"
 	else
-		local args=(-log-level "${CFS_LOG_LEVEL}" -root "${CFS_ROOT}" -knarr-root "${KNARR_ROOT}")
+		local args=(-log-level "${CFS_LOG_LEVEL}" -root "${CFS_ROOT}" -knarr-root "${KNARR_ROOT}"
+			-ingest-workers "${CFS_INGEST_WORKERS}")
 		# Always explicit: the mode is part of the reconciled state, so the
 		# daemon must be started with the value the state line records.
 		if [ "${CFS_ALLOW_UNSTAGED_PULLS}" = "1" ]; then
@@ -189,6 +193,7 @@ main() {
 	echo "log level: ${CFS_LOG_LEVEL}"
 	echo "roots: ${CFS_ROOT} ${KNARR_ROOT}"
 	echo "allow unstaged pulls: ${CFS_ALLOW_UNSTAGED_PULLS}"
+	echo "ingest workers: ${CFS_INGEST_WORKERS}"
 	echo "logs: ${CFS_LOGFILE}"
 }
 
