@@ -75,11 +75,12 @@ func (f *fakeIntrospectionServer) setPlugins(plugins []*introspectionapi.Plugin)
 }
 
 // runProbe serves a fake containerd with the given version and plugins on a
-// unix socket, runs the probe against it as the snapshotter at socketAddress,
-// and returns the log entries the probe emitted, the STATUS line it pushed to
-// a fake systemd notification socket ("" when none arrived), and the probe's
-// return value — non-nil exactly when the first verdict was binding.
-func runProbe(t *testing.T, version string, plugins []*introspectionapi.Plugin, socketAddress string) ([]*logrus.Entry, string, error) {
+// unix socket, runs the probe against it as the snapshotter at socketAddress
+// in the given work mode, and returns the log entries the probe emitted, the
+// STATUS line it pushed to a fake systemd notification socket ("" when none
+// arrived), and the probe's return value — non-nil exactly when the first
+// verdict was binding.
+func runProbe(t *testing.T, version string, plugins []*introspectionapi.Plugin, socketAddress string, staged bool) ([]*logrus.Entry, string, error) {
 	t.Helper()
 	containerdSocket := filepath.Join(t.TempDir(), "containerd.sock")
 	listener, err := net.Listen("unix", containerdSocket)
@@ -106,7 +107,7 @@ func runProbe(t *testing.T, version string, plugins []*introspectionapi.Plugin, 
 	ctx, cancel := context.WithCancel(log.WithLogger(context.Background(), logrus.NewEntry(logger)))
 	done := make(chan error, 1)
 	go func() {
-		done <- probeContainerd(ctx, containerdSocket, socketAddress)
+		done <- probeContainerd(ctx, containerdSocket, socketAddress, staged)
 	}()
 
 	status := ""
@@ -143,10 +144,21 @@ func wiredPlugin(exports map[string]string) *introspectionapi.Plugin {
 	return &introspectionapi.Plugin{Type: snapshotterPluginType, ID: "cfs", Exports: exports}
 }
 
+// wiredDiffPlugin is the proxy differ entry pointing at this daemon's socket.
+func wiredDiffPlugin() *introspectionapi.Plugin {
+	return &introspectionapi.Plugin{Type: differPluginType, ID: "cfs-diff", Exports: map[string]string{"address": testSocket}}
+}
+
+// wiredPlugins is the complete wiring: the snapshotter entry with the given
+// exports and the differ entry.
+func wiredPlugins(exports map[string]string) []*introspectionapi.Plugin {
+	return []*introspectionapi.Plugin{wiredPlugin(exports), wiredDiffPlugin()}
+}
+
 func TestProbeReportsOldContainerd(t *testing.T) {
 	entries, status, err := runProbe(t, "1.7.24~ds1",
 		[]*introspectionapi.Plugin{wiredPlugin(map[string]string{"enable_remote_snapshot_annotations": "true"})},
-		testSocket)
+		testSocket, true)
 	entryContaining(t, entries, logrus.ErrorLevel, "older than 2.1")
 	// Correct wiring must not be announced as success while the version
 	// already makes every pull fail.
@@ -164,7 +176,7 @@ func TestProbeReportsOldContainerd(t *testing.T) {
 }
 
 func TestProbeReportsMissingProxyEntry(t *testing.T) {
-	entries, status, err := runProbe(t, "v2.2.3", nil, testSocket)
+	entries, status, err := runProbe(t, "v2.2.3", nil, testSocket, true)
 	entryContaining(t, entries, logrus.ErrorLevel, "no proxy snapshotter")
 	if !strings.Contains(status, "degraded: containerd has no proxy_plugins entry") {
 		t.Fatalf("status = %q, want the missing-entry degradation", status)
@@ -177,7 +189,7 @@ func TestProbeReportsMissingProxyEntry(t *testing.T) {
 func TestProbeReportsMissingAnnotationsExport(t *testing.T) {
 	entries, status, err := runProbe(t, "v2.2.3",
 		[]*introspectionapi.Plugin{wiredPlugin(nil)},
-		testSocket)
+		testSocket, true)
 	entryContaining(t, entries, logrus.ErrorLevel, "enable_remote_snapshot_annotations")
 	if !strings.Contains(status, "degraded: proxy_plugins.cfs lacks enable_remote_snapshot_annotations") {
 		t.Fatalf("status = %q, want the missing-export degradation", status)
@@ -201,7 +213,7 @@ func TestProbeReportsRecovery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	wired := []*introspectionapi.Plugin{wiredPlugin(map[string]string{"enable_remote_snapshot_annotations": "true"})}
+	wired := wiredPlugins(map[string]string{"enable_remote_snapshot_annotations": "true"})
 	introspection := &fakeIntrospectionServer{plugins: wired}
 	server := grpc.NewServer()
 	versionapi.RegisterVersionServer(server, &fakeVersionServer{version: "v2.2.3"})
@@ -221,7 +233,7 @@ func TestProbeReportsRecovery(t *testing.T) {
 	ctx, cancel := context.WithCancel(log.WithLogger(context.Background(), logrus.NewEntry(logger)))
 	done := make(chan error, 1)
 	go func() {
-		done <- probeContainerd(ctx, containerdSocket, testSocket)
+		done <- probeContainerd(ctx, containerdSocket, testSocket, true)
 	}()
 	t.Cleanup(func() {
 		cancel()
@@ -274,8 +286,8 @@ func TestProbeReportsRecovery(t *testing.T) {
 
 func TestProbeReportsWiredContainerd(t *testing.T) {
 	entries, status, err := runProbe(t, "v2.2.3",
-		[]*introspectionapi.Plugin{wiredPlugin(map[string]string{"enable_remote_snapshot_annotations": "true"})},
-		testSocket)
+		wiredPlugins(map[string]string{"enable_remote_snapshot_annotations": "true"}),
+		testSocket, true)
 	for _, e := range entries {
 		if e.Level <= logrus.ErrorLevel {
 			t.Fatalf("unexpected error entry: %v", e.Message)
@@ -287,5 +299,40 @@ func TestProbeReportsWiredContainerd(t *testing.T) {
 	}
 	if err != nil {
 		t.Fatalf("probe returned %v, want nil for a healthy first verdict", err)
+	}
+}
+
+// TestProbeReportsMissingDifferEntry covers that staged mode, which needs the
+// differ to be handed its layers, reports a missing diff entry and treats it
+// as binding.
+func TestProbeReportsMissingDifferEntry(t *testing.T) {
+	entries, status, err := runProbe(t, "v2.2.3",
+		[]*introspectionapi.Plugin{wiredPlugin(map[string]string{"enable_remote_snapshot_annotations": "true"})},
+		testSocket, true)
+	entryContaining(t, entries, logrus.ErrorLevel, "no proxy differ")
+	if !strings.Contains(status, "degraded: containerd has no diff proxy_plugins entry") {
+		t.Fatalf("status = %q, want the missing-differ degradation", status)
+	}
+	if !errors.Is(err, snapshot.ErrPrerequisites) {
+		t.Fatalf("probe returned %v, want a binding prerequisites failure", err)
+	}
+}
+
+// TestProbeIgnoresMissingDifferOutOfBand covers the other work mode: it
+// applies no layers, so the same wiring is healthy without a differ.
+func TestProbeIgnoresMissingDifferOutOfBand(t *testing.T) {
+	entries, status, err := runProbe(t, "v2.2.3",
+		[]*introspectionapi.Plugin{wiredPlugin(map[string]string{"enable_remote_snapshot_annotations": "true"})},
+		testSocket, false)
+	for _, e := range entries {
+		if e.Level <= logrus.ErrorLevel {
+			t.Fatalf("unexpected error entry: %v", e.Message)
+		}
+	}
+	if want := "STATUS=ok: wired to containerd v2.2.3 (proxy plugin cfs)"; status != want {
+		t.Fatalf("status = %q, want %q", status, want)
+	}
+	if err != nil {
+		t.Fatalf("probe returned %v, want nil: out-of-band mode needs no differ", err)
 	}
 }

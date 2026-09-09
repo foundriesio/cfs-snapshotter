@@ -7,6 +7,7 @@ require (
 	github.com/containerd/containerd/v2 v2.3.3
 	github.com/containerd/continuity v0.5.0
 	github.com/containerd/errdefs v1.0.0
+	github.com/containerd/errdefs/pkg v0.3.0
 	github.com/containerd/log v0.1.0
 	github.com/foundriesio/knarr v0.1.2-0.20260909084132-5eb27a6c64f5
 	github.com/moby/sys/mountinfo v0.7.2
@@ -23,7 +24,6 @@ require (
 	github.com/Microsoft/hcsshim v0.15.0-rc.1 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/containerd/cgroups/v3 v3.1.3 // indirect
-	github.com/containerd/errdefs/pkg v0.3.0 // indirect
 	github.com/containerd/platforms v1.0.0-rc.4 // indirect
 	github.com/containerd/ttrpc v1.2.8 // indirect
 	github.com/containerd/typeurl/v2 v2.2.3 // indirect

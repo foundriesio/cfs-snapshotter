@@ -32,9 +32,13 @@ const probeInterval = 5 * time.Second
 // wait minutes for a second round.
 var reprobeInterval = 5 * time.Minute
 
-// snapshotterPluginType is the introspection type every snapshotter plugin,
-// proxy ones included, is registered under.
-const snapshotterPluginType = "io.containerd.snapshotter.v1"
+// snapshotterPluginType and differPluginType are the introspection types
+// every snapshotter and every differ plugin, proxy ones included, are
+// registered under.
+const (
+	snapshotterPluginType = "io.containerd.snapshotter.v1"
+	differPluginType      = "io.containerd.differ.v1"
+)
 
 // probeContainerd watches the containerd on containerdAddress and keeps
 // checking whether it can actually drive this snapshotter:
@@ -45,21 +49,26 @@ const snapshotterPluginType = "io.containerd.snapshotter.v1"
 //   - a proxy snapshotter entry in containerd's config points at this
 //     daemon's socket: without one containerd cannot reach this snapshotter;
 //   - that entry exports enable_remote_snapshot_annotations = "true": without
-//     it pulls arrive without image identity and are declined.
+//     it pulls arrive without image identity and are declined;
+//   - a proxy differ entry points at the same socket, which staged mode needs
+//     to be handed its layers: without one they go to containerd's own
+//     differ, which fails on the staging placeholder. Out-of-band mode
+//     applies no layers, so it is not checked there.
 //
 // Each round's verdict is pushed to systemd as the unit's status line, where
 // systemctl status shows it next to "active (running)"; findings are logged
 // when the verdict changes, with each error naming its remedy.
 //
 // The first definite verdict is binding: a containerd that cannot drive this
-// snapshotter — too old, not wired, wiring without the annotations export —
-// is an unmet prerequisite, reported as a non-nil return so the daemon exits
-// and the unit lands in the failed state until the fix and a manual restart.
+// snapshotter — too old, not wired, wiring without the annotations export, or
+// in staged mode without the differ — is an unmet prerequisite, reported as a
+// non-nil return so the daemon exits and the unit lands in the failed state
+// until the fix and a manual restart.
 // After a healthy first verdict the rounds only inform: a live data plane
 // with containers on it is never self-terminated over later drift, which the
 // status line reports instead — and recovery from drift is likewise noticed
 // without a restart.
-func probeContainerd(ctx context.Context, containerdAddress, socketAddress string) error {
+func probeContainerd(ctx context.Context, containerdAddress, socketAddress string, staged bool) error {
 	conn, err := dialContainerd(containerdAddress)
 	if err != nil {
 		log.G(ctx).WithError(err).WithField("address", containerdAddress).
@@ -83,15 +92,15 @@ func probeContainerd(ctx context.Context, containerdAddress, socketAddress strin
 			log.G(ctx).WithError(r.introspectErr).
 				Warn("containerd probe: cannot list containerd's plugins; skipping the wiring check")
 		}
-		if status := r.status(); status != "" {
+		if status := r.status(staged); status != "" {
 			if status != last {
-				r.logVerdict(ctx, socketAddress)
+				r.logVerdict(ctx, socketAddress, staged)
 				last = status
 			}
 			notify(ctx, "STATUS="+status)
 			if binding {
 				binding = false
-				if r.tooOld || !r.wired || !r.hasExport {
+				if r.tooOld || !r.wired || !r.hasExport || (staged && !r.differWired) {
 					return fmt.Errorf("%w: %s", snapshot.ErrPrerequisites, strings.TrimPrefix(status, "degraded: "))
 				}
 			}
@@ -119,6 +128,10 @@ type probeResult struct {
 	wired     bool
 	entryID   string
 	hasExport bool
+	// differWired reports a proxy differ entry pointing at this daemon's
+	// socket; differID is its config name.
+	differWired bool
+	differID    string
 }
 
 // probeOnce runs one round against containerd, waiting for the server to
@@ -141,11 +154,23 @@ func probeOnce(ctx context.Context, conn *grpc.ClientConn, socketAddress string)
 		return r, true
 	}
 	for _, p := range resp.Plugins {
-		if p.Type == snapshotterPluginType && p.Exports["address"] == socketAddress {
+		if p.Exports["address"] != socketAddress {
+			continue
+		}
+		switch p.Type {
+		case snapshotterPluginType:
+			if r.wired {
+				continue
+			}
 			r.wired = true
 			r.entryID = p.ID
 			r.hasExport = p.Exports["enable_remote_snapshot_annotations"] == "true"
-			break
+		case differPluginType:
+			if r.differWired {
+				continue
+			}
+			r.differWired = true
+			r.differID = p.ID
 		}
 	}
 	return r, true
@@ -154,7 +179,7 @@ func probeOnce(ctx context.Context, conn *grpc.ClientConn, socketAddress string)
 // status renders the verdict for the unit's status line, the first problem
 // winning. It is empty when introspection failed before any finding, so a
 // transient listing error does not overwrite the last real verdict.
-func (r probeResult) status() string {
+func (r probeResult) status(staged bool) string {
 	switch {
 	case r.tooOld:
 		return "degraded: containerd " + r.version + " is older than 2.1; pulls will fail"
@@ -164,6 +189,8 @@ func (r probeResult) status() string {
 		return "degraded: containerd has no proxy_plugins entry for this snapshotter's socket"
 	case !r.hasExport:
 		return "degraded: proxy_plugins." + r.entryID + " lacks enable_remote_snapshot_annotations; pulls will be declined"
+	case staged && !r.differWired:
+		return "degraded: containerd has no diff proxy_plugins entry for this snapshotter's socket; staged pulls will fail"
 	default:
 		return "ok: wired to containerd " + r.version + " (proxy plugin " + r.entryID + ")"
 	}
@@ -173,7 +200,7 @@ func (r probeResult) status() string {
 // its remedy. The wiring fields are skipped when introspection failed, and
 // correct wiring is not announced as success while the version already makes
 // every pull fail.
-func (r probeResult) logVerdict(ctx context.Context, socketAddress string) {
+func (r probeResult) logVerdict(ctx context.Context, socketAddress string, staged bool) {
 	if r.tooOld {
 		log.G(ctx).WithField("version", r.version).
 			Error("containerd probe: containerd is older than 2.1, whose transfer service does not forward the unpack handshake and image-identity annotations to proxy snapshotters; every pull through this snapshotter will fail")
@@ -188,6 +215,9 @@ func (r probeResult) logVerdict(ctx context.Context, socketAddress string) {
 	case !r.hasExport:
 		log.G(ctx).WithField("plugin", r.entryID).
 			Errorf("containerd probe: the proxy snapshotter entry does not export enable_remote_snapshot_annotations = \"true\", so pulls arrive without image identity and are declined; add it under [proxy_plugins.%s.exports] and restart containerd", r.entryID)
+	case staged && !r.differWired:
+		log.G(ctx).WithField("socket", socketAddress).
+			Error("containerd probe: no proxy differ in containerd's config points at this daemon's socket, so the layers of a staged pull go to containerd's own differ and fail on the staging placeholder; add the [proxy_plugins] diff entry (shipped as containerd-cfs.toml) and restart containerd")
 	case !r.tooOld:
 		log.G(ctx).WithFields(log.Fields{"plugin": r.entryID, "version": r.version}).
 			Info("containerd probe: containerd is wired to this snapshotter")

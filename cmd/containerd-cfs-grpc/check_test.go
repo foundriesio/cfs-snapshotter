@@ -51,8 +51,7 @@ func wantLines(t *testing.T, report string, wants ...string) {
 }
 
 func TestRunCheckPassesOutOfBand(t *testing.T) {
-	address := fakeContainerd(t, "v2.2.3",
-		[]*introspectionapi.Plugin{wiredPlugin(map[string]string{"enable_remote_snapshot_annotations": "true"})})
+	address := fakeContainerd(t, "v2.2.3", wiredPlugins(map[string]string{"enable_remote_snapshot_annotations": "true"}))
 	var out bytes.Buffer
 	code := runCheck(context.Background(), &out,
 		snapshot.Config{KnarrRoot: t.TempDir(), ContainerdAddress: address}, testSocket)
@@ -62,16 +61,28 @@ func TestRunCheckPassesOutOfBand(t *testing.T) {
 	wantLines(t, out.String(),
 		"1. mkcomposefs: skipped (out-of-band mode",
 		"2. fs-verity on the knarr store: skipped (out-of-band mode",
+		"ingest workers: 2",
 		"3. containerd: ok (version v2.2.3)",
 		"4. containerd version 2.1+: ok",
 		"5. containerd proxy_plugins wiring: ok (proxy plugin cfs)",
 		"6. enable_remote_snapshot_annotations export: ok",
+		"7. containerd diff proxy_plugins wiring: skipped (out-of-band mode applies no layers)",
 		"check passed")
 }
 
+func TestRunCheckReportsConfiguredWorkers(t *testing.T) {
+	address := fakeContainerd(t, "v2.2.3", wiredPlugins(map[string]string{"enable_remote_snapshot_annotations": "true"}))
+	var out bytes.Buffer
+	code := runCheck(context.Background(), &out,
+		snapshot.Config{KnarrRoot: t.TempDir(), ContainerdAddress: address, IngestWorkers: 4}, testSocket)
+	if code != 0 {
+		t.Fatalf("runCheck = %d, want 0; output:\n%s", code, out.String())
+	}
+	wantLines(t, out.String(), "ingest workers: 4", "check passed")
+}
+
 func TestRunCheckFailsOnOldContainerd(t *testing.T) {
-	address := fakeContainerd(t, "1.7.24~ds1",
-		[]*introspectionapi.Plugin{wiredPlugin(map[string]string{"enable_remote_snapshot_annotations": "true"})})
+	address := fakeContainerd(t, "1.7.24~ds1", wiredPlugins(map[string]string{"enable_remote_snapshot_annotations": "true"}))
 	var out bytes.Buffer
 	code := runCheck(context.Background(), &out,
 		snapshot.Config{KnarrRoot: t.TempDir(), ContainerdAddress: address}, testSocket)
@@ -84,6 +95,24 @@ func TestRunCheckFailsOnOldContainerd(t *testing.T) {
 		"4. containerd version 2.1+: FAIL: 1.7.24~ds1 is older than 2.1",
 		"5. containerd proxy_plugins wiring: ok (proxy plugin cfs)",
 		"6. enable_remote_snapshot_annotations export: ok",
+		"7. containerd diff proxy_plugins wiring: skipped (out-of-band mode applies no layers)",
+		"check failed")
+}
+
+func TestRunCheckFailsOnMissingDiffer(t *testing.T) {
+	address := fakeContainerd(t, "v2.2.3",
+		[]*introspectionapi.Plugin{wiredPlugin(map[string]string{"enable_remote_snapshot_annotations": "true"})})
+	var out bytes.Buffer
+	code := runCheck(context.Background(), &out,
+		snapshot.Config{KnarrRoot: t.TempDir(), ContainerdAddress: address, AllowUnstagedPulls: true},
+		testSocket)
+	if code != 1 {
+		t.Fatalf("runCheck = %d, want 1; output:\n%s", code, out.String())
+	}
+	wantLines(t, out.String(),
+		"5. containerd proxy_plugins wiring: ok (proxy plugin cfs)",
+		"6. enable_remote_snapshot_annotations export: ok",
+		"7. containerd diff proxy_plugins wiring: FAIL: no proxy_plugins entry of type \"diff\" points at",
 		"check failed")
 }
 
@@ -102,12 +131,12 @@ func TestRunCheckFailsOnUnreachableContainerd(t *testing.T) {
 		"4. containerd version 2.1+: not checked (containerd did not answer)",
 		"5. containerd proxy_plugins wiring: not checked (containerd did not answer)",
 		"6. enable_remote_snapshot_annotations export: not checked (containerd did not answer)",
+		"7. containerd diff proxy_plugins wiring: not checked (containerd did not answer)",
 		"check failed")
 }
 
 func TestRunCheckFailsOnMissingAnnotationsExport(t *testing.T) {
-	address := fakeContainerd(t, "v2.2.3",
-		[]*introspectionapi.Plugin{wiredPlugin(nil)})
+	address := fakeContainerd(t, "v2.2.3", wiredPlugins(nil))
 	var out bytes.Buffer
 	code := runCheck(context.Background(), &out,
 		snapshot.Config{KnarrRoot: t.TempDir(), ContainerdAddress: address}, testSocket)
@@ -117,13 +146,13 @@ func TestRunCheckFailsOnMissingAnnotationsExport(t *testing.T) {
 	wantLines(t, out.String(),
 		"5. containerd proxy_plugins wiring: ok (proxy plugin cfs)",
 		"6. enable_remote_snapshot_annotations export: FAIL: missing enable_remote_snapshot_annotations",
+		"7. containerd diff proxy_plugins wiring: skipped (out-of-band mode applies no layers)",
 		"check failed")
 }
 
 func TestRunCheckReportsAllStagedPrerequisites(t *testing.T) {
 	t.Setenv("PATH", t.TempDir())
-	address := fakeContainerd(t, "v2.2.3",
-		[]*introspectionapi.Plugin{wiredPlugin(map[string]string{"enable_remote_snapshot_annotations": "true"})})
+	address := fakeContainerd(t, "v2.2.3", wiredPlugins(map[string]string{"enable_remote_snapshot_annotations": "true"}))
 	var out bytes.Buffer
 	code := runCheck(context.Background(), &out,
 		snapshot.Config{KnarrRoot: t.TempDir(), ContainerdAddress: address, AllowUnstagedPulls: true},
@@ -137,8 +166,27 @@ func TestRunCheckReportsAllStagedPrerequisites(t *testing.T) {
 		"1. mkcomposefs: FAIL:",
 		"2. fs-verity on the knarr store (",
 		"3. containerd: ok (version v2.2.3)",
+		"7. containerd diff proxy_plugins wiring: ok (proxy plugin cfs-diff)",
 		"check failed")
 	if !strings.Contains(out.String(), "mkcomposefs not found") {
 		t.Fatalf("mkcomposefs failure lacks its cause:\n%s", out.String())
 	}
+}
+
+// TestRunCheckSkipsDifferOutOfBand covers that the mode which applies no
+// layers does not require the differ the staged mode needs: the same wiring
+// that fails the check in staged mode passes here.
+func TestRunCheckSkipsDifferOutOfBand(t *testing.T) {
+	address := fakeContainerd(t, "v2.2.3",
+		[]*introspectionapi.Plugin{wiredPlugin(map[string]string{"enable_remote_snapshot_annotations": "true"})})
+	var out bytes.Buffer
+	code := runCheck(context.Background(), &out,
+		snapshot.Config{KnarrRoot: t.TempDir(), ContainerdAddress: address}, testSocket)
+	if code != 0 {
+		t.Fatalf("runCheck = %d, want 0; output:\n%s", code, out.String())
+	}
+	wantLines(t, out.String(),
+		"6. enable_remote_snapshot_annotations export: ok",
+		"7. containerd diff proxy_plugins wiring: skipped (out-of-band mode applies no layers)",
+		"check passed")
 }
