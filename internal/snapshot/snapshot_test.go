@@ -4,11 +4,11 @@
 package snapshot
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -17,7 +17,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/containerd/containerd/v2/core/content"
+	contentapi "github.com/containerd/containerd/api/services/content/v1"
 	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/containerd/containerd/v2/core/snapshots"
 	"github.com/containerd/containerd/v2/core/snapshots/storage"
@@ -28,6 +28,9 @@ import (
 	"github.com/opencontainers/image-spec/identity"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"golang.org/x/sys/unix"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 func TestOptFieldsExposesLabels(t *testing.T) {
@@ -1002,12 +1005,12 @@ func TestCommitStagedRecordReadsNothing(t *testing.T) {
 	sn := newStagingSnapshotter(t, engine)
 	layers := []digest.Digest{digest.FromString("layer-1"), digest.FromString("layer-2")}
 	root, chains := stageImage(t, sn, layers...)
-	content := sn.blobs.store
+	content := sn.blobs.client
 
 	if _, err := sn.Prepare(ctx, "extract", "", snapshots.WithLabels(stagedLabels("app:v1", root, chains[0]))); err != nil {
 		t.Fatalf("Prepare() error = %v", err)
 	}
-	sn.blobs.store = fakeContent{blobs: map[digest.Digest][]byte{}}
+	sn.blobs.client = fakeContent{blobs: map[digest.Digest][]byte{}}
 	base := "moby/1/" + chains[0].String()
 	if err := sn.Commit(ctx, base, "extract"); err != nil {
 		t.Fatalf("Commit() error = %v", err)
@@ -1020,7 +1023,7 @@ func TestCommitStagedRecordReadsNothing(t *testing.T) {
 		t.Fatalf("committed labels = %v, want a staging record", info.Labels)
 	}
 
-	sn.blobs.store = content
+	sn.blobs.client = content
 	if _, err := sn.Prepare(ctx, "extract-leaf", base, snapshots.WithLabels(stagedLabels("app:v1", root, chains[1]))); err != nil {
 		t.Fatalf("Prepare(leaf) error = %v", err)
 	}
@@ -1030,7 +1033,7 @@ func TestCommitStagedRecordReadsNothing(t *testing.T) {
 	if len(sn.builds) != 0 {
 		t.Fatalf("open builds = %d, want none after the leaf's apply", len(sn.builds))
 	}
-	sn.blobs.store = fakeContent{blobs: map[digest.Digest][]byte{}}
+	sn.blobs.client = fakeContent{blobs: map[digest.Digest][]byte{}}
 	leaf := "moby/2/" + chains[1].String()
 	if err := sn.Commit(ctx, leaf, "extract-leaf"); err != nil {
 		t.Fatalf("Commit(leaf) error = %v", err)
@@ -1044,7 +1047,7 @@ func TestCommitStagedRecordReadsNothing(t *testing.T) {
 		t.Fatalf("engine Hold calls = %+v, want %+v", engine.holds, holds)
 	}
 
-	sn.blobs.store = content
+	sn.blobs.client = content
 	if _, err := sn.Prepare(ctx, "extract-unapplied", base, snapshots.WithLabels(stagedLabels("app:v1", root, chains[1]))); err != nil {
 		t.Fatalf("Prepare(unapplied) error = %v", err)
 	}
@@ -1322,7 +1325,7 @@ func TestApplyResumesAfterRestart(t *testing.T) {
 	}
 
 	second := newConfiguredSnapshotter(t, Config{Root: root, AllowUnstagedPulls: true}, engine, notMounted)
-	second.blobs.store = first.blobs.store
+	second.blobs.client = first.blobs.client
 	base := "moby/1/" + chains[0].String()
 	if err := second.Commit(ctx, base, "moby/1/extract"); err != nil {
 		t.Fatalf("Commit() after restart error = %v", err)
@@ -1720,8 +1723,8 @@ func TestCloseIsIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newSnapshotter() error = %v", err)
 	}
-	if _, err := sn.blobs.contentStore(); err != nil {
-		t.Fatalf("contentStore() error = %v", err)
+	if _, err := sn.blobs.contentClient(); err != nil {
+		t.Fatalf("contentClient() error = %v", err)
 	}
 	for i := range 2 {
 		if err := sn.Close(); err != nil {
@@ -2303,29 +2306,47 @@ type holdCall struct {
 	holder string
 }
 
-// fakeContent serves canned blobs the way containerd's content store does.
-// Only the read a conversion makes is implemented; anything else panics on the
-// nil embedded store.
+// fakeContent serves canned blobs the way containerd's content service does:
+// one Read call streams a blob in fixed-size messages, and a blob the store
+// does not hold fails the first receive rather than the call. Only the read a
+// conversion makes is implemented; anything else panics on the nil embedded
+// client.
 type fakeContent struct {
-	content.Store
+	contentapi.ContentClient
 	blobs map[digest.Digest][]byte
 }
 
-func (f fakeContent) ReaderAt(_ context.Context, desc ocispec.Descriptor) (content.ReaderAt, error) {
-	blob, ok := f.blobs[desc.Digest]
+// fakeMessageSize is the size of the messages a fake read streams a blob in,
+// small enough that every fake manifest takes several.
+const fakeMessageSize = 16
+
+func (f fakeContent) Read(_ context.Context, req *contentapi.ReadContentRequest, _ ...grpc.CallOption) (contentapi.Content_ReadClient, error) {
+	blob, ok := f.blobs[digest.Digest(req.Digest)]
 	if !ok {
-		return nil, fmt.Errorf("content %s: %w", desc.Digest, errdefs.ErrNotFound)
+		return &fakeReadStream{err: status.Errorf(codes.NotFound, "content %s", req.Digest)}, nil
 	}
-	return fakeReaderAt{Reader: bytes.NewReader(blob)}, nil
+	return &fakeReadStream{data: blob}, nil
 }
 
-type fakeReaderAt struct {
-	*bytes.Reader
+// fakeReadStream is the stream of one fake read.
+type fakeReadStream struct {
+	grpc.ClientStream
+	data []byte
+	err  error
 }
 
-func (r fakeReaderAt) Size() int64 { return r.Reader.Size() }
-
-func (fakeReaderAt) Close() error { return nil }
+func (s *fakeReadStream) Recv() (*contentapi.ReadContentResponse, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	if len(s.data) == 0 {
+		return nil, io.EOF
+	}
+	n := min(len(s.data), fakeMessageSize)
+	resp := &contentapi.ReadContentResponse{Data: s.data[:n]}
+	s.data = s.data[n:]
+	return resp, nil
+}
 
 // layerSize is the size the fake manifests declare for every layer blob.
 const layerSize = 42
@@ -2382,10 +2403,10 @@ func stageImageBy(t *testing.T, sn *snapshotter, author string, diffIDs ...diges
 		t.Fatalf("marshal manifest: %v", err)
 	}
 	root := digest.FromBytes(manifest)
-	store, ok := sn.blobs.store.(fakeContent)
+	store, ok := sn.blobs.client.(fakeContent)
 	if !ok {
 		store = fakeContent{blobs: map[digest.Digest][]byte{}}
-		sn.blobs.store = store
+		sn.blobs.client = store
 	}
 	store.blobs[root] = manifest
 	store.blobs[configDigest] = config
