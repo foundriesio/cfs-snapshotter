@@ -71,6 +71,7 @@ package snapshot
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -122,7 +123,10 @@ import (
 // the hold is released against the digest that was taken rather than against a
 // reference a tag may have moved in the meantime.
 //
-// The last three are private to this snapshotter. containerd hands a backend
+// holderLabel records the holder name the record took that hold under, so a
+// record releases its own hold and not another record's.
+//
+// The last four are private to this snapshotter. containerd hands a backend
 // Commit the containerd.io/snapshot.ref label and the containerd.io/snapshot/*
 // prefix and drops everything else, so Commit carries them over from the
 // active record itself.
@@ -134,13 +138,25 @@ const (
 	chainMemberLabel          = privateLabelPrefix + "chain-member"
 	stagingLabel              = privateLabelPrefix + "staging"
 	rootDigestLabel           = privateLabelPrefix + "root-digest"
+	holderLabel               = privateLabelPrefix + "holder"
 )
 
-// cfsHolder names this snapshotter among the knarr store's holders. Every image
-// the snapshotter hands containerd a record for is held under it until
-// containerd forgets the record, so a knarr remove cannot take content away
-// from underneath a runtime that is counting on it.
-const cfsHolder = "cfs"
+// recordHolder names the knarr hold a single snapshot record takes. Every image
+// the snapshotter hands containerd a record for is held until containerd
+// forgets that record, so a knarr remove cannot take content away from
+// underneath a runtime that is counting on it. One name per record, rather than
+// one for the snapshotter, is what keeps two records standing for the same
+// image independent: each takes its own hold, and the image is let go only once
+// the last of them is removed.
+//
+// The name is a hash of the record name rather than the name itself because a
+// holder may only carry [a-z0-9._-], and every record containerd names carries
+// a path separator and a digest colon. The record keeps the result in
+// holderLabel, so a release names the hold that record took rather than
+// re-deriving it.
+func recordHolder(name string) string {
+	return fmt.Sprintf("cfs-%x", sha256.Sum256([]byte(name)))
+}
 
 // snapshotter is the cfs-snapshotter implementation of snapshots.Snapshotter.
 type snapshotter struct {
@@ -498,8 +514,19 @@ func (s *snapshotter) Commit(ctx context.Context, name, key string, opts ...snap
 	if root == "" {
 		return s.commitRecord(ctx, name, key, nil, opts)
 	}
-	private := map[string]string{chainMemberLabel: "true", rootDigestLabel: root}
+	holder := recordHolder(name)
+	if err := s.engine.Hold(ctx, root, holder); err != nil {
+		return fmt.Errorf("hold image %q: %w", labels[imageRefLabel], err)
+	}
+	private := map[string]string{chainMemberLabel: "true", rootDigestLabel: root, holderLabel: holder}
 	if err := s.commitRecord(ctx, name, key, private, opts); err != nil {
+		// No record carries this holder, so nothing would ever release it. A
+		// record that already exists is not such a case: the holder is named
+		// after the record, so the hold this call took is the one that record
+		// already stands for.
+		if !errdefs.IsAlreadyExists(err) {
+			s.releaseHold(ctx, root, holder)
+		}
 		return err
 	}
 	s.sweepStagedChain(ctx, name)
@@ -514,23 +541,25 @@ func (s *snapshotter) Commit(ctx context.Context, name, key string, opts ...snap
 // once no image references them.
 //
 // A record that pinned an image in the knarr store releases it here, against
-// the root digest the record itself carries rather than any reference that may
-// have moved since. The release is idempotent and names only this
-// snapshotter's own hold, so removing a record that never took one, or a
-// mid-chain member that shares an image with records still standing, changes
-// nothing; the image is let go once containerd has forgotten the last of them.
+// the root digest and the holder name the record itself carries rather than any
+// reference that may have moved since. The release names that record's own
+// hold, so removing a record that never took one, or one of several records
+// standing for the same image, leaves the other holds in place; the image is
+// let go once containerd has forgotten the last of them.
 func (s *snapshotter) Remove(ctx context.Context, key string) (err error) {
 	log.G(ctx).WithField("key", key).Trace("cfs snapshotter: remove")
 	var (
-		renamed, path, root string
-		restore             bool
+		renamed, path, root, holder string
+		restore                     bool
 	)
 	err = s.ms.WithTransaction(ctx, true, func(ctx context.Context) error {
 		_, info, _, err := storage.GetInfo(ctx, key)
 		if err != nil {
 			return fmt.Errorf("failed to get snapshot info: %w", err)
 		}
+		// A record that took a hold carries both labels, written together.
 		root = info.Labels[rootDigestLabel]
+		holder = info.Labels[holderLabel]
 		id, _, err := storage.Remove(ctx, key)
 		if err != nil {
 			return fmt.Errorf("failed to remove: %w", err)
@@ -572,13 +601,20 @@ func (s *snapshotter) Remove(ctx context.Context, key string) (err error) {
 		}
 	}
 	if root != "" {
-		if err := s.engine.Release(ctx, root, cfsHolder); err != nil {
-			// The record is already gone, so the caller has nothing to retry;
-			// what is left behind is an image held longer than it need be.
-			log.G(ctx).WithError(err).WithField("digest", root).Warn("failed to release the image hold")
-		}
+		s.releaseHold(ctx, root, holder)
 	}
 	return nil
+}
+
+// releaseHold drops one of the knarr store's holds on root, logging a failure
+// rather than reporting it: every caller has already passed the point where it
+// could undo its own work, so what a failure leaves behind is an image held
+// longer than it need be.
+func (s *snapshotter) releaseHold(ctx context.Context, root, holder string) {
+	if err := s.engine.Release(ctx, root, holder); err != nil {
+		log.G(ctx).WithError(err).WithFields(log.Fields{"digest": root, "holder": holder}).
+			Warn("failed to release the image hold")
+	}
 }
 
 // Walk invokes fn for each committed snapshot matching the given filters. The
@@ -675,8 +711,9 @@ var errStagePull = errors.New("stage the pull")
 // content it will only mount later, and the hold is what stops a knarr remove
 // from taking that content away in between — a pull followed by a remove
 // followed by a run would otherwise fail at the run. The hold is taken before
-// the record exists: a hold with nothing to release it over-protects, while a
-// record with no hold would leave content containerd counts on reclaimable.
+// the record exists, because a record with no hold would leave content
+// containerd counts on reclaimable, and dropped again if the record then fails
+// to land.
 func (s *snapshotter) createAndCommitIntermediateVirtualSnapshot(ctx context.Context, key, parent, name string, labels map[string]string, opts []snapshots.Opt) error {
 	imageRef := labels[imageRefLabel]
 	if imageRef == "" {
@@ -705,10 +742,12 @@ func (s *snapshotter) createAndCommitIntermediateVirtualSnapshot(ctx context.Con
 
 	private := map[string]string{chainMemberLabel: "true"}
 	if n := len(info.Layers); info.Layers[n-1].ChainID.String() == name {
-		if err := s.engine.Hold(ctx, info.Root.String(), cfsHolder); err != nil {
+		holder := recordHolder(name)
+		if err := s.engine.Hold(ctx, info.Root.String(), holder); err != nil {
 			return fmt.Errorf("hold image %q: %w", imageRef, err)
 		}
 		private[rootDigestLabel] = info.Root.String()
+		private[holderLabel] = holder
 	}
 
 	err = s.ms.WithTransaction(ctx, true, func(ctx context.Context) error {
@@ -725,6 +764,13 @@ func (s *snapshotter) createAndCommitIntermediateVirtualSnapshot(ctx context.Con
 		return nil
 	})
 	if err != nil && !errdefs.IsAlreadyExists(err) {
+		// The record this hold belongs to was never written, so nothing will
+		// ever release it. An already-existing record is not such a case: the
+		// holder is named after the record, so the hold this call took is the
+		// one that record already stands for.
+		if holder := private[holderLabel]; holder != "" {
+			s.releaseHold(ctx, info.Root.String(), holder)
+		}
 		return err
 	}
 	log.G(ctx).WithFields(log.Fields{
@@ -764,11 +810,11 @@ func (s *snapshotter) commitRecord(ctx context.Context, name, key string, privat
 }
 
 // buildStagedChain builds the composefs image of a staged layer chain out of
-// the blobs the runtime fetched, and pins it in the knarr store. It returns the
-// root digest the image was built and held under, or an empty digest when the
-// chain being committed is not the image's last one — an image is worth
-// building once, whole, and the earlier chains of the same pull are only steps
-// towards it.
+// the blobs the runtime fetched. It returns the root digest the image was built
+// under, which the caller pins and records, or an empty digest when the chain
+// being committed is not the image's last one — an image is worth building
+// once, whole, and the earlier chains of the same pull are only steps towards
+// it.
 //
 // The labels the runtime attached are what the build is anchored on: the
 // reference names the image, the manifest digest fixes which image that is, and
@@ -799,9 +845,6 @@ func (s *snapshotter) buildStagedChain(ctx context.Context, labels map[string]st
 	}
 	if _, err := s.engine.Pull(ctx, imageRef, knarr.WithBlobSource(s.blobs), knarr.WithResolvedRoot(digest.Digest(root))); err != nil {
 		return "", fmt.Errorf("build image %q from the staged layers of chain %s: %w", imageRef, chainID, err)
-	}
-	if err := s.engine.Hold(ctx, root, cfsHolder); err != nil {
-		return "", fmt.Errorf("hold image %q: %w", imageRef, err)
 	}
 	return root, nil
 }

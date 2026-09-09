@@ -757,7 +757,7 @@ func TestCommitBuildsStagedLeaf(t *testing.T) {
 	if pull.ref != imageRef || pull.opts.ResolvedRoot != root || pull.opts.BlobSource != knarr.BlobSource(sn.blobs) {
 		t.Fatalf("Pull(%q, %+v), want %q rooted at %s from the content store", pull.ref, pull.opts, imageRef, root)
 	}
-	want := []holdCall{{ref: root.String(), holder: cfsHolder}}
+	want := []holdCall{{ref: root.String(), holder: recordHolder(parent)}}
 	if !slices.Equal(engine.holds, want) {
 		t.Fatalf("engine Hold calls = %+v, want %+v", engine.holds, want)
 	}
@@ -962,12 +962,112 @@ func TestCommitConvergesOnDuplicateLeaves(t *testing.T) {
 	if len(engine.pulls) != 2 {
 		t.Fatalf("engine Pull calls = %d, want both commits to build", len(engine.pulls))
 	}
+	// Both commits hold, under the one name the surviving record is known by;
+	// the loser must not give that hold back with the record still standing.
+	held := holdCall{ref: root.String(), holder: recordHolder(name)}
+	if want := []holdCall{held, held}; !slices.Equal(engine.holds, want) {
+		t.Fatalf("engine Hold calls = %+v, want %+v", engine.holds, want)
+	}
+	if len(engine.releases) != 0 {
+		t.Fatalf("engine Release calls = %+v, want the surviving record still held", engine.releases)
+	}
 	info, err := sn.Stat(ctx, name)
 	if err != nil {
 		t.Fatalf("Stat(%q) error = %v", name, err)
 	}
 	if info.Labels[rootDigestLabel] != root.String() {
 		t.Fatalf("committed labels = %v, want the built image's digest", info.Labels)
+	}
+}
+
+// TestPrepareReadmissionKeepsHold covers two runtimes handshaking over the same
+// leaf chain: containerd names that record by the chain alone, so the second
+// admission finds the record already there and must leave its hold alone.
+func TestPrepareReadmissionKeepsHold(t *testing.T) {
+	ctx := context.Background()
+	leaf := digest.FromString("leaf-chain")
+	image := testImageInfo("image", leaf)
+	engine := fakeEngineForImages(image)
+	sn := newSnapshotterForTest(t, engine, notMounted)
+
+	seedChainRecord(t, ctx, sn, leaf.String(), "", image.Root.String())
+	seedChainRecord(t, ctx, sn, leaf.String(), "", image.Root.String())
+
+	held := holdCall{ref: image.Root.String(), holder: recordHolder(leaf.String())}
+	if want := []holdCall{held, held}; !slices.Equal(engine.holds, want) {
+		t.Fatalf("engine Hold calls = %+v, want %+v", engine.holds, want)
+	}
+	if len(engine.releases) != 0 {
+		t.Fatalf("engine Release calls = %+v, want the admitted image still held", engine.releases)
+	}
+}
+
+// TestCommitReleasesHoldWhenRecordFails covers a built image whose record then
+// fails to land: the hold names that record, so with the record gone nothing
+// would ever release it.
+func TestCommitReleasesHoldWhenRecordFails(t *testing.T) {
+	ctx := pullNamespace()
+	engine := fakeEngineForImages()
+	sn := newStagingSnapshotter(t, engine)
+	root, chains := stageImage(t, sn, digest.FromString("layer-1"))
+	name := "moby/1/" + chains[0].String()
+
+	if _, err := sn.Prepare(ctx, "extract", "", snapshots.WithLabels(stagedLabels("app:v1", root, chains[0]))); err != nil {
+		t.Fatalf("Prepare() error = %v", err)
+	}
+	// Recording the record measures the snapshot directory, so removing it is
+	// a write failure arriving after the image was built and held.
+	id, _, err := sn.snapshotInfo(ctx, "extract")
+	if err != nil {
+		t.Fatalf("snapshotInfo(extract) error = %v", err)
+	}
+	if err := os.RemoveAll(sn.getSnapshotDir(id)); err != nil {
+		t.Fatalf("remove staging dir: %v", err)
+	}
+	if err := sn.Commit(ctx, name, "extract"); err == nil {
+		t.Fatal("Commit() error = nil, want the record write to fail")
+	}
+	want := []holdCall{{ref: root.String(), holder: recordHolder(name)}}
+	if !slices.Equal(engine.holds, want) {
+		t.Fatalf("engine Hold calls = %+v, want %+v", engine.holds, want)
+	}
+	if !slices.Equal(engine.releases, want) {
+		t.Fatalf("engine Release calls = %+v, want the hold given back", engine.releases)
+	}
+}
+
+// TestRemoveKeepsImageHeldForOtherRecords covers two runtimes pulling one image
+// into their own namespaces: containerd names a record per namespace, each
+// takes its own hold, and removing one leaves the other's standing.
+func TestRemoveKeepsImageHeldForOtherRecords(t *testing.T) {
+	engine := fakeEngineForImages()
+	sn := newStagingSnapshotter(t, engine)
+	root, chains := stageImage(t, sn, digest.FromString("layer-1"))
+
+	names := make([]string, 2)
+	for i, ns := range []string{"moby", "k8s.io"} {
+		ctx := namespaces.WithNamespace(context.Background(), ns)
+		names[i] = ns + "/1/" + chains[0].String()
+		if _, err := sn.Prepare(ctx, "extract", "", snapshots.WithLabels(stagedLabels("app:v1", root, chains[0]))); err != nil {
+			t.Fatalf("Prepare() in %s error = %v", ns, err)
+		}
+		if err := sn.Commit(ctx, names[i], "extract"); err != nil {
+			t.Fatalf("Commit(%s) error = %v", names[i], err)
+		}
+	}
+	want := []holdCall{
+		{ref: root.String(), holder: recordHolder(names[0])},
+		{ref: root.String(), holder: recordHolder(names[1])},
+	}
+	if !slices.Equal(engine.holds, want) {
+		t.Fatalf("engine Hold calls = %+v, want one per record", engine.holds)
+	}
+
+	if err := sn.Remove(namespaces.WithNamespace(context.Background(), "moby"), names[0]); err != nil {
+		t.Fatalf("Remove(%s) error = %v", names[0], err)
+	}
+	if !slices.Equal(engine.releases, want[:1]) {
+		t.Fatalf("engine Release calls = %+v, want only the removed record's hold", engine.releases)
 	}
 }
 
@@ -1038,7 +1138,7 @@ func TestRemoveReleasesByRecordedDigest(t *testing.T) {
 	if err := sn.Remove(ctx, name); err != nil {
 		t.Fatalf("Remove() error = %v", err)
 	}
-	want := []holdCall{{ref: root.String(), holder: cfsHolder}}
+	want := []holdCall{{ref: root.String(), holder: recordHolder(name)}}
 	if !slices.Equal(engine.releases, want) {
 		t.Fatalf("engine Release calls = %+v, want %+v", engine.releases, want)
 	}
@@ -1065,7 +1165,7 @@ func TestRemoveToleratesReleaseFailure(t *testing.T) {
 	if err := sn.Remove(ctx, name); err != nil {
 		t.Fatalf("Remove() error = %v, want success despite the failed release", err)
 	}
-	want := []holdCall{{ref: root.String(), holder: cfsHolder}}
+	want := []holdCall{{ref: root.String(), holder: recordHolder(name)}}
 	if !slices.Equal(engine.releases, want) {
 		t.Fatalf("engine Release calls = %+v, want %+v", engine.releases, want)
 	}
@@ -1097,7 +1197,7 @@ func TestPrepareHoldsAdmittedImage(t *testing.T) {
 	}
 
 	seedChainRecord(t, ctx, sn, leaf.String(), base.String(), image.Root.String())
-	want := []holdCall{{ref: image.Root.String(), holder: cfsHolder}}
+	want := []holdCall{{ref: image.Root.String(), holder: recordHolder(leaf.String())}}
 	if !slices.Equal(engine.holds, want) {
 		t.Fatalf("engine Hold calls = %+v, want %+v", engine.holds, want)
 	}
