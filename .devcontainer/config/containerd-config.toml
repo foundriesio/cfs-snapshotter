@@ -12,6 +12,13 @@ version = 2
 [proxy_plugins.cfs.exports]
   enable_remote_snapshot_annotations = "true"
 
+[proxy_plugins.cfs-diff]
+  type = "diff"
+  address = "/run/containerd-cfs-grpc/containerd-cfs-grpc.sock"
+
+[plugins."io.containerd.service.v1.diff-service"]
+  default = ["cfs-diff", "walking"]
+
 [plugins."io.containerd.cri.v1.images".registry]
   config_path = "/etc/containerd/certs.d"
 
@@ -22,3 +29,4 @@ version = 2
 [[plugins."io.containerd.transfer.v1.local".unpack_config]]
   platform = "linux"
   snapshotter = "cfs"
+  differ = "cfs-diff"

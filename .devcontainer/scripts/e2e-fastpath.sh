@@ -38,6 +38,11 @@ share_ref=""
 share_more_ref=""
 partial_ref=""
 pull_pid=""
+# cold_composefs is the digest of the composefs image the cold pull built at
+# one ingest worker, which the two-worker re-pull and a knarr pull of the same
+# image must build again byte for byte.
+cold_composefs=""
+fresh_knarr_root=""
 
 cleanup() {
 	# A failure inside the interrupted-pull leg can leave its background pull
@@ -61,6 +66,9 @@ cleanup() {
 	done
 	if [ -n "${work}" ] && [ -e "${work}" ]; then
 		rm -rf "${work}" || echo "warning: failed to remove ${work}" >&2
+	fi
+	if [ -n "${fresh_knarr_root}" ] && [ -e "${fresh_knarr_root}" ]; then
+		rm -rf "${fresh_knarr_root}" || echo "warning: failed to remove ${fresh_knarr_root}" >&2
 	fi
 	# Either phase's failure leaves its own daemon running; put the
 	# devcontainer back in its boot posture (staged mode, default stores),
@@ -637,26 +645,34 @@ assert_tamper_fails_at_open() {
 	echo "PASS: verity rejected the tampered object when overlayfs opened /hello"
 }
 
-# report_conversion prints how long building the staged layers into a composefs
-# image took. The snapshotter traces every Commit as it starts, and the whole
-# chain is built inside the last one; the caller asks for the record that
-# commit created as soon as the call returns, so the gap between the two is the
-# build. Everything else the daemon logs meanwhile belongs to other records.
-report_conversion() {
-	local ref="$1" layers="$2" offset="$3" entries commit start name end seconds
+# report_layer_applies prints how long the differ spent on each layer of a
+# cold pull — feeding it into the image build and, for the last one, also
+# finishing the image — from the elapsed time the snapshotter logs per apply.
+# Everything else the daemon logs meanwhile belongs to other records.
+report_layer_applies() {
+	local ref="$1" layers="$2" offset="$3" entries applies count line layer seconds
 	entries="$(tail -n "+$((offset + 1))" "${CFS_LOG}" | grep '^{')" ||
 		fail "the snapshotter logged nothing for the pull of ${ref}"
-	commit="$(jq -c 'select(.msg == "cfs snapshotter: commit")' <<<"${entries}" | tail -1)"
-	[ -n "${commit}" ] || fail "the snapshotter logged no commit for the pull of ${ref}"
-	start="$(jq -r '.time' <<<"${commit}")"
-	name="$(jq -r '.name' <<<"${commit}")"
-	end="$(jq -r --arg t "${start}" --arg k "${name}" \
-		'select(.time > $t and .msg == "cfs snapshotter: stat" and .key == $k) | .time' \
-		<<<"${entries}" | sed -n '1p')"
-	[ -n "${end}" ] || fail "the snapshotter never served the record it committed for ${ref}"
-	seconds="$(awk -v a="$(date -d "${start}" +%s.%N)" -v b="$(date -d "${end}" +%s.%N)" \
-		'BEGIN {printf "%.3f", b - a}')"
-	echo "conversion: ${ref} ${layers} layers in ${seconds}s"
+	applies="$(jq -c 'select(.msg == "cfs differ: applied staged layer")' <<<"${entries}")"
+	count="$(grep -c '^{' <<<"${applies}")" || true
+	[ "${count}" -eq "${layers}" ] ||
+		fail "the snapshotter logged ${count} layer applies for the pull of ${ref}, want ${layers}"
+	while IFS= read -r line; do
+		layer="$(jq -r '.layer' <<<"${line}")"
+		seconds="$(jq -r '.elapsed * 1000 | round / 1000' <<<"${line}")"
+		if [ "$(jq -r '.leaf' <<<"${line}")" = true ]; then
+			echo "finish: ${ref} layer ${layer} in ${seconds}s"
+		else
+			echo "apply: ${ref} layer ${layer} in ${seconds}s"
+		fi
+	done <<<"${applies}"
+}
+
+# hello_in_store reports whether the store holds an object with the seeded
+# /hello of the image in layout.
+hello_in_store() {
+	[ -d "$(cas_dir)" ] || return 1
+	[ -n "$(hello_objects "$(cas_dir)" "$1" | sed -n '1p')" ]
 }
 
 assert_cold_pull_lands_composefs() {
@@ -665,12 +681,25 @@ assert_cold_pull_lands_composefs() {
 	local bindings uppers records output pid chainfs
 
 	tag_ref="${REGISTRY}/${repo}:${nonce}"
-	seed_image "${nonce}-cold" "${tag_ref}" 3 "${layout}"
+	seed_image "${nonce}-cold" "${tag_ref}" 3 "${layout}" "" "${PARTIAL_LAYER_BYTES}"
 	cold_ref="$(pinned_ref "${REGISTRY}/${repo}" "${layout}")" || fail "cannot pin the cold image ref"
 
 	offset="$(wc -l <"${CFS_LOG}")"
-	docker pull "${cold_ref}" >/dev/null || fail "cold docker pull failed"
-	report_conversion "${cold_ref}" 3 "${offset}"
+	docker pull "${cold_ref}" >/dev/null 2>&1 &
+	pull_pid=$!
+	# Layers reach the store as the differ applies them, not once the pull is
+	# over: the seeded /hello, in the first layer, must be a store object
+	# while the last, large layer is still being transferred. The store
+	# holds the image's metadata from the first apply on, so only a known
+	# file's object is evidence that a layer went in.
+	wait_until "the first layer of ${cold_ref} to reach the store" 600 0.1 \
+		hello_in_store "${layout}"
+	if docker image inspect "${cold_ref}" >/dev/null 2>&1; then
+		fail "the cold pull completed before its first layer was seen in the store"
+	fi
+	wait "${pull_pid}" || fail "cold docker pull failed"
+	pull_pid=""
+	report_layer_applies "${cold_ref}" 3 "${offset}"
 
 	info="$(knarr_cli inspect --format json "${cold_ref}")" ||
 		fail "the knarr store does not hold the cold-pulled image"
@@ -679,6 +708,7 @@ assert_cold_pull_lands_composefs() {
 		fail "the knarr store holds the cold-pulled image under another root"
 
 	composefs="$(jq -r '.composefs.digest' <<<"${info}")"
+	cold_composefs="${composefs}"
 	fsverity="$(jq -r '.fsverity' <<<"${info}")"
 	object="$(sharded_path "$(cas_dir)" "${composefs}")"
 	[ -f "${object}" ] || fail "the composefs image is missing from the store at ${object}"
@@ -689,7 +719,7 @@ assert_cold_pull_lands_composefs() {
 	[ "${bindings}" -eq 1 ] || fail "the cold pull built ${bindings} composefs images, want 1"
 
 	uppers="$(staging_uppers)"
-	[ "${uppers}" -eq 0 ] || fail "${uppers} staged upper directories survived the conversion"
+	[ "${uppers}" -eq 0 ] || fail "${uppers} staged upper directories were created for the pull"
 	records="$(cfs_committed_keys | wc -l)"
 	[ "${records}" -eq 3 ] || fail "the cold pull left ${records} snapshot records, want 3"
 
@@ -706,7 +736,7 @@ assert_cold_pull_lands_composefs() {
 	[ -n "${chainfs}" ] || fail "the cold-pulled image has no shared image mount"
 	[ "$(findmnt -n -o FSTYPE -M "${chainfs}")" = erofs ] || fail "the cold image mount is not EROFS"
 	docker rm -f cfs-e2e-cold >/dev/null || fail "remove the mount inspection container"
-	echo "PASS: a plain docker pull staged, converted, and ran one composefs image"
+	echo "PASS: a plain docker pull was ingested layer by layer into one composefs image and ran"
 }
 
 assert_cold_repull_refetches() {
@@ -814,10 +844,14 @@ assert_interrupted_pull_converges() {
 	wait_until "the aborted pull's staged snapshots to be collected" 120 1 \
 		collected_after_lease_drop "${leases}" "${baseline}"
 	assert_no_staging_residue
+	# Removing the pull's snapshots closed its image build, which held the
+	# store's shared lock while it was open: a collection now runs instead
+	# of reporting the store busy, and reclaims what the build had stored.
+	knarr_cli gc >&2 || fail "knarr gc after the aborted pull did not run"
 
 	offset="$(wc -l <"${CFS_LOG}")"
 	docker pull "${partial_ref}" >/dev/null || fail "re-pull after the interrupted pull failed"
-	report_conversion "${partial_ref}" 3 "${offset}"
+	report_layer_applies "${partial_ref}" 3 "${offset}"
 	knarr_cli inspect --format json "${partial_ref}" >/dev/null ||
 		fail "the re-pull did not land in the knarr store"
 	[ "$(image_bindings "$(manifest_digest "${layout}")")" -eq 1 ] ||
@@ -867,6 +901,41 @@ assert_cold_mixed_door() {
 	echo "PASS: a knarr pull of a runtime-staged tag kept one held image and remove declined"
 }
 
+# assert_ingest_workers_converge re-pulls the cold image with the snapshotter
+# at two ingest workers and compares the composefs image it builds with the
+# one built at one worker, and with the one a knarr pull of the same image
+# builds from its OCI layout into a fresh store: the worker count and the door
+# an image comes in through change the order objects land in the store, never
+# the image.
+assert_ingest_workers_converge() {
+	local layout="${work}/cold-layout" root offset composefs fresh_composefs
+	root="$(manifest_digest "${layout}")" || fail "cannot read the cold manifest digest"
+	[ -n "${cold_composefs}" ] || fail "the one-worker cold pull recorded no composefs digest"
+
+	CFS_INGEST_WORKERS=2 CFS_ALLOW_UNSTAGED_PULLS=1 CFS_ROOT="${COLD_CFS_ROOT}" KNARR_ROOT="${COLD_KNARR_ROOT}" \
+		"${SCRIPT_DIR}/run-cfs.sh" >&2 || fail "restart the snapshotter with two ingest workers"
+	offset="$(wc -l <"${CFS_LOG}")"
+	docker pull "${cold_ref}" >/dev/null || fail "re-pull at two ingest workers failed"
+	report_layer_applies "${cold_ref}" 3 "${offset}"
+	composefs="$(knarr_cli inspect --format json "${cold_ref}" | jq -r '.composefs.digest')" ||
+		fail "the knarr store does not hold the image re-pulled at two workers"
+	[ "${composefs}" = "${cold_composefs}" ] ||
+		fail "two ingest workers built ${composefs}, one worker built ${cold_composefs}"
+
+	# The fresh store must sit on the shared fs-verity filesystem, like every
+	# other store the devcontainer uses.
+	fresh_knarr_root="$(mktemp -d /var/lib/cfs-shared-root/knarr-e2e-fresh.XXXXXX)" ||
+		fail "cannot create a fresh knarr root"
+	"${KNARR_BIN}" --root "${fresh_knarr_root}" pull --from-dir "${layout}" "${cold_ref}" >&2 ||
+		fail "knarr pull of the cold image into a fresh store failed"
+	fresh_composefs="$("${KNARR_BIN}" --root "${fresh_knarr_root}" inspect --format json "${cold_ref}" |
+		jq -r '.composefs.digest')" || fail "cannot inspect the fresh store's image"
+	[ "${fresh_composefs}" = "${cold_composefs}" ] ||
+		fail "knarr pull built ${fresh_composefs}, the snapshotter built ${cold_composefs}"
+	[ "${root}" = "$(manifest_digest "${layout}")" ] || fail "the cold layout changed underneath the test"
+	echo "PASS: one and two ingest workers and a knarr pull built the same composefs image"
+}
+
 warm_phase() {
 	local nonce="$1" chainfs
 	echo "== warm phase: images enter the store out of band =="
@@ -902,7 +971,8 @@ cold_phase() {
 	# cleanup must already see the cold posture to restore the boot one.
 	knarr_root="${COLD_KNARR_ROOT}"
 	cfs_root="${COLD_CFS_ROOT}"
-	CFS_ALLOW_UNSTAGED_PULLS=1 CFS_ROOT="${COLD_CFS_ROOT}" KNARR_ROOT="${COLD_KNARR_ROOT}" \
+	# One ingest worker first; the last leg switches to two and compares.
+	CFS_INGEST_WORKERS=1 CFS_ALLOW_UNSTAGED_PULLS=1 CFS_ROOT="${COLD_CFS_ROOT}" KNARR_ROOT="${COLD_KNARR_ROOT}" \
 		"${SCRIPT_DIR}/run-cfs.sh" >&2 || fail "start the snapshotter in cold-pull mode"
 	forget_knarr_images
 
@@ -912,6 +982,7 @@ cold_phase() {
 	assert_cold_prefix_dedup "${nonce}"
 	assert_interrupted_pull_converges "${nonce}"
 	assert_cold_mixed_door "${nonce}"
+	assert_ingest_workers_converge
 
 	drain_runtime_images
 	CFS_ALLOW_UNSTAGED_PULLS=1 CFS_ROOT="${WARM_CFS_ROOT}" KNARR_ROOT="${WARM_KNARR_ROOT}" \
@@ -932,7 +1003,7 @@ mounts it into the container (a container started any other way has none)"
 	cold_phase "${nonce}"
 	echo "E2E PASS: handshake identity, real content, recovery, concurrency, teardown," \
 		"tamper enforcement, holds, tag identity, cold conversion, dedup," \
-		"interrupted-pull recovery, and mixed-door identity"
+		"interrupted-pull recovery, mixed-door identity, and worker-count identity"
 }
 
 main "$@"

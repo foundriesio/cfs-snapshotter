@@ -89,9 +89,10 @@ start_runtime_daemons() {
 	rm -f "${CFS_SOCKET}"
 	start_daemon containerd-cfs-grpc "${LOG_DIR}/containerd-cfs-grpc.pid" "${LOG_DIR}/containerd-cfs-grpc.log" \
 		"${CONTAINERD_CFS_GRPC_BIN}" -log-level "${CFS_LOG_LEVEL}" -root "${CFS_ROOT}" -knarr-root "${KNARR_ROOT}" \
-		-allow-unstaged-pulls
-	# The state line run-cfs.sh reconciles against: log level, stores, work mode.
-	printf '%s\n' "${CFS_LOG_LEVEL} ${KNARR_ROOT} ${CFS_ROOT} 1" >"${CFS_STATE_FILE}"
+		-allow-unstaged-pulls -ingest-workers 0
+	# The state line run-cfs.sh reconciles against: log level, stores, work
+	# mode, ingest workers (0 is the daemon's default).
+	printf '%s\n' "${CFS_LOG_LEVEL} ${KNARR_ROOT} ${CFS_ROOT} 1 0" >"${CFS_STATE_FILE}"
 	wait_for cfs-snapshotter test -S "${CFS_SOCKET}"
 
 	# Enable the built-in erofs snapshotter only when the kernel supports

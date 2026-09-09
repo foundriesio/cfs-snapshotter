@@ -175,8 +175,11 @@ stores of its own (`/var/lib/knarr-cold`,
 of an image nobody staged:
 
 - lands in the knarr store as exactly one composefs image, present in the CAS
-  and named in the fs-verity view, with the staged directories discarded and
+  and named in the fs-verity view, with no staging directories on disk and
   the chain's snapshot records kept;
+- reaches the store a layer at a time through the differ: a known file of the
+  first layer is a store object while the last, large layer is still being
+  transferred;
 - runs under `docker run`, on a shared EROFS mount and a `verity=require`
   overlay, and prints the seeded program's output;
 - fetches its layers again when it is removed from the runtime and
@@ -187,14 +190,19 @@ of an image nobody staged:
 - shares its objects with a second image built on the same layers — the store
   does not grow by a second copy;
 - leaves nothing behind when the pull is interrupted midway: the active
-  snapshot is aborted, the staged records and their directories are collected
-  once nothing references them, and a re-pull of the same reference converges
-  on the same one composefs image.
+  snapshot is aborted, the staged records are collected once nothing
+  references them, `knarr gc` runs against the store the abandoned build let
+  go of, and a re-pull of the same reference converges on the same one
+  composefs image;
+- builds the same composefs image at one and at two ingest workers, and the
+  same one `knarr pull` builds from the image's OCI layout into a fresh store.
 
-The e2e prints a `conversion: <image> <N> layers in <T>s` line per cold pull,
-measured from the snapshotter's own log: the interval between the trace of the
-leaf Commit, inside which the whole chain is built, and the first read of the
-record that Commit created.
+The cold phase runs the snapshotter with `-ingest-workers 1` and switches to
+`-ingest-workers 2` for the last leg. The e2e prints one line per layer the
+differ applied for a cold pull, from the elapsed time the snapshotter logs for
+each: `apply: <image> layer <i> in <T>s` for the layers fed into the image
+build, and `finish: <image> layer <i> in <T>s` for the last one, which also
+finishes the image.
 
 ## Conformance Suite
 
