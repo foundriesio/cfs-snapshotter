@@ -17,6 +17,19 @@ version = 2
 [proxy_plugins.cfs.exports]
   enable_remote_snapshot_annotations = "true"
 
+# Register the cfs differ, served by the same daemon on the same socket.
+# It ingests the layers of a staged pull straight into the knarr store;
+# without it every staged pull fails at the layer apply.
+[proxy_plugins.cfs-diff]
+  type = "diff"
+  address = "/run/containerd-cfs-grpc/containerd-cfs-grpc.sock"
+
+# Docker applies layers through the diff service, which tries the differs
+# in this order: cfs-diff takes the cfs snapshotter's layers and declines
+# every other, which then falls through to walking as before.
+[plugins."io.containerd.service.v1.diff-service"]
+  default = ["cfs-diff", "walking"]
+
 # `ctr pull` unpacks via the transfer service, which only unpacks for the
 # snapshotters listed here. Listing any entry replaces the built-in
 # default, so keep overlayfs alongside cfs.
@@ -27,3 +40,4 @@ version = 2
 [[plugins."io.containerd.transfer.v1.local".unpack_config]]
   platform = "linux"
   snapshotter = "cfs"
+  differ = "cfs-diff"

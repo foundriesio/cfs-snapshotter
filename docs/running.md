@@ -3,9 +3,10 @@
 # Running cfs-snapshotter
 
 cfs-snapshotter is a containerd **remote (proxy) snapshotter**: a standalone
-daemon (`containerd-cfs-grpc`) that serves the containerd Snapshots gRPC API on a
-unix socket. containerd — and Docker, which uses the same containerd — is pointed
-at it through one `proxy_plugins` entry.
+daemon (`containerd-cfs-grpc`) that serves the containerd Snapshots gRPC API on
+a unix socket, and on the same socket the Diff API, through which containerd
+hands it the layers of a pull to ingest. containerd — and Docker, which uses
+the same containerd — is pointed at them through two `proxy_plugins` entries.
 
 > **Status:** the snapshotter serves real image content from a local
 > [knarr](https://github.com/foundriesio/knarr) store. A container
@@ -13,7 +14,8 @@ at it through one `proxy_plugins` entry.
 > shared by all its containers — and gets one flat overlay whose data comes
 > from the store's fs-verity-backed objects (`verity=require`). By default
 > the runtime's own pull fills the store: containerd fetches the layers as
-> it always would and the snapshotter builds them into a composefs image;
+> it always would and the snapshotter's differ ingests each one into the
+> store as it lands, building the composefs image;
 > see [Pulling without staging first](#pulling-without-staging-first). A
 > machine set up the other way (`-allow-unstaged-pulls=false`) never fills
 > the store itself: images enter it out of band via `knarr pull`, pinned by
@@ -39,8 +41,9 @@ The defaults match the config below; see `-help` for the full list.
 | `-knarr-root` | `/var/lib/knarr` | The knarr store images are served from. |
 | `-containerd-address` | `/run/containerd/containerd.sock` | containerd's gRPC socket, whose content store the layers of a staged pull are read back from. |
 | `-allow-unstaged-pulls` | `true` | Selects the machine's work mode: stage every pull through containerd's content store and build it into the knarr store, instead of admitting only images already there. `=false` selects the out-of-band mode. |
+| `-ingest-workers` | `0` (knarr's default, 2) | How many layers staged pulls ingest into the knarr store at once, across every pull in progress. Two is the gain on every platform measured; a many-core host with fast storage may take a few percent more from four. |
 | `-log-level` | `info` | `trace`, `debug`, `info`, `warn`, `error`, `fatal`, `panic`. |
-| `-check` | off | Check the runtime prerequisites and the containerd wiring instead of serving — one verdict line per aspect, non-zero exit on any failure. |
+| `-check` | off | Check the runtime prerequisites and the containerd wiring of both the snapshotter and the differ instead of serving: one verdict line per aspect, the effective ingest worker count, and a non-zero exit on any failure. |
 
 The snapshotter root hosts each container's overlay upper and work
 directories, so it must live on a regular filesystem (ext4, xfs, …) — overlay
@@ -62,6 +65,16 @@ version = 2
 [proxy_plugins.cfs.exports]
   enable_remote_snapshot_annotations = "true"
 
+# Register the cfs differ, served by the same daemon on the same socket.
+[proxy_plugins.cfs-diff]
+  type = "diff"
+  address = "/run/containerd-cfs-grpc/containerd-cfs-grpc.sock"
+
+# Docker applies layers through the diff service: cfs-diff first, which
+# takes only the cfs snapshotter's layers, then walking for everything else.
+[plugins."io.containerd.service.v1.diff-service"]
+  default = ["cfs-diff", "walking"]
+
 # `ctr pull` unpacks via the transfer service, which only unpacks for the
 # snapshotters listed here. Listing any entry replaces the built-in default,
 # so keep overlayfs alongside cfs.
@@ -72,11 +85,22 @@ version = 2
 [[plugins."io.containerd.transfer.v1.local".unpack_config]]
   platform = "linux"
   snapshotter = "cfs"
+  differ = "cfs-diff"
 ```
 
 The `enable_remote_snapshot_annotations = "true"` export is required. Without
 it, transfer-service pulls do not stamp the image identity used by the cfs
 admission gate and are declined.
+
+The `cfs-diff` entry is required for staged pulls, and it must be the differ
+containerd actually uses for the cfs snapshotter's layers: first in the diff
+service's order, which is the path Docker takes, and named by `differ` on the
+cfs `unpack_config` entry, which is the path `ctr` and CRI take. A staging
+snapshot's only mount is a placeholder no kernel can mount, so a layer routed
+to any other differ fails at once (`mount: no such device`) instead of being
+extracted somewhere the store never sees. `containerd-cfs-grpc -check` reports
+whether the differ is registered; the order and the `differ` selection are not
+visible through introspection, which is what the placeholder is for.
 
 ## 3. Configure Docker
 
@@ -147,22 +171,51 @@ docker run --rm <registry>/<repo>@sha256:<manifest-digest>
 Nothing else changes: the pull is a plain `docker pull`, with its usual
 per-layer progress, and the container gets the same mounts an out-of-band pull
 would have given it. What differs is where the content comes from. containerd
-fetches the layers it always would; the snapshotter stages each one into the
-snapshot the unpacker prepared for it, and when the chain's last layer is
-committed it builds the whole image into the knarr store — reading the layers
-back out of containerd's content store, so nothing is fetched twice — and
-discards the staged copies. From then on a container mounts the image's
-composefs like any other. A later pull of the same reference, after the
-runtime dropped it, fetches the layers again like any docker pull would — on a
-staging machine the runtime's content store keeps the layers of everything it
-lists, which is what lets a pull that extends an already-present image read
-the shared layers back instead of failing over their absence — and the
-rebuilt image converges on the same single composefs image in the store.
+fetches the layers it always would and hands each one, as it lands, to the
+snapshotter's differ, which ingests it into the knarr store's build of the
+image — reading the layer back out of containerd's content store, so nothing
+is fetched twice and nothing is staged on disk in between. The build scans
+layers ahead of the ones containerd has handed over, up to `-ingest-workers`
+at a time, so the conversion overlaps the download; when the chain's last
+layer is applied the image is finished, verified whole against the manifest
+digest, and recorded. From then on a container mounts the image's composefs
+like any other. A later pull of the same reference, after the runtime dropped
+it, fetches the layers again like any docker pull would — on a staging machine
+the runtime's content store keeps the layers of everything it lists, which is
+what lets a pull that extends an already-present image read the shared layers
+back instead of failing over their absence — and the rebuilt image converges
+on the same single composefs image in the store.
 
 The image is pinned in the store for as long as the runtime lists it. A
 `knarr remove` of an image a runtime is holding declines and names the holder;
 `docker rmi`, once containerd has forgotten the image's snapshots, drops the
 pin.
+
+A `knarr gc` while a staged pull is in progress, or shortly after one was
+interrupted, reports the store busy: the pull's build keeps the store's shared
+lock from its first applied layer until the image is finished, or until
+containerd has removed the abandoned pull's snapshots. That is expected;
+retry once the pull is over.
+
+Four residuals of routing layers through the differ are worth knowing:
+
+- After a restart of `containerd-cfs-grpc`, containerd's connection to the
+  socket takes up to 3 s to come back, and a pull that lands in that window
+  fails once. Every Docker-path layer apply tries `cfs-diff` first, so this
+  now also holds for an overlayfs pull on the same host; a retry succeeds.
+- Two concurrent pulls of the same image in one namespace converge, but the
+  losing pull's abort can interrupt the winner's layer apply once; a retry of
+  the failed pull converges.
+- A `docker rmi` followed at once by a `docker pull` of the same image can
+  collide the same way: containerd's collector removes the old pull's layer
+  records some moments after the `rmi`, and the snapshotter reads such a
+  removal as that pull being unwound, closing the build of the new pull if
+  one is under way for the same image. One layer apply of the new pull then
+  fails; a retry converges.
+- Where containerd's content store lives matters: every layer is read back
+  from it, so a slow root filesystem slows the ingest. On a device with a
+  faster secondary disk, moving containerd's root there is worth more than
+  any worker count.
 
 The two work modes are exclusive, and the flag defaults to on:
 

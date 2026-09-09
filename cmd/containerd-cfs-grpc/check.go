@@ -47,6 +47,11 @@ func runCheck(ctx context.Context, w io.Writer, cfg snapshot.Config, socketAddre
 		line(w, "1. mkcomposefs: skipped (out-of-band mode builds nothing locally)")
 		line(w, "2. fs-verity on the knarr store: skipped (out-of-band mode builds nothing locally)")
 	}
+	workers := cfg.IngestWorkers
+	if workers == 0 {
+		workers = knarr.DefaultIngestWorkers
+	}
+	line(w, "ingest workers: %d", workers)
 
 	r, reachable := containerdRound(ctx, cfg.ContainerdAddress, socketAddress)
 	if !reachable {
@@ -55,6 +60,7 @@ func runCheck(ctx context.Context, w io.Writer, cfg snapshot.Config, socketAddre
 		line(w, "4. containerd version 2.1+: not checked (containerd did not answer)")
 		line(w, "5. containerd proxy_plugins wiring: not checked (containerd did not answer)")
 		line(w, "6. enable_remote_snapshot_annotations export: not checked (containerd did not answer)")
+		line(w, "7. containerd diff proxy_plugins wiring: not checked (containerd did not answer)")
 	} else {
 		line(w, "3. containerd: ok (version %s)", r.version)
 
@@ -73,18 +79,23 @@ func runCheck(ctx context.Context, w io.Writer, cfg snapshot.Config, socketAddre
 			failed = true
 			line(w, "5. containerd proxy_plugins wiring: FAIL: cannot list containerd's plugins: %v", r.introspectErr)
 			line(w, "6. enable_remote_snapshot_annotations export: not checked (plugin listing failed)")
+			line(w, "7. containerd diff proxy_plugins wiring: not checked (plugin listing failed)")
 		case !r.wired:
 			failed = true
 			line(w, "5. containerd proxy_plugins wiring: FAIL: no proxy_plugins entry points at %s", socketAddress)
 			line(w, "6. enable_remote_snapshot_annotations export: not checked (no wiring)")
+			reportDiffer(w, r, socketAddress, cfg.AllowUnstagedPulls)
 		case !r.hasExport:
 			failed = true
 			line(w, "5. containerd proxy_plugins wiring: ok (proxy plugin %s)", r.entryID)
 			line(w, "6. enable_remote_snapshot_annotations export: FAIL: missing enable_remote_snapshot_annotations = \"true\" under [proxy_plugins.%s.exports]; pulls arrive without image identity and are declined", r.entryID)
+			reportDiffer(w, r, socketAddress, cfg.AllowUnstagedPulls)
 		default:
 			line(w, "5. containerd proxy_plugins wiring: ok (proxy plugin %s)", r.entryID)
 			line(w, "6. enable_remote_snapshot_annotations export: ok")
+			reportDiffer(w, r, socketAddress, cfg.AllowUnstagedPulls)
 		}
+		failed = failed || (cfg.AllowUnstagedPulls && !r.differWired)
 	}
 
 	if failed {
@@ -93,6 +104,24 @@ func runCheck(ctx context.Context, w io.Writer, cfg snapshot.Config, socketAddre
 	}
 	line(w, "check passed")
 	return 0
+}
+
+// reportDiffer writes the verdict on the diff proxy wiring: containerd must
+// route a staged pull's layers to this daemon's differ, or every such pull
+// fails at the staging placeholder. Whether containerd tries this differ
+// first, or names it for the transfer service's unpack, is not visible
+// through introspection; the placeholder is what enforces it. Out-of-band
+// mode applies no layers, so the entry is not checked there.
+func reportDiffer(w io.Writer, r probeResult, socketAddress string, staged bool) {
+	if !staged {
+		line(w, "7. containerd diff proxy_plugins wiring: skipped (out-of-band mode applies no layers)")
+		return
+	}
+	if !r.differWired {
+		line(w, "7. containerd diff proxy_plugins wiring: FAIL: no proxy_plugins entry of type \"diff\" points at %s; staged pulls fail at the layer apply", socketAddress)
+		return
+	}
+	line(w, "7. containerd diff proxy_plugins wiring: ok (proxy plugin %s)", r.differID)
 }
 
 // line writes one verdict line to the report. The writer is stdout or a test

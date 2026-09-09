@@ -2,10 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // Command containerd-cfs-grpc is the cfs-snapshotter daemon: a containerd
-// remote (proxy) snapshotter exposed over a gRPC unix socket. containerd is
-// pointed at it via a [proxy_plugins.cfs] entry in its config.toml (see
-// docs/running.md). Image content is served from composefs images in the local
-// knarr store.
+// remote (proxy) snapshotter and the differ that ingests its staged pulls,
+// both exposed over one gRPC unix socket. containerd is pointed at them via
+// the [proxy_plugins.cfs] and [proxy_plugins.cfs-diff] entries in its
+// config.toml (see docs/running.md). Image content is served from composefs
+// images in the local knarr store.
 package main
 
 import (
@@ -19,9 +20,11 @@ import (
 	"path/filepath"
 	"time"
 
+	diffapi "github.com/containerd/containerd/api/services/diff/v1"
 	snapshotsapi "github.com/containerd/containerd/api/services/snapshots/v1"
 	"github.com/containerd/containerd/v2/contrib/snapshotservice"
 	"github.com/containerd/log"
+	"github.com/foundriesio/knarr/pkg/knarr"
 	"golang.org/x/sys/unix"
 	"google.golang.org/grpc"
 
@@ -40,6 +43,7 @@ var (
 	knarrRoot          = flag.String("knarr-root", "/var/lib/knarr", "path to the shared knarr image store root")
 	containerdAddress  = flag.String("containerd-address", "/run/containerd/containerd.sock", "address of containerd's gRPC server")
 	allowUnstagedPulls = flag.Bool("allow-unstaged-pulls", true, "stage every pull through containerd's content store and build it into the knarr store, instead of admitting only images already there")
+	ingestWorkers      = flag.Int("ingest-workers", 0, fmt.Sprintf("number of layers a staged pull ingests into the knarr store at once, across all pulls in progress (0 selects the default of %d)", knarr.DefaultIngestWorkers))
 	logLevel           = flag.String("log-level", log.InfoLevel.String(), "logging level [trace, debug, info, warn, error, fatal, panic]")
 	printVersion       = flag.Bool("version", false, "print the version and exit")
 	runChecks          = flag.Bool("check", false, "check the runtime prerequisites and the containerd wiring instead of serving, and exit non-zero on any failure")
@@ -68,6 +72,7 @@ func main() {
 		KnarrRoot:          *knarrRoot,
 		AllowUnstagedPulls: *allowUnstagedPulls,
 		ContainerdAddress:  *containerdAddress,
+		IngestWorkers:      *ingestWorkers,
 	}
 	if *runChecks {
 		// Bounded: a check answers now, it does not wait for containerd the
@@ -93,8 +98,8 @@ func main() {
 // cannot succeed until an administrator fixes the host or containerd.
 const exitPrerequisites = 3
 
-// run builds the snapshotter, serves it over a gRPC unix socket, and blocks
-// until SIGINT/SIGTERM, then shuts down gracefully.
+// run builds the snapshotter, serves it and its differ over a gRPC unix
+// socket, and blocks until SIGINT/SIGTERM, then shuts down gracefully.
 func run(ctx context.Context, address string, cfg snapshot.Config) error {
 	sn, err := snapshot.NewSnapshotter(ctx, cfg)
 	if err != nil {
@@ -118,6 +123,7 @@ func run(ctx context.Context, address string, cfg snapshot.Config) error {
 
 	server := grpc.NewServer()
 	snapshotsapi.RegisterSnapshotsServer(server, snapshotservice.FromSnapshotter(sn))
+	diffapi.RegisterDiffServer(server, newDiffServer(sn))
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -132,7 +138,7 @@ func run(ctx context.Context, address string, cfg snapshot.Config) error {
 	// the same error path as any other startup failure.
 	probeErrCh := make(chan error, 1)
 	go func() {
-		if probeErr := probeContainerd(ctx, cfg.ContainerdAddress, address); probeErr != nil {
+		if probeErr := probeContainerd(ctx, cfg.ContainerdAddress, address, cfg.AllowUnstagedPulls); probeErr != nil {
 			probeErrCh <- probeErr
 		}
 	}()

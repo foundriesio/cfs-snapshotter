@@ -138,15 +138,20 @@ Apply it one of two ways, then `sudo systemctl restart containerd`:
   sudo tee -a /etc/containerd/config.toml < /usr/share/doc/cfs-snapshotter/containerd-cfs.toml
   ```
 
-After the restart, containerd must list the plugin:
+After the restart, containerd must list both plugins — the snapshotter
+and the differ, which the same daemon serves on the same socket:
 
 ```sh
-sudo ctr plugins ls | grep cfs    # io.containerd.snapshotter.v1  cfs  -  ok
+sudo ctr plugins ls | grep cfs
+# io.containerd.snapshotter.v1  cfs       -            ok
+# io.containerd.differ.v1       cfs-diff  linux/amd64  ok
 ```
 
 No `cfs` row means containerd did not read the block — recheck the
 `imports` placement above, or `sudo containerd config dump | grep -A3
-proxy_plugins` to see what it actually merged.
+proxy_plugins` to see what it actually merged. A `cfs` row without a
+`cfs-diff` row means an older version of the block is in place: every
+staged pull then fails at the layer apply until the differ is wired in.
 
 The package never edits `/etc/containerd/config.toml` itself: the file
 belongs to containerd, and the `unpack_config` list below *replaces*
@@ -165,6 +170,16 @@ version = 2
 [proxy_plugins.cfs.exports]
   enable_remote_snapshot_annotations = "true"
 
+# Register the cfs differ, served by the same daemon on the same socket.
+[proxy_plugins.cfs-diff]
+  type = "diff"
+  address = "/run/containerd-cfs-grpc/containerd-cfs-grpc.sock"
+
+# Docker applies layers through the diff service: cfs-diff first, which
+# takes only the cfs snapshotter's layers, then walking for everything else.
+[plugins."io.containerd.service.v1.diff-service"]
+  default = ["cfs-diff", "walking"]
+
 # `ctr pull` unpacks via the transfer service, which only unpacks for the
 # snapshotters listed here. Listing any entry replaces the built-in default,
 # so keep overlayfs alongside cfs.
@@ -175,6 +190,7 @@ version = 2
 [[plugins."io.containerd.transfer.v1.local".unpack_config]]
   platform = "linux"
   snapshotter = "cfs"
+  differ = "cfs-diff"
 ```
 
 For Docker (which shares the system containerd), also enable the
@@ -226,8 +242,9 @@ that appears *after* a healthy start only degrades the status, and
 there fixing containerd and restarting *containerd alone* is enough —
 the status flips back to ok by itself.
 
-The pull is staged and built into the knarr store by the snapshotter, and
-the container's root filesystem is served from it as a composefs mount.
+The pull's layers are ingested into the knarr store by the snapshotter's
+differ as containerd fetches them, and the container's root filesystem
+is served from the store as a composefs mount.
 
 ## Runtime requirements
 
