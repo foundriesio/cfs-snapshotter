@@ -40,6 +40,9 @@ jobs:
         run: git config --global url."https://x-access-token:${{ secrets.KNARR_TOKEN }}@github.com/foundriesio/".insteadOf "https://github.com/foundriesio/"
       - run: make vet
       - run: make test
+      # The snapshotter feeds layers to the knarr store from several workers,
+      # so the unit tests also run under the race detector.
+      - run: GOFLAGS=-race make test
       - run: make build
 
   lint:
