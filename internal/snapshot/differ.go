@@ -5,6 +5,7 @@ package snapshot
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"slices"
@@ -54,9 +55,10 @@ var _ diff.Applier = (*snapshotter)(nil)
 // containerd's content store, where the fetch has just put it. Ingest blocks
 // until the layer is in the store and returns its verification failure, so
 // a layer containerd goes on to commit is one the store holds and verified.
-// The last layer also finishes the build, which records the image, and is
-// marked as such on its record first, so the Commit that follows — inside
-// containerd's transaction — pins the image without reading anything.
+// The last layer also finishes the build, which holds the image under the
+// build's holder, and is marked as such on its record first — along with the
+// image's identity and that holder — so the Commit that follows, inside
+// containerd's transaction, files the record without touching the store.
 // Mounts of any other shape belong to another snapshotter's pull and are
 // declined, so a diff service that tries this differ first falls through to
 // the next.
@@ -82,15 +84,20 @@ func (s *snapshotter) Apply(ctx context.Context, desc ocispec.Descriptor, mounts
 	if err := layer.bind(desc); err != nil {
 		return ocispec.Descriptor{}, err
 	}
-	if layer.leaf {
-		if err := s.markLeaf(ctx, key); err != nil {
-			return ocispec.Descriptor{}, err
-		}
-	}
-
-	b, err := s.buildFor(ctx, ns, layer)
+	b, err := s.buildFor(ctx, ns, key, layer)
 	if err != nil {
 		return ocispec.Descriptor{}, err
+	}
+	if layer.leaf {
+		// buildFor moved the last layer's build to finishing under this key;
+		// it leaves when this apply is over, or when a Remove of the record
+		// takes and closes it meanwhile — in which case it is not here to
+		// take, and nothing more is owed.
+		defer s.takeFinishing(key)
+		if err := s.markLeaf(ctx, key, layer.root, b.holder); err != nil {
+			closeBuilds(s.takeFinishing(key))
+			return ocispec.Descriptor{}, err
+		}
 	}
 	if err := s.ingest(ctx, ns, b, layer); err != nil {
 		return ocispec.Descriptor{}, fmt.Errorf("build image %q from the staged layers of chain %s: %w", layer.imageRef, layer.chainID, err)
@@ -125,12 +132,19 @@ func (s *snapshotter) stagingLabels(ctx context.Context, key string) (map[string
 }
 
 // markLeaf records on the staging snapshot under key that its layer is the
-// image's last. The marker is written before the layer is ingested, so it is
-// on the record whenever a Commit arrives — after a daemon restart included.
-func (s *snapshotter) markLeaf(ctx context.Context, key string) error {
+// image's last, which image that is, and the holder the build finishing it
+// holds the image under. The markers are written before the layer is
+// ingested, so they are on the record whenever a Commit arrives — after a
+// daemon restart included — and the record releases the holder when it is
+// removed uncommitted, as an unwound pull's is.
+func (s *snapshotter) markLeaf(ctx context.Context, key string, root digest.Digest, holder string) error {
 	err := s.ms.WithTransaction(ctx, true, func(ctx context.Context) error {
-		mark := snapshots.Info{Name: key, Labels: map[string]string{leafLabel: "true"}}
-		_, err := storage.UpdateInfo(ctx, mark, "labels."+leafLabel)
+		mark := snapshots.Info{Name: key, Labels: map[string]string{
+			leafLabel:       "true",
+			rootDigestLabel: root.String(),
+			holderLabel:     holder,
+		}}
+		_, err := storage.UpdateInfo(ctx, mark, "labels."+leafLabel, "labels."+rootDigestLabel, "labels."+holderLabel)
 		return err
 	})
 	if err != nil {
@@ -246,35 +260,52 @@ type buildKey struct {
 	root      string
 }
 
-// openBuild is an image build in progress and the chain identity of the
-// image's last layer, which is where the build finishes.
+// openBuild is an image build in progress, the chain identity of the
+// image's last layer, which is where the build finishes, and the holder the
+// finished image is held under.
 type openBuild struct {
-	build knarr.Build
-	leaf  string
+	build  knarr.Build
+	leaf   string
+	holder string
+}
+
+// buildHolder names the hold a build takes on the image it finishes, after
+// the staging snapshot whose layer started the build: containerd files one
+// such key per pull, so two pulls of one image — in one namespace or two —
+// never share a holder, and removing the record of one leaves the other's
+// hold standing. The key carries characters a holder name may not, so it is
+// hashed.
+func buildHolder(ns, key string) string {
+	return fmt.Sprintf("cfs-build-%x", sha256.Sum256([]byte(ns+"/"+key)))
 }
 
 // buildFor returns the build of the image a staged layer belongs to, starting
 // one when none is open. A pull whose earlier layers went through a previous
 // build — resumed after a restart, or after another pull of the same image
 // was aborted — gets a new one, which catches up on those layers from the
-// content store. The last layer's build leaves the map here: the Finish that
-// spends it happens outside buildMu, and a duplicate pull arriving at the
-// leaf meanwhile starts a build of its own rather than sharing a spent one.
-func (s *snapshotter) buildFor(ctx context.Context, ns string, layer stagedLayer) (*openBuild, error) {
+// content store. The last layer's build moves from the map to finishing, under
+// the layer's staging key, in one step: the Finish that spends it happens
+// outside buildMu, and a duplicate pull arriving at the leaf meanwhile starts
+// a build of its own rather than sharing a spent one, while a Remove of the
+// staging record finds the build under its key from this instant on.
+func (s *snapshotter) buildFor(ctx context.Context, ns, key string, layer stagedLayer) (*openBuild, error) {
 	s.buildMu.Lock()
 	defer s.buildMu.Unlock()
-	key := buildKey{namespace: ns, root: layer.root.String()}
-	b, ok := s.builds[key]
+	bk := buildKey{namespace: ns, root: layer.root.String()}
+	b, ok := s.builds[bk]
 	if !ok {
-		build, err := s.engine.NewBuild(ctx, layer.imageRef, knarr.WithBlobSource(s.blobs), knarr.WithResolvedRoot(layer.root))
+		holder := buildHolder(ns, key)
+		build, err := s.engine.NewBuild(ctx, layer.imageRef,
+			knarr.WithBlobSource(s.blobs), knarr.WithResolvedRoot(layer.root), knarr.WithHold(holder))
 		if err != nil {
 			return nil, fmt.Errorf("begin building image %q from its staged layers: %w", layer.imageRef, err)
 		}
-		b = &openBuild{build: build, leaf: layer.leafChain}
-		s.builds[key] = b
+		b = &openBuild{build: build, leaf: layer.leafChain, holder: holder}
+		s.builds[bk] = b
 	}
 	if layer.leaf {
-		delete(s.builds, key)
+		delete(s.builds, bk)
+		s.finishing[key] = b
 	}
 	return b, nil
 }
@@ -317,7 +348,10 @@ func (s *snapshotter) abandonBuild(ctx context.Context, key buildKey, b *openBui
 // to, if one is in progress. A staged record still anchored on a manifest is
 // one the runtime is unwinding: its abort removes the active snapshot, and
 // the garbage collector removes the committed layers below it afterwards.
-// Either closes the pull's build, which nothing will finish now. The
+// Either closes the pull's build, which nothing will finish now. A build
+// applying its last layer under the removed record is closed too, which
+// waits for a finish already under way: once it returns, the hold that
+// finish took, if it did, is there for the caller to release. The
 // collector's context names no namespace, so it is read from the key, which
 // containerd prefixes with the namespace for every record it files with a
 // backend; a key without one is not such a record.
@@ -331,12 +365,29 @@ func (s *snapshotter) closeStagedBuild(ctx context.Context, key string, labels m
 	}
 	bk := buildKey{namespace: ns, root: labels[manifestDigestLabel]}
 	taken := s.takeBuilds(func(k buildKey, _ *openBuild) bool { return k == bk })
+	taken = append(taken, s.takeFinishing(key)...)
 	if len(taken) == 0 {
 		return
 	}
 	closeBuilds(taken)
 	log.G(ctx).WithFields(log.Fields{"namespace": ns, "root": bk.root}).
 		Debug("cfs snapshotter: abandoned image build")
+}
+
+// takeFinishing removes and returns the build finishing under key, or every
+// finishing build when key is empty. Like takeBuilds, it only takes: the
+// caller closes what it took after the lock is released.
+func (s *snapshotter) takeFinishing(key string) []*openBuild {
+	s.buildMu.Lock()
+	defer s.buildMu.Unlock()
+	var taken []*openBuild
+	for k, b := range s.finishing {
+		if key == "" || k == key {
+			taken = append(taken, b)
+			delete(s.finishing, k)
+		}
+	}
+	return taken
 }
 
 // takeBuilds removes the builds keep selects from the map and returns them.

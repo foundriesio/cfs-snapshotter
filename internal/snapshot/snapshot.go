@@ -200,6 +200,12 @@ type snapshotter struct {
 	// never held across a write transaction, for the reason given at mounts.
 	buildMu sync.Mutex
 	builds  map[buildKey]*openBuild
+	// finishing are the builds whose last layer is being applied, keyed by
+	// that layer's staging snapshot: out of builds, so a duplicate pull
+	// reaching the leaf starts a build of its own, but findable by the
+	// record containerd removes if it unwinds the pull meanwhile. buildMu
+	// guards it too.
+	finishing map[string]*openBuild
 }
 
 // Compile-time assertion that *snapshotter satisfies the containerd interface.
@@ -295,6 +301,7 @@ func newSnapshotter(ctx context.Context, cfg Config, engine engineAPI) (*snapsho
 		mounted:            mountinfo.Mounted,
 		allowUnstagedPulls: cfg.AllowUnstagedPulls,
 		builds:             make(map[buildKey]*openBuild),
+		finishing:          make(map[string]*openBuild),
 	}, nil
 }
 
@@ -522,14 +529,15 @@ func (s *snapshotter) View(ctx context.Context, key, parent string, opts ...snap
 // it stands for is its snapshot.ref label — never the name, which is
 // containerd's own bookkeeping — and whether that chain is the image's last
 // is the leaf marker the differ left. Everything but the last layer is filed
-// as it stands; the last one is where the image, finished by the differ, is
-// pinned in the store for as long as containerd references it and its record
-// becomes an image chain member — from which instant a mount over it composes
-// the image. The hold is taken before the record and given back if the record
-// fails to land, so no hold outlives the record that would release it. A
-// staged Commit needs no build to be open: after a restart between a layer's
-// Apply and its Commit, the next Apply starts a build that catches up from
-// the content store.
+// as it stands; the last one's record becomes an image chain member — from
+// which instant a mount over it composes the image — carrying the image's
+// identity and the holder the build that finished the image holds it under,
+// both left on the staging record by the differ. The hold keeps the image
+// for as long as containerd references the record, which releases it when
+// removed; Commit itself touches the store not at all. A staged Commit needs
+// no build to be open: after a restart between a layer's Apply and its
+// Commit, the next Apply starts a build that catches up from the content
+// store.
 func (s *snapshotter) Commit(ctx context.Context, name, key string, opts ...snapshots.Opt) error {
 	log.G(ctx).WithFields(log.Fields{"name": name, "key": key}).
 		WithFields(optFields(opts)).Trace("cfs snapshotter: commit")
@@ -548,12 +556,15 @@ func (s *snapshotter) Commit(ctx context.Context, name, key string, opts ...snap
 
 	start := time.Now()
 	leaf := labels[leafLabel] != ""
+	var private map[string]string
 	if leaf {
-		err = s.commitLeaf(ctx, name, key, labels, opts)
-	} else {
-		err = s.commitRecord(ctx, name, key, nil, opts)
+		private = map[string]string{
+			chainMemberLabel: "true",
+			rootDigestLabel:  labels[rootDigestLabel],
+			holderLabel:      labels[holderLabel],
+		}
 	}
-	if err != nil {
+	if err := s.commitRecord(ctx, name, key, private, opts); err != nil {
 		return err
 	}
 	log.G(ctx).WithFields(log.Fields{
@@ -562,31 +573,6 @@ func (s *snapshotter) Commit(ctx context.Context, name, key string, opts ...snap
 		"leaf":    leaf,
 		"elapsed": time.Since(start).Seconds(),
 	}).Info("cfs snapshotter: committed staged layer")
-	return nil
-}
-
-// commitLeaf pins the image a staged chain's last layer completes and files
-// the record as an image chain member. The image is the manifest digest the
-// runtime stamped the record with; a hold on an image the store does not hold
-// fails, so a leaf whose build did not finish is refused rather than
-// recorded.
-func (s *snapshotter) commitLeaf(ctx context.Context, name, key string, labels map[string]string, opts []snapshots.Opt) error {
-	root := labels[manifestDigestLabel]
-	holder := recordHolder(name)
-	if err := s.engine.Hold(ctx, root, holder); err != nil {
-		return fmt.Errorf("hold image %q: %w", labels[imageRefLabel], err)
-	}
-	private := map[string]string{chainMemberLabel: "true", rootDigestLabel: root, holderLabel: holder}
-	if err := s.commitRecord(ctx, name, key, private, opts); err != nil {
-		// No record carries this holder, so nothing would ever release it. A
-		// record that already exists is not such a case: the holder is named
-		// after the record, so the hold this call took is the one that record
-		// already stands for.
-		if !errdefs.IsAlreadyExists(err) {
-			s.releaseHold(ctx, root, holder)
-		}
-		return err
-	}
 	return nil
 }
 
@@ -604,7 +590,9 @@ func (s *snapshotter) commitLeaf(ctx context.Context, name, key string, labels m
 // standing for the same image, leaves the other holds in place; the image is
 // let go once containerd has forgotten the last of them. A staged record of a
 // pull still in progress belongs to a pull the runtime is unwinding, and its
-// build is abandoned along with it (see closeStagedBuild).
+// build is abandoned along with it (see closeStagedBuild); the last layer's
+// staging record carries the holder its build holds the image under, so an
+// image finished but never committed is released the same way.
 func (s *snapshotter) Remove(ctx context.Context, key string) (err error) {
 	log.G(ctx).WithField("key", key).Trace("cfs snapshotter: remove")
 	var (
@@ -658,11 +646,15 @@ func (s *snapshotter) Remove(ctx context.Context, key string) (err error) {
 			log.G(ctx).WithError(err).WithField("path", renamed).Warn("failed to remove snapshot directory")
 		}
 	}
+	// The pull's build, if one is still running, is closed before the hold is
+	// released: a build finishing its image takes the hold as it completes,
+	// and a release before that would find nothing and leave the hold that
+	// lands after it with nothing to release it.
+	s.closeStagedBuild(ctx, key, labels)
 	// A record that took a hold carries both labels, written together.
 	if root := labels[rootDigestLabel]; root != "" {
 		s.releaseHold(ctx, root, labels[holderLabel])
 	}
-	s.closeStagedBuild(ctx, key, labels)
 	return nil
 }
 
@@ -694,6 +686,7 @@ func (s *snapshotter) Walk(ctx context.Context, fn snapshots.WalkFunc, filters .
 func (s *snapshotter) Close() error {
 	log.L.Trace("cfs snapshotter: close")
 	closeBuilds(s.takeBuilds(func(buildKey, *openBuild) bool { return true }))
+	closeBuilds(s.takeFinishing(""))
 	err := s.blobs.Close()
 	if s.ms != nil {
 		err = errors.Join(err, s.ms.Close())
