@@ -186,10 +186,42 @@ what lets a pull that extends an already-present image read the shared layers
 back instead of failing over their absence — and the rebuilt image converges
 on the same single composefs image in the store.
 
-The image is pinned in the store for as long as the runtime lists it. A
-`knarr remove` of an image a runtime is holding declines and names the holder;
-`docker rmi`, once containerd has forgotten the image's snapshots, drops the
-pin.
+The image is the runtime's: the store keeps it by the snapshotter's hold, for
+as long as the runtime lists it, and names it by a *runtime reference* — the
+reference docker pulled, recorded for that holder. `knarr ls` shows the row
+like any other (with the holder in `--format json`), and `knarr inspect`,
+`knarr mount` and `knarr hold` resolve the name; what the name does not do is
+keep the image, and `knarr remove` of it declines while the runtime's hold
+stands. `docker image rm` is what removes it: containerd forgets the image's
+snapshots, the snapshotter releases its hold and collects the store, and the
+removal waits for that, so by the time the command returns the image and its
+name are gone from `knarr ls` and its objects — those no other image shares —
+are reclaimed from disk. An image `knarr pull` put in the store is an agent's,
+and a runtime removal never touches it: its reference keeps it, and only the
+hold the runtime took is dropped. An agent that wants a runtime-pulled image
+kept adopts it — `knarr pull` of the name replaces the runtime's reference
+with the agent's — or holds it; once it releases such a hold, it collects
+with `knarr gc` — reclaiming what an agent let go is the agent's call, not
+the snapshotter's. A runtime pull never displaces a reference the agent
+recorded for the same name: the image is then held but not named.
+
+The store is also collected after every pull, whether it finished or was
+abandoned: a pull writes every file of every layer, and the files a later
+layer replaced or removed are objects no image references, so the daemon
+collects them in the background as soon as the image is built. A collection
+that finds the store busy — a pull or a mount in flight — is retried by the
+daemon shortly after, so a removal during a pull reclaims a little later than
+the command's return. A collection that fails for any
+other reason is logged and does not fail the docker command; nothing of it
+reaches the docker CLI. A hold of the snapshotter's own that no record owns —
+what a crash between a finished build and its record leaves behind — is
+released when the daemon next starts, which then collects once. An image whose whole layer chain is a
+prefix of another image the runtime still lists stays in the store with that
+image: containerd keeps its last record as the other's ancestor, and both are
+reclaimed when the other goes. The collection is a walk of the whole store,
+not a delete proportional to the image, so `docker image rm` costs a store
+walk. `docker images` reports a staged image's size as its composefs
+metadata, not its content.
 
 A `knarr gc` while a staged pull is in progress, or shortly after one was
 interrupted, reports the store busy: the pull's build keeps the store's shared
