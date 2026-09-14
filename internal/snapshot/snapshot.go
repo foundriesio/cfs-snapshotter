@@ -57,7 +57,8 @@
 // it, feeding the fetched layer straight from containerd's content store into
 // the knarr store's build of the image; a containerd that routes the layer to
 // another differ fails at the placeholder instead of extracting into nothing.
-// Commit then files the record, and the chain's last Commit pins the image.
+// Commit then files the record; the chain's last Apply, finishing the build,
+// pins the image, and its Commit files the labels that name that hold.
 //
 // Container creation (the docker daemon, via containerd) prepares two
 // snapshots on top of the image's full chain:
@@ -87,6 +88,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/containerd/containerd/v2/core/diff"
@@ -97,6 +99,7 @@ import (
 	"github.com/containerd/log"
 	"github.com/foundriesio/knarr/pkg/knarr"
 	"github.com/moby/sys/mountinfo"
+	"github.com/opencontainers/go-digest"
 
 	"github.com/containerd/continuity/fs"
 )
@@ -168,8 +171,17 @@ const (
 // holderLabel, so a release names the hold that record took rather than
 // re-deriving it.
 func recordHolder(name string) string {
-	return fmt.Sprintf("cfs-%x", sha256.Sum256([]byte(name)))
+	return fmt.Sprintf("%s%x", holderPrefix, sha256.Sum256([]byte(name)))
 }
+
+// holderPrefix starts every holder name this snapshotter takes, so a holder
+// of its own can be told from an agent's when holds are reconciled at
+// startup.
+const holderPrefix = "cfs-"
+
+// gcRetryInterval paces the collections retried after the knarr store
+// reported itself busy.
+var gcRetryInterval = 30 * time.Second
 
 // snapshotter is the cfs-snapshotter implementation of snapshots.Snapshotter.
 type snapshotter struct {
@@ -206,7 +218,25 @@ type snapshotter struct {
 	// record containerd removes if it unwinds the pull meanwhile. buildMu
 	// guards it too.
 	finishing map[string]*openBuild
+	// dirty records that a hold was released, or a build ended, since the
+	// store was last collected, so a collection has something to reclaim.
+	// Collections run under reclaimMu — from Cleanup, on containerd's cycle,
+	// and from the reclaim goroutine — on lifetime, the context Close
+	// cancels before it waits for that goroutine. Neither channel is ever
+	// closed: kick wakes the goroutine to collect now, retry to collect once
+	// the interval has passed after a busy store.
+	reclaimMu sync.Mutex
+	dirty     atomic.Bool
+	kick      chan struct{}
+	retry     chan struct{}
+	lifetime  context.Context
+	cancel    context.CancelFunc
+	wg        sync.WaitGroup
 }
+
+// Compile-time assertion that *snapshotter collects on containerd's cleanup
+// cycle.
+var _ snapshots.Cleaner = (*snapshotter)(nil)
 
 // Compile-time assertion that *snapshotter satisfies the containerd interface.
 var _ snapshots.Snapshotter = (*snapshotter)(nil)
@@ -216,6 +246,7 @@ var _ snapshots.Snapshotter = (*snapshotter)(nil)
 // one object because the differ works on the snapshotter's own records.
 type Snapshotter interface {
 	snapshots.Snapshotter
+	snapshots.Cleaner
 	diff.Applier
 }
 
@@ -292,7 +323,8 @@ func newSnapshotter(ctx context.Context, cfg Config, engine engineAPI) (*snapsho
 	if err := os.Mkdir(filepath.Join(root, "snapshots"), 0700); err != nil && !os.IsExist(err) {
 		return nil, fmt.Errorf("cfs snapshotter: create snapshots dir: %w", err)
 	}
-	return &snapshotter{
+	lifetime, cancel := context.WithCancel(context.Background())
+	s := &snapshotter{
 		root:               root,
 		objectsDir:         objectsDir,
 		ms:                 ms,
@@ -302,27 +334,176 @@ func newSnapshotter(ctx context.Context, cfg Config, engine engineAPI) (*snapsho
 		allowUnstagedPulls: cfg.AllowUnstagedPulls,
 		builds:             make(map[buildKey]*openBuild),
 		finishing:          make(map[string]*openBuild),
-	}, nil
+		kick:               make(chan struct{}, 1),
+		retry:              make(chan struct{}, 1),
+		lifetime:           lifetime,
+		cancel:             cancel,
+	}
+	// A previous run may have left holds behind — a build finished but never
+	// committed, a record that never landed — and the flag that says there is
+	// something to collect does not survive a restart; reconcile, then have
+	// the first collection run unconditionally.
+	if err := s.reconcileHolds(ctx); err != nil {
+		log.G(ctx).WithError(err).Error("cfs snapshotter: cannot reconcile the store's holds; leaked holds stay until the next start")
+	}
+	s.dirty.Store(true)
+	s.wg.Add(1)
+	go s.reclaim()
+	return s, nil
+}
+
+// reconcileHolds releases every hold this snapshotter took that no record of
+// its owns any more. The records are the intent: a committed leaf carries the
+// holder its image is held under, and so does the staging record of a leaf
+// applied but not yet committed; a holder of this snapshotter's that no
+// record names was stranded by a crash between the hold and its record, or
+// by a build that finished for a pull the runtime then dropped. Holders that
+// are not this snapshotter's are left alone.
+func (s *snapshotter) reconcileHolds(ctx context.Context) error {
+	owned := map[string]struct{}{}
+	err := s.ms.WithTransaction(ctx, false, func(ctx context.Context) error {
+		return storage.WalkInfo(ctx, func(_ context.Context, info snapshots.Info) error {
+			if holder := info.Labels[holderLabel]; holder != "" {
+				owned[holder] = struct{}{}
+			}
+			return nil
+		})
+	})
+	if err != nil {
+		return fmt.Errorf("walk snapshot records: %w", err)
+	}
+	held, err := s.engine.Holds(ctx)
+	if err != nil {
+		return err
+	}
+	for root, holders := range held {
+		for _, holder := range holders {
+			if !strings.HasPrefix(holder, holderPrefix) {
+				continue
+			}
+			if _, ok := owned[holder]; ok {
+				continue
+			}
+			log.G(ctx).WithFields(log.Fields{"digest": root, "holder": holder}).
+				Info("cfs snapshotter: releasing a hold no snapshot record owns")
+			s.releaseHold(ctx, root.String(), holder)
+		}
+	}
+	return nil
+}
+
+// Cleanup collects the knarr store once the runtime has dropped an image.
+// containerd calls it at the end of each of its own collection cycles, after
+// the Remove of every record that cycle pruned, and — for an image removal
+// the client asked to be synchronous, as docker's is — waits for it, so the
+// store is reclaimed by the time the client's command returns. The
+// collection runs on the snapshotter's own context: the RPC's only waits.
+func (s *snapshotter) Cleanup(ctx context.Context) error {
+	log.G(ctx).Trace("cfs snapshotter: cleanup")
+	return s.collect()
+}
+
+// collectSoon marks the store to be collected and wakes the reclaim
+// goroutine to do it. A build that ended is what calls it: finished or not,
+// the build wrote every file of every layer it saw, and the files a later
+// layer replaced or removed are objects no image references.
+func (s *snapshotter) collectSoon() {
+	s.dirty.Store(true)
+	select {
+	case s.kick <- struct{}{}:
+	default:
+	}
+}
+
+// collect runs one collection of the knarr store if a hold was released, or
+// a build ended, since the last one. A store busy with a pull, hold or mount
+// defers the collection to the reclaim goroutine — the removal that made it
+// necessary has already happened, only the reclaiming waits — while any
+// other failure is reported and not retried: a store the collector cannot
+// enumerate fails the same way every time, and is fixed by hand, not by
+// re-walking it.
+func (s *snapshotter) collect() error {
+	s.reclaimMu.Lock()
+	defer s.reclaimMu.Unlock()
+	if !s.dirty.Swap(false) {
+		return nil
+	}
+	report, err := s.engine.GC(s.lifetime)
+	switch {
+	case errors.Is(err, knarr.ErrStoreBusy):
+		s.dirty.Store(true)
+		select {
+		case s.retry <- struct{}{}:
+		default:
+		}
+		log.L.WithError(err).Debug("cfs snapshotter: store busy, collection deferred")
+		return nil
+	case s.lifetime.Err() != nil:
+		return nil
+	case err != nil:
+		log.L.WithError(err).Error("cfs snapshotter: store collection failed")
+		return fmt.Errorf("collect the knarr store: %w", err)
+	}
+	entry := log.L.WithFields(log.Fields{
+		"objects":  report.ObjectsRemoved,
+		"bytes":    report.BytesFreed,
+		"bindings": report.BindingsRemoved,
+		"in_use":   report.InUseSkipped,
+	})
+	if report.ObjectsRemoved > 0 || report.BindingsRemoved > 0 {
+		entry.Info("cfs snapshotter: collected the store")
+	} else {
+		entry.Debug("cfs snapshotter: collected the store")
+	}
+	return nil
+}
+
+// reclaim is the collector's goroutine: it runs the first collection of the
+// snapshotter's life, then one on every kick, and one after each interval a
+// collection asked for by finding the store busy. It exits when the
+// snapshotter closes.
+func (s *snapshotter) reclaim() {
+	defer s.wg.Done()
+	_ = s.collect()
+	for {
+		select {
+		case <-s.lifetime.Done():
+			return
+		case <-s.kick:
+		case <-s.retry:
+			select {
+			case <-s.lifetime.Done():
+				return
+			case <-time.After(gcRetryInterval):
+			}
+		}
+		_ = s.collect()
+	}
 }
 
 // engineAPI is the subset of knarr.Engine the snapshotter uses: reading the
 // local store (Inspect, ObjectsDir), mounting an image chain from it
 // (MountChain, Unmount), building an image out of layers the runtime fetches
-// (NewBuild), and pinning what it hands containerd for as long as containerd
-// references it (Hold, Release). Building happens in the differ's Apply, a
-// layer at a time as the runtime fetches the chain; a Prepare still never
-// reaches for content over the network.
+// (NewBuild), pinning what it hands containerd for as long as containerd
+// references it (Hold, Release, and Holds to reconcile them at startup), and
+// reclaiming what nothing pins any more (GC). Building happens in the
+// differ's Apply, a layer at a time as the runtime fetches the chain; a
+// Prepare still never reaches for content over the network.
 // Publish and Remove are deliberately excluded — the snapshotter publishes
-// nothing and deletes nobody's image — so snapshotter code cannot casually
-// reach for them. The narrow surface is also the seam the tests fake.
+// nothing and forgets nobody's reference — so snapshotter code cannot
+// casually reach for them: the one thing that deletes image data is the
+// collector, which reclaims only what no reference and no hold wants. The
+// narrow surface is also the seam the tests fake.
 type engineAPI interface {
 	Inspect(ctx context.Context, ref string) (*knarr.ImageInfo, error)
 	NewBuild(ctx context.Context, ref string, opts ...knarr.PullOption) (knarr.Build, error)
 	Hold(ctx context.Context, ref, holder string) error
 	Release(ctx context.Context, ref, holder string) error
+	Holds(ctx context.Context) (map[digest.Digest][]string, error)
 	MountChain(ctx context.Context, chainID, target string, opts ...knarr.MountOption) error
 	Unmount(ctx context.Context, target string) error
 	ObjectsDir() (string, error)
+	GC(ctx context.Context, opts ...knarr.GCOption) (*knarr.GCReport, error)
 }
 
 // Stat returns the info for an active or committed snapshot by key. It is the
@@ -651,9 +832,11 @@ func (s *snapshotter) Remove(ctx context.Context, key string) (err error) {
 	// and a release before that would find nothing and leave the hold that
 	// lands after it with nothing to release it.
 	s.closeStagedBuild(ctx, key, labels)
-	// A record that took a hold carries both labels, written together.
+	// A record that took a hold carries both labels, written together. What
+	// the release leaves unwanted is the next collection's to reclaim.
 	if root := labels[rootDigestLabel]; root != "" {
 		s.releaseHold(ctx, root, labels[holderLabel])
+		s.dirty.Store(true)
 	}
 	return nil
 }
@@ -680,11 +863,14 @@ func (s *snapshotter) Walk(ctx context.Context, fn snapshots.WalkFunc, filters .
 	})
 }
 
-// Close abandons the image builds in progress and releases the snapshotter's
-// metadata store and the containerd connection it reads image blobs over. It
-// is safe to call on an already-closed snapshotter.
+// Close stops the store collector, abandons the image builds in progress and
+// releases the snapshotter's metadata store and the containerd connection it
+// reads image blobs over. It is safe to call on an already-closed
+// snapshotter.
 func (s *snapshotter) Close() error {
 	log.L.Trace("cfs snapshotter: close")
+	s.cancel()
+	s.wg.Wait()
 	closeBuilds(s.takeBuilds(func(buildKey, *openBuild) bool { return true }))
 	closeBuilds(s.takeFinishing(""))
 	err := s.blobs.Close()

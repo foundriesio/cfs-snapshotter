@@ -2149,6 +2149,10 @@ type fakeEngine struct {
 	// engine creates.
 	ingestErr error
 	finishErr error
+	// held is what Holds reports; gcErr fails every GC and gcs counts them.
+	held  map[digest.Digest][]string
+	gcErr error
+	gcs   int
 	// finishGate, when set, blocks every build's Finish until the gate is
 	// closed; Close closes it and then waits for finishDone, the way a real
 	// Close lets a finish already under way complete before it returns.
@@ -2221,6 +2225,51 @@ func (e *fakeEngine) Release(_ context.Context, ref, holder string) error {
 	e.releases = append(e.releases, holdCall{ref: ref, holder: holder})
 	e.events = append(e.events, "release:"+holder)
 	return e.releaseErr
+}
+
+func (e *fakeEngine) Holds(context.Context) (map[digest.Digest][]string, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.held, nil
+}
+
+func (e *fakeEngine) GC(ctx context.Context, _ ...knarr.GCOption) (*knarr.GCReport, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.gcs++
+	if e.gcErr != nil {
+		return nil, e.gcErr
+	}
+	return &knarr.GCReport{}, nil
+}
+
+// gcCount reports how many collections the engine has run.
+func (e *fakeEngine) gcCount() int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.gcs
+}
+
+// setGCErr sets the error every later collection fails with.
+func (e *fakeEngine) setGCErr(err error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.gcErr = err
+}
+
+// awaitGCs waits for the engine to have run at least n collections.
+func awaitGCs(t *testing.T, engine *fakeEngine, n int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for engine.gcCount() < n {
+		if time.Now().After(deadline) {
+			t.Fatalf("engine ran %d collections, want at least %d", engine.gcCount(), n)
+		}
+		time.Sleep(time.Millisecond)
+	}
 }
 
 func (e *fakeEngine) MountChain(ctx context.Context, chainID, target string, opts ...knarr.MountOption) error {
@@ -2602,6 +2651,227 @@ func optionValue(t *testing.T, m mount.Mount, key string) string {
 	}
 	t.Fatalf("mount options %v carry no %s", m.Options, key)
 	return ""
+}
+
+// TestNewSnapshotterReleasesStrayHolds covers a daemon starting over a store
+// that a previous run left holds in: the holder a committed leaf names and
+// the one a staging leaf names are kept, this snapshotter's holders that no
+// record names are released, and holders that are not its own are left alone.
+func TestNewSnapshotterReleasesStrayHolds(t *testing.T) {
+	ctx := pullNamespace()
+	root := t.TempDir()
+	engine := fakeEngineForImages()
+	engine.objectsDir = t.TempDir()
+	first := newConfiguredSnapshotter(t, Config{Root: root, AllowUnstagedPulls: true}, engine, notMounted)
+	layers := []digest.Digest{digest.FromString("layer-1")}
+	image, chains := stageImage(t, first, layers...)
+	other, otherChains := stageImageBy(t, first, "other", layers...)
+
+	if _, err := first.Prepare(ctx, "moby/1/extract", "", snapshots.WithLabels(stagedLabels("app:v1", image, chains[0]))); err != nil {
+		t.Fatalf("Prepare() error = %v", err)
+	}
+	if err := applyStaged(ctx, first, "moby/1/extract", layers[0]); err != nil {
+		t.Fatalf("Apply() error = %v", err)
+	}
+	committed := "moby/1/" + chains[0].String()
+	if err := first.Commit(ctx, committed, "moby/1/extract"); err != nil {
+		t.Fatalf("Commit() error = %v", err)
+	}
+	// A second image applied but never committed: its staging record names
+	// the holder its build took.
+	if _, err := first.Prepare(ctx, "moby/2/extract", "", snapshots.WithLabels(stagedLabels("other:v1", other, otherChains[0]))); err != nil {
+		t.Fatalf("Prepare(other) error = %v", err)
+	}
+	if err := applyStaged(ctx, first, "moby/2/extract", layers[0]); err != nil {
+		t.Fatalf("Apply(other) error = %v", err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	owned := buildHolder("moby", "moby/1/extract")
+	staged := buildHolder("moby", "moby/2/extract")
+	stray := buildHolder("moby", "moby/9/extract")
+	strayRecord := recordHolder("moby/9/" + chains[0].String())
+	engine.held = map[digest.Digest][]string{
+		image: {"agent", owned, stray},
+		other: {staged, strayRecord},
+	}
+	second := newConfiguredSnapshotter(t, Config{Root: root, AllowUnstagedPulls: true}, engine, notMounted)
+	awaitGCs(t, engine, 1)
+	if _, err := second.Stat(ctx, committed); err != nil {
+		t.Fatalf("Stat(%q) error = %v", committed, err)
+	}
+	engine.mu.Lock()
+	releases := slices.Clone(engine.releases)
+	engine.mu.Unlock()
+	slices.SortFunc(releases, func(a, b holdCall) int { return strings.Compare(a.ref+a.holder, b.ref+b.holder) })
+	want := []holdCall{{ref: image.String(), holder: stray}, {ref: other.String(), holder: strayRecord}}
+	slices.SortFunc(want, func(a, b holdCall) int { return strings.Compare(a.ref+a.holder, b.ref+b.holder) })
+	if !slices.Equal(releases, want) {
+		t.Fatalf("engine Release calls = %+v, want the stray holders alone: %+v", releases, want)
+	}
+}
+
+// TestCleanupCollectsAfterRemove covers the runtime dropping a staged image:
+// the record's removal releases the hold and marks the store to be
+// collected, and the cleanup containerd runs at the end of that cycle
+// collects it. A cleanup with nothing dropped since collects nothing.
+func TestCleanupCollectsAfterRemove(t *testing.T) {
+	ctx := pullNamespace()
+	engine := fakeEngineForImages()
+	sn := newStagingSnapshotter(t, engine)
+	awaitGCs(t, engine, 1)
+	if err := sn.Cleanup(ctx); err != nil {
+		t.Fatalf("Cleanup() error = %v", err)
+	}
+	if got := engine.gcCount(); got != 1 {
+		t.Fatalf("collections after an idle cleanup = %d, want the startup one alone", got)
+	}
+
+	layers := []digest.Digest{digest.FromString("layer-1")}
+	root, chains := stageImage(t, sn, layers...)
+	name := "moby/1/" + chains[0].String()
+	if _, err := sn.Prepare(ctx, "extract", "", snapshots.WithLabels(stagedLabels("app:v1", root, chains[0]))); err != nil {
+		t.Fatalf("Prepare() error = %v", err)
+	}
+	if err := applyStaged(ctx, sn, "extract", layers[0]); err != nil {
+		t.Fatalf("Apply() error = %v", err)
+	}
+	if err := sn.Commit(ctx, name, "extract"); err != nil {
+		t.Fatalf("Commit() error = %v", err)
+	}
+	// The finished build kicked a collection of its own leftovers.
+	awaitGCs(t, engine, 2)
+	if err := sn.Remove(ctx, name); err != nil {
+		t.Fatalf("Remove() error = %v", err)
+	}
+	if got := engine.gcCount(); got != 2 {
+		t.Fatalf("collections after a remove = %d, want none until cleanup", got)
+	}
+	if err := sn.Cleanup(ctx); err != nil {
+		t.Fatalf("Cleanup() error = %v", err)
+	}
+	if got := engine.gcCount(); got != 3 {
+		t.Fatalf("collections after cleanup = %d, want 3", got)
+	}
+	if err := sn.Cleanup(ctx); err != nil {
+		t.Fatalf("second Cleanup() error = %v", err)
+	}
+	if got := engine.gcCount(); got != 3 {
+		t.Fatalf("collections after a second cleanup = %d, want still 3", got)
+	}
+}
+
+// TestApplyCollectsWhenBuildEnds covers the store being collected after a
+// pull, not only after a removal: a build writes every file of every layer,
+// and the ones a later layer replaced are nobody's once the image is built.
+// A build abandoned midway leaves the same kind of leftovers.
+func TestApplyCollectsWhenBuildEnds(t *testing.T) {
+	ctx := pullNamespace()
+	engine := fakeEngineForImages()
+	sn := newStagingSnapshotter(t, engine)
+	awaitGCs(t, engine, 1)
+	layers := []digest.Digest{digest.FromString("layer-1")}
+	root, chains := stageImage(t, sn, layers...)
+
+	if _, err := sn.Prepare(ctx, "extract", "", snapshots.WithLabels(stagedLabels("app:v1", root, chains[0]))); err != nil {
+		t.Fatalf("Prepare() error = %v", err)
+	}
+	if err := applyStaged(ctx, sn, "extract", layers[0]); err != nil {
+		t.Fatalf("Apply() error = %v", err)
+	}
+	awaitGCs(t, engine, 2)
+
+	other, otherChains := stageImageBy(t, sn, "other", digest.FromString("o-1"), digest.FromString("o-2"))
+	engine.ingestErr = errors.New("layer failed")
+	if _, err := sn.Prepare(ctx, "extract-other", "", snapshots.WithLabels(stagedLabels("other:v1", other, otherChains[0]))); err != nil {
+		t.Fatalf("Prepare(other) error = %v", err)
+	}
+	if err := applyStaged(ctx, sn, "extract-other", digest.FromString("o-1")); err == nil {
+		t.Fatal("Apply(other) succeeded, want the layer failure")
+	}
+	awaitGCs(t, engine, 3)
+}
+
+// TestCleanupRetriesWhenStoreBusy covers a collection finding the store busy
+// with a pull: it is not an error, and the snapshotter collects again on its
+// own once the interval passes, until a collection goes through.
+func TestCleanupRetriesWhenStoreBusy(t *testing.T) {
+	interval := gcRetryInterval
+	gcRetryInterval = 5 * time.Millisecond
+	t.Cleanup(func() { gcRetryInterval = interval })
+	engine := fakeEngineForImages()
+	engine.gcErr = fmt.Errorf("busy: %w", knarr.ErrStoreBusy)
+	sn := newStagingSnapshotter(t, engine)
+	awaitGCs(t, engine, 2)
+	if err := sn.Cleanup(context.Background()); err != nil {
+		t.Fatalf("Cleanup() on a busy store error = %v, want none", err)
+	}
+	engine.setGCErr(nil)
+	awaitGCs(t, engine, 3)
+	deadline := time.Now().Add(time.Second)
+	for sn.dirty.Load() {
+		if time.Now().After(deadline) {
+			t.Fatal("the store stayed marked dirty after a collection went through")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	settled := engine.gcCount()
+	time.Sleep(20 * gcRetryInterval)
+	if got := engine.gcCount(); got != settled {
+		t.Fatalf("collections kept running after one succeeded: %d, then %d", settled, got)
+	}
+}
+
+// TestCleanupReportsOtherFailuresOnce covers a collection failing for a
+// reason other than a busy store: the failure is reported and not retried,
+// since nothing would change between attempts.
+func TestCleanupReportsOtherFailuresOnce(t *testing.T) {
+	interval := gcRetryInterval
+	gcRetryInterval = 5 * time.Millisecond
+	t.Cleanup(func() { gcRetryInterval = interval })
+	engine := fakeEngineForImages()
+	broken := errors.New("held image has no binding")
+	engine.gcErr = broken
+	sn := newStagingSnapshotter(t, engine)
+	awaitGCs(t, engine, 1)
+	time.Sleep(20 * gcRetryInterval)
+	if got := engine.gcCount(); got != 1 {
+		t.Fatalf("collections after a broken store = %d, want the one that failed", got)
+	}
+	if err := sn.Cleanup(context.Background()); err != nil {
+		t.Fatalf("Cleanup() with nothing to collect error = %v", err)
+	}
+	sn.dirty.Store(true)
+	if err := sn.Cleanup(context.Background()); !errors.Is(err, broken) {
+		t.Fatalf("Cleanup() on a broken store error = %v, want %v", err, broken)
+	}
+}
+
+// TestCloseStopsPendingRetry covers shutting down while a collection is
+// waiting to be retried: Close returns without waiting out the interval.
+func TestCloseStopsPendingRetry(t *testing.T) {
+	interval := gcRetryInterval
+	gcRetryInterval = time.Hour
+	t.Cleanup(func() { gcRetryInterval = interval })
+	engine := fakeEngineForImages()
+	engine.gcErr = fmt.Errorf("busy: %w", knarr.ErrStoreBusy)
+	sn, err := newSnapshotter(context.Background(), Config{Root: t.TempDir(), AllowUnstagedPulls: true}, engine)
+	if err != nil {
+		t.Fatalf("newSnapshotter() error = %v", err)
+	}
+	awaitGCs(t, engine, 1)
+	done := make(chan error, 1)
+	go func() { done <- sn.Close() }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Close() error = %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close() waited on the retry interval")
+	}
 }
 
 // TestRemoveWaitsForFinishingBuild covers containerd unwinding a pull while

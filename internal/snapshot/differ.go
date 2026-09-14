@@ -95,7 +95,10 @@ func (s *snapshotter) Apply(ctx context.Context, desc ocispec.Descriptor, mounts
 		// take, and nothing more is owed.
 		defer s.takeFinishing(key)
 		if err := s.markLeaf(ctx, key, layer.root, b.holder); err != nil {
-			closeBuilds(s.takeFinishing(key))
+			if taken := s.takeFinishing(key); len(taken) > 0 {
+				closeBuilds(taken)
+				s.collectSoon()
+			}
 			return ocispec.Descriptor{}, err
 		}
 	}
@@ -326,7 +329,11 @@ func (s *snapshotter) ingest(ctx context.Context, ns string, b *openBuild, layer
 		}
 		return nil
 	}
-	if _, err := b.build.Finish(ctx); err != nil {
+	_, err := b.build.Finish(ctx)
+	// Finished or failed, the build is over and the store holds what it
+	// wrote; the part of it no image references is the collector's.
+	s.collectSoon()
+	if err != nil {
 		return err
 	}
 	closeBuilds(s.takeBuilds(func(key buildKey, other *openBuild) bool {
@@ -340,6 +347,7 @@ func (s *snapshotter) ingest(ctx context.Context, ns string, b *openBuild, layer
 func (s *snapshotter) abandonBuild(ctx context.Context, key buildKey, b *openBuild) {
 	s.takeBuilds(func(k buildKey, other *openBuild) bool { return k == key && other == b })
 	b.build.Close()
+	s.collectSoon()
 	log.G(ctx).WithFields(log.Fields{"namespace": key.namespace, "root": key.root}).
 		Debug("cfs snapshotter: abandoned image build")
 }
@@ -370,6 +378,7 @@ func (s *snapshotter) closeStagedBuild(ctx context.Context, key string, labels m
 		return
 	}
 	closeBuilds(taken)
+	s.collectSoon()
 	log.G(ctx).WithFields(log.Fields{"namespace": ns, "root": bk.root}).
 		Debug("cfs snapshotter: abandoned image build")
 }
