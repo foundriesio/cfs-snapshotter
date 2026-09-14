@@ -176,7 +176,9 @@ of an image nobody staged:
 
 - lands in the knarr store as exactly one composefs image, present in the CAS
   and named in the fs-verity view, with no staging directories on disk and
-  the chain's snapshot records kept;
+  the chain's snapshot records kept — and the content its layers wrote that
+  the image does not reference (every layer rewrites one file) is collected
+  by the snapshotter right after the pull, without a `knarr gc`;
 - reaches the store a layer at a time through the differ: a known file of the
   first layer is a store object while the last, large layer is still being
   transferred;
@@ -185,10 +187,23 @@ of an image nobody staged:
 - fetches its layers again when it is removed from the runtime and
   re-pulled — a staging machine refetches rather than answering from the
   store — and converges on the same single store image;
-- is held in the store until the runtime forgets it, exactly as an
-  out-of-band pull is;
+- is the runtime's alone: the store lists it under the reference docker
+  pulled, as a runtime reference for the snapshotter's holder that resolves
+  by name but pins nothing, `knarr gc` would reclaim none of it while the
+  runtime lists it, and
+  `docker rmi` reclaims it — from the store's listing and from disk, back to
+  the byte count before the pull — before the command returns, with no wait
+  and no knarr command;
 - shares its objects with a second image built on the same layers — the store
-  does not grow by a second copy;
+  does not grow by a second copy — and removing the shorter of the two from
+  the runtime keeps what the longer reads (and the shorter itself, whose
+  chain still stands under the longer), keeps the longer mountable, and
+  removing both reclaims everything;
+- stays when an agent holds it: `docker rmi` drops only the runtime's hold,
+  and the image goes once the agent releases and runs `knarr gc`;
+- is not pinned for good by a hold of the snapshotter's own that no record
+  owns — the daemon releases such a hold when it starts, and the next
+  `docker rmi` reclaims the image;
 - leaves nothing behind when the pull is interrupted midway: the active
   snapshot is aborted, the staged records are collected once nothing
   references them, `knarr gc` runs against the store the abandoned build let
