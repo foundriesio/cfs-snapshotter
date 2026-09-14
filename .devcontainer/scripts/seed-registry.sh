@@ -112,6 +112,12 @@ EOF
 		rm -rf "${source_dir}" || echo "warning: failed to remove ${source_dir}" >&2
 	fi
 	printf 'cfs e2e layer %s %s\n' "${layer}" "${SEED_NONCE}" >"${rootfs}/layer-${layer}.txt"
+	# One file every layer rewrites, so every layer but the last leaves
+	# content the built image does not reference. Larger than composefs
+	# inlines, so each version is a store object of its own.
+	for _ in $(seq 1 64); do
+		printf 'cfs e2e shadow %s %s\n' "${layer}" "${SEED_NONCE}"
+	done >"${rootfs}/shadow.txt"
 	# Bulk goes in the last layer only, and is incompressible, so a pull of the
 	# image spends its transfer time where a test wants a wide window: after
 	# the earlier layers have been applied.
