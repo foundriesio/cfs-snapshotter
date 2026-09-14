@@ -172,6 +172,14 @@ committed_keys_are() {
 # collection only happens when the garbage collector runs, the collector is
 # armed by deletion events, and a cleanly unwound pull leaves nothing to
 # delete — on a quiet runtime the unreferenced records would then just sit.
+# active_gone_after_lease_drop releases the leases the aborted pull took — a
+# retention lease the runtime leaves behind keeps its active record from
+# going — and reports whether that record is gone.
+active_gone_after_lease_drop() {
+	drop_new_leases "$1"
+	no_active_snapshots
+}
+
 collected_after_lease_drop() {
 	drop_new_leases "$1"
 	ctr --address "${CONTAINERD_SOCKET}" --namespace "${DOCKER_NAMESPACE}" \
@@ -990,7 +998,7 @@ assert_interrupted_pull_converges() {
 	fi
 	pull_pid=""
 
-	wait_until "the aborted pull's active snapshot to go" 60 1 no_active_snapshots
+	wait_until "the aborted pull's active snapshot to go" 60 1 active_gone_after_lease_drop "${leases}"
 	if docker image inspect "${partial_ref}" >/dev/null 2>&1; then
 		fail "the cold pull completed before it could be interrupted"
 	fi
