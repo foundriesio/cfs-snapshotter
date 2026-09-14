@@ -9,7 +9,7 @@ require (
 	github.com/containerd/errdefs v1.0.0
 	github.com/containerd/errdefs/pkg v0.3.0
 	github.com/containerd/log v0.1.0
-	github.com/foundriesio/knarr v0.1.2-0.20260909084132-5eb27a6c64f5
+	github.com/foundriesio/knarr v0.1.2-0.20260914162932-515bd4f10903
 	github.com/moby/sys/mountinfo v0.7.2
 	github.com/opencontainers/go-digest v1.0.0
 	github.com/opencontainers/image-spec v1.1.1
