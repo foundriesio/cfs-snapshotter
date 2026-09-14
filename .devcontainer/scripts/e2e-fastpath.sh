@@ -42,6 +42,7 @@ pull_pid=""
 # one ingest worker, which the two-worker re-pull and a knarr pull of the same
 # image must build again byte for byte.
 cold_composefs=""
+cold_store_bytes=""
 fresh_knarr_root=""
 
 cleanup() {
@@ -317,6 +318,50 @@ knarr_ref_for_digest() {
 	printf '%s\n' "${ref}"
 }
 
+# knarr_lists_digest succeeds when the store lists an image by its identity
+# digest, whatever reference it is listed under — none, for an image the
+# runtime staged, which the store keeps by the snapshotter's hold alone.
+knarr_lists_digest() {
+	local digest="$1" listing
+	listing="$(knarr_cli ls --format json)" || fail "cannot list knarr images"
+	jq -e --arg d "${digest}" 'any(.[]; .digest == $d)' <<<"${listing}" >/dev/null
+}
+
+# knarr_ref_of_digest prints the reference the store lists a digest under,
+# empty for an image no reference names.
+knarr_ref_of_digest() {
+	local digest="$1" listing
+	listing="$(knarr_cli ls --format json)" || fail "cannot list knarr images"
+	jq -r --arg d "${digest}" 'map(select(.digest == $d)) | .[0].ref // ""' <<<"${listing}"
+}
+
+# knarr_holder_of_digest prints the holder a runtime reference names a digest
+# for, empty for an agent's reference or an unnamed image.
+knarr_holder_of_digest() {
+	local digest="$1" listing
+	listing="$(knarr_cli ls --format json)" || fail "cannot list knarr images"
+	jq -r --arg d "${digest}" 'map(select(.digest == $d)) | .[0].holder // ""' <<<"${listing}"
+}
+
+# store_settled reports whether a collection would reclaim nothing: the
+# snapshotter collects the store on its own after each pull, so the shadowed
+# content a pull leaves is gone shortly after the pull returns. While that
+# collection runs the store is busy and the probe fails, which is "not yet",
+# not an error.
+store_settled() {
+	local report
+	report="$(knarr_cli gc --dry-run --format json 2>/dev/null)" || return 1
+	[ "$(jq -r '.objectsRemoved' <<<"${report}")" -eq 0 ]
+}
+
+# shadow_object reports the store path of the shadow.txt a seeded layer
+# writes, which every later layer of the image replaces.
+shadow_object() {
+	local nonce="$1" layer="$2" hex
+	hex="$(for _ in $(seq 1 64); do printf 'cfs e2e shadow %s %s\n' "${layer}" "${nonce}"; done | sha256sum | cut -d' ' -f1)"
+	sharded_path "$(cas_dir)" "${hex}"
+}
+
 assert_knarr_remove_declines() {
 	local ref="$1" output
 	if output="$(knarr_cli remove "${ref}" 2>&1)"; then
@@ -515,9 +560,11 @@ assert_warm_hold_declines_remove() {
 
 assert_warm_hold_released() {
 	local ref
+	# The runtime forgot the image; the agent's reference still names it, so
+	# the store kept it and only the runtime's hold is gone.
 	ref="$(knarr_ref_for_digest "$(manifest_digest "${work}/layout")")"
 	knarr_remove_when_released "${ref}"
-	echo "PASS: removing the image from the runtime released the cfs hold"
+	echo "PASS: removing the image from the runtime released the cfs hold and kept the agent's image"
 }
 
 # assert_warm_tag_identity stages an index-rooted image by TAG through the
@@ -683,6 +730,10 @@ assert_cold_pull_lands_composefs() {
 	tag_ref="${REGISTRY}/${repo}:${nonce}"
 	seed_image "${nonce}-cold" "${tag_ref}" 3 "${layout}" "" "${PARTIAL_LAYER_BYTES}"
 	cold_ref="$(pinned_ref "${REGISTRY}/${repo}" "${layout}")" || fail "cannot pin the cold image ref"
+	root="$(manifest_digest "${layout}")"
+	# What the store holds before the pull is what it must hold again once the
+	# runtime has dropped the image.
+	cold_store_bytes="$(cas_object_bytes)"
 
 	offset="$(wc -l <"${CFS_LOG}")"
 	docker pull "${cold_ref}" >/dev/null 2>&1 &
@@ -701,11 +752,27 @@ assert_cold_pull_lands_composefs() {
 	pull_pid=""
 	report_layer_applies "${cold_ref}" 3 "${offset}"
 
+	# A staged image is the runtime's, not an agent's: the store keeps it by
+	# the snapshotter's hold and names it by a runtime reference for that
+	# holder, so it resolves by name like any image without being pinned by
+	# the name.
 	info="$(knarr_cli inspect --format json "${cold_ref}")" ||
-		fail "the knarr store does not hold the cold-pulled image"
-	root="$(manifest_digest "${layout}")"
+		fail "the knarr store does not resolve the cold-pulled image by its reference"
 	[ "$(jq -r '.root' <<<"${info}")" = "${root}" ] ||
 		fail "the knarr store holds the cold-pulled image under another root"
+	[ "$(knarr_ref_of_digest "${root}")" = "${cold_ref}" ] ||
+		fail "the staged image is not listed under the runtime's reference"
+	case "$(knarr_holder_of_digest "${root}")" in
+	cfs-build-*) ;;
+	*) fail "the staged image's reference is not a runtime reference for a cfs build holder" ;;
+	esac
+	# The pull wrote three versions of shadow.txt; the image references the
+	# last. The snapshotter collects the other two without being asked.
+	wait_until "the pull's shadowed content to be collected" 60 0.5 store_settled
+	[ ! -e "$(shadow_object "${nonce}-cold" 1)" ] ||
+		fail "the first layer's shadowed file survived the collection after the pull"
+	[ -e "$(shadow_object "${nonce}-cold" 3)" ] ||
+		fail "the last layer's file, which the image references, was collected"
 
 	composefs="$(jq -r '.composefs.digest' <<<"${info}")"
 	cold_composefs="${composefs}"
@@ -777,7 +844,7 @@ assert_cold_prefix_dedup() {
 	seed_image "${share_nonce}" "${REGISTRY}/${repo}:${nonce}" 3 "${layout}"
 	share_ref="$(pinned_ref "${REGISTRY}/${repo}" "${layout}")" || fail "cannot pin the shared-base ref"
 	docker pull "${share_ref}" >/dev/null || fail "cold docker pull of the shared-base image failed"
-	knarr_cli inspect --format json "${share_ref}" >/dev/null ||
+	knarr_cli inspect --format json "$(manifest_digest "${layout}")" >/dev/null ||
 		fail "the knarr store does not hold the shared-base image"
 	docker rmi "${share_ref}" >/dev/null || fail "docker rmi of the shared-base image failed"
 	local share_manifest
@@ -791,7 +858,7 @@ assert_cold_prefix_dedup() {
 		fail "cannot pin the prefix-sharing ref"
 	docker pull "${share_more_ref}" >/dev/null ||
 		fail "cold docker pull of the prefix-sharing image failed"
-	knarr_cli inspect --format json "${share_more_ref}" >/dev/null ||
+	knarr_cli inspect --format json "$(manifest_digest "${more_layout}")" >/dev/null ||
 		fail "the knarr store does not hold the prefix-sharing image"
 	[ "$(image_bindings "$(manifest_digest "${more_layout}")")" -eq 1 ] ||
 		fail "the prefix-sharing pull did not build exactly one composefs image"
@@ -802,15 +869,101 @@ assert_cold_prefix_dedup() {
 	copies="$(hello_objects "$(cas_dir)" "${more_layout}" | wc -l)"
 	[ "${copies}" -eq 1 ] || fail "the store holds ${copies} copies of the shared /hello, want 1"
 	echo "PASS: a prefix-sharing image cold-pulled after a base re-pull and shared its objects"
+
+	# Shared content follows the last image that needs it: dropping the base
+	# reclaims nothing the longer image reads, and that image still mounts —
+	# its chain is resolved from the store's bindings, not from a reference,
+	# which no staged image has. The base's whole chain is a prefix of the
+	# longer image's, so containerd keeps the base's leaf record as the
+	# other's ancestor and the base stays in the store, held by that record,
+	# until the longer image goes. Dropping the longer image reclaims both.
+	docker rmi "${share_ref}" >/dev/null || fail "docker rmi of the shared-base image failed"
+	[ "$(image_bindings "$(manifest_digest "${layout}")")" -eq 1 ] ||
+		fail "the shared-base image was reclaimed while its chain still stands under the longer image"
+	copies="$(hello_objects "$(cas_dir)" "${more_layout}" | wc -l)"
+	[ "${copies}" -eq 1 ] || fail "removing the base left ${copies} copies of the shared /hello, want 1"
+	output="$(docker run --rm --network=none "${share_more_ref}")" ||
+		fail "docker run of the prefix-sharing image after the base was removed failed"
+	[ "${output}" = "cfs hello ${share_nonce}" ] || fail "unexpected container output: ${output}"
+	docker rmi "${share_more_ref}" >/dev/null || fail "docker rmi of the prefix-sharing image failed"
+	no_image_binding "$(manifest_digest "${more_layout}")" ||
+		fail "the prefix-sharing image survived its removal from the runtime"
+	no_image_binding "$(manifest_digest "${layout}")" ||
+		fail "the shared-base image survived the removal of the last image standing on its chain"
+	copies="$(hello_objects "$(cas_dir)" "${more_layout}" | wc -l)"
+	[ "${copies}" -eq 0 ] || fail "the shared /hello survived the removal of every image reading it"
+	echo "PASS: removing one of two images sharing a chain kept the other's content, removing both reclaimed it"
 }
 
-assert_cold_hold_released() {
-	local ref
-	ref="$(knarr_ref_for_digest "$(manifest_digest "${work}/cold-layout")")"
-	assert_knarr_remove_declines "${ref}"
+# assert_staged_rmi_reclaims covers the runtime dropping a staged image: the
+# removal releases the snapshotter's hold and collects the store inside the
+# same docker command, so by the time `docker rmi` returns the image is gone
+# from the runtime, from the store's listing and from disk — with no wait,
+# no poll, and no knarr command run by anyone.
+assert_staged_rmi_reclaims() {
+	local root bytes
+	root="$(manifest_digest "${work}/cold-layout")"
+	knarr_lists_digest "${root}" || fail "the knarr store does not list the staged image"
+	wait_until "the re-pull's shadowed content to be collected" 60 0.5 store_settled
 	docker rmi "${cold_ref}" >/dev/null || fail "docker rmi of the converted image failed"
-	knarr_remove_when_released "${ref}"
-	echo "PASS: a converted image stayed cfs-held until the runtime forgot it"
+	if docker image inspect "${cold_ref}" >/dev/null 2>&1; then
+		fail "the runtime still lists the image after docker rmi returned"
+	fi
+	if knarr_lists_digest "${root}"; then
+		fail "the knarr store still lists the image after docker rmi returned"
+	fi
+	if knarr_cli inspect --format json "${cold_ref}" >/dev/null 2>&1; then
+		fail "the runtime's reference survived docker rmi"
+	fi
+	no_image_binding "${root}" || fail "the composefs image survived docker rmi"
+	bytes="$(cas_object_bytes)"
+	[ "${bytes}" -eq "${cold_store_bytes}" ] ||
+		fail "the store holds ${bytes} object bytes after docker rmi, ${cold_store_bytes} before the pull"
+	echo "PASS: docker rmi of a staged image reclaimed it from the store before returning"
+}
+
+# assert_staged_adoption covers an agent adopting a staged image with a hold
+# of its own: the runtime dropping the image releases only the snapshotter's
+# hold, and the image stays until the agent lets go and collects.
+assert_staged_adoption() {
+	local nonce="$1" repo="cfs/e2e-adopt" layout="${work}/adopt-layout" ref root
+	seed_image "${nonce}-adopt" "${REGISTRY}/${repo}:${nonce}" 2 "${layout}"
+	ref="$(pinned_ref "${REGISTRY}/${repo}" "${layout}")" || fail "cannot pin the adopted image ref"
+	docker pull "${ref}" >/dev/null || fail "docker pull of the image to adopt failed"
+	root="$(manifest_digest "${layout}")"
+	knarr_cli hold --holder agent "${root}" >&2 || fail "knarr hold of the staged image failed"
+	docker rmi "${ref}" >/dev/null || fail "docker rmi of the adopted image failed"
+	knarr_lists_digest "${root}" || fail "the agent-held image was dropped with the runtime's"
+	[ "$(image_bindings "${root}")" -eq 1 ] || fail "the adopted image lost its composefs image"
+	knarr_cli release --holder agent "${root}" >&2 || fail "knarr release of the adopted image failed"
+	knarr_cli gc >&2 || fail "knarr gc after the release failed"
+	if knarr_lists_digest "${root}"; then
+		fail "the image survived the agent's release and collection"
+	fi
+	echo "PASS: an agent's hold kept a staged image past docker rmi, its release let it go"
+}
+
+# assert_staged_self_heal covers a hold of the snapshotter's own that no
+# record owns — what a crash between a build's finish and its record leaves
+# behind: the daemon releases it when it starts, so the image is reclaimed
+# by the runtime's removal like any other rather than pinned for good.
+assert_staged_self_heal() {
+	local nonce="$1" repo="cfs/e2e-heal" layout="${work}/heal-layout" ref root
+	local stray="cfs-build-0000000000000000000000000000000000000000000000000000000000000000"
+	seed_image "${nonce}-heal" "${REGISTRY}/${repo}:${nonce}" 2 "${layout}"
+	ref="$(pinned_ref "${REGISTRY}/${repo}" "${layout}")" || fail "cannot pin the self-heal image ref"
+	docker pull "${ref}" >/dev/null || fail "docker pull of the self-heal image failed"
+	root="$(manifest_digest "${layout}")"
+	knarr_cli hold --holder "${stray}" "${root}" >&2 || fail "cannot plant the stray hold"
+	CFS_INGEST_WORKERS=1 CFS_ALLOW_UNSTAGED_PULLS=1 CFS_ROOT="${COLD_CFS_ROOT}" KNARR_ROOT="${COLD_KNARR_ROOT}" \
+		CFS_FORCE_RESTART=1 "${SCRIPT_DIR}/run-cfs.sh" >&2 || fail "restart the snapshotter"
+	grep -q "releasing a hold no snapshot record owns" "${CFS_LOG}" ||
+		fail "the restarted snapshotter did not report releasing the stray hold"
+	docker rmi "${ref}" >/dev/null || fail "docker rmi of the self-heal image failed"
+	if knarr_lists_digest "${root}"; then
+		fail "the stray hold kept the image past docker rmi"
+	fi
+	echo "PASS: a hold no record owned was released at startup and the image reclaimed"
 }
 
 assert_interrupted_pull_converges() {
@@ -845,14 +998,16 @@ assert_interrupted_pull_converges() {
 		collected_after_lease_drop "${leases}" "${baseline}"
 	assert_no_staging_residue
 	# Removing the pull's snapshots closed its image build, which held the
-	# store's shared lock while it was open: a collection now runs instead
-	# of reporting the store busy, and reclaims what the build had stored.
+	# store's shared lock while it was open, and had the snapshotter collect
+	# what the build stored; a collection run by hand afterwards runs instead
+	# of reporting the store busy, and finds nothing left.
+	wait_until "the abandoned build's leftovers to be collected" 60 0.5 store_settled
 	knarr_cli gc >&2 || fail "knarr gc after the aborted pull did not run"
 
 	offset="$(wc -l <"${CFS_LOG}")"
 	docker pull "${partial_ref}" >/dev/null || fail "re-pull after the interrupted pull failed"
 	report_layer_applies "${partial_ref}" 3 "${offset}"
-	knarr_cli inspect --format json "${partial_ref}" >/dev/null ||
+	knarr_cli inspect --format json "$(manifest_digest "${layout}")" >/dev/null ||
 		fail "the re-pull did not land in the knarr store"
 	[ "$(image_bindings "$(manifest_digest "${layout}")")" -eq 1 ] ||
 		fail "the re-pull did not build exactly one composefs image"
@@ -861,14 +1016,14 @@ assert_interrupted_pull_converges() {
 }
 
 # assert_cold_mixed_door covers the two doors meeting on one image: the
-# runtime stages a tag pull and holds the platform manifest it stamped, then
-# a knarr pull of the same tag resolves its index down to that same manifest
-# — updating the reference's provenance, not adding a second image — and a
-# knarr remove of the tag declines on the runtime's hold instead of
-# orphaning it.
+# runtime stages a tag pull, holds the platform manifest it stamped and names
+# it by a runtime reference; a knarr pull of the same tag resolves its index
+# down to that same manifest and adopts the image — replacing the runtime's
+# reference with the agent's, not adding a second image — and a knarr remove
+# of the tag declines on the runtime's hold instead of orphaning it.
 assert_cold_mixed_door() {
 	local nonce="$1" repo="cfs/e2e-mixed" layout="${work}/mixed-layout"
-	local tag_ref idx mdigest resolved output
+	local tag_ref idx mdigest output
 	tag_ref="${REGISTRY}/${repo}:${nonce}"
 	seed_image "${nonce}-mixed" "${tag_ref}" 2 "${layout}" "" "" 1
 	idx="$(manifest_digest "${layout}")" || fail "cannot read the index digest"
@@ -878,9 +1033,11 @@ assert_cold_mixed_door() {
 	docker pull "${tag_ref}" >/dev/null || fail "docker pull of the index-rooted tag failed"
 	[ "$(image_bindings "${mdigest}")" -eq 1 ] ||
 		fail "the staged pull did not build exactly one composefs image"
-	resolved="$(ref_record_field "${tag_ref}" '.resolved.digest')"
-	[ "${resolved}" = "${mdigest}" ] ||
-		fail "the staged record's provenance is ${resolved}, want the stamped manifest"
+	knarr_lists_digest "${mdigest}" || fail "the staged image is not listed under the stamped manifest"
+	[ "$(knarr_ref_of_digest "${mdigest}")" = "${tag_ref}" ] ||
+		fail "the staged pull did not name the image by the runtime's reference"
+	[ -n "$(knarr_holder_of_digest "${mdigest}")" ] ||
+		fail "the runtime's reference is not a runtime reference"
 
 	knarr_cli pull "${tag_ref}" >&2 || fail "knarr pull of the staged tag failed"
 	[ "$(image_bindings "${mdigest}")" -eq 1 ] ||
@@ -888,6 +1045,10 @@ assert_cold_mixed_door() {
 	no_image_binding "${idx}" || fail "the knarr pull built a binding under the index digest"
 	[ "$(ref_record_field "${tag_ref}" '.identity.digest')" = "${mdigest}" ] ||
 		fail "the knarr pull re-keyed the image away from the manifest identity"
+	[ "$(knarr_ref_of_digest "${mdigest}")" = "${tag_ref}" ] ||
+		fail "the knarr pull did not name the held image"
+	[ -z "$(knarr_holder_of_digest "${mdigest}")" ] ||
+		fail "the knarr pull left the runtime's reference in place instead of adopting the image"
 	[ "$(ref_record_field "${tag_ref}" '.resolved.digest')" = "${idx}" ] ||
 		fail "the knarr pull did not record the index as provenance"
 
@@ -917,7 +1078,7 @@ assert_ingest_workers_converge() {
 	offset="$(wc -l <"${CFS_LOG}")"
 	docker pull "${cold_ref}" >/dev/null || fail "re-pull at two ingest workers failed"
 	report_layer_applies "${cold_ref}" 3 "${offset}"
-	composefs="$(knarr_cli inspect --format json "${cold_ref}" | jq -r '.composefs.digest')" ||
+	composefs="$(knarr_cli inspect --format json "${root}" | jq -r '.composefs.digest')" ||
 		fail "the knarr store does not hold the image re-pulled at two workers"
 	[ "${composefs}" = "${cold_composefs}" ] ||
 		fail "two ingest workers built ${composefs}, one worker built ${cold_composefs}"
@@ -978,10 +1139,12 @@ cold_phase() {
 
 	assert_cold_pull_lands_composefs "${nonce}"
 	assert_cold_repull_refetches "${nonce}"
-	assert_cold_hold_released
+	assert_staged_rmi_reclaims
 	assert_cold_prefix_dedup "${nonce}"
 	assert_interrupted_pull_converges "${nonce}"
 	assert_cold_mixed_door "${nonce}"
+	assert_staged_adoption "${nonce}"
+	assert_staged_self_heal "${nonce}"
 	assert_ingest_workers_converge
 
 	drain_runtime_images
@@ -1002,8 +1165,8 @@ mounts it into the container (a container started any other way has none)"
 	warm_phase "${nonce}"
 	cold_phase "${nonce}"
 	echo "E2E PASS: handshake identity, real content, recovery, concurrency, teardown," \
-		"tamper enforcement, holds, tag identity, cold conversion, dedup," \
-		"interrupted-pull recovery, mixed-door identity, and worker-count identity"
+		"tamper enforcement, holds, tag identity, cold conversion, rmi reclaim, dedup," \
+		"interrupted-pull recovery, mixed-door identity, adoption, self-heal, and worker-count identity"
 }
 
 main "$@"
