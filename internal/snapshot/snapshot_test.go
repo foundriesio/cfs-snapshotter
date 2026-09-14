@@ -16,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	contentapi "github.com/containerd/containerd/api/services/content/v1"
 	"github.com/containerd/containerd/v2/core/mount"
@@ -762,11 +763,14 @@ func TestApplyDrivesBuild(t *testing.T) {
 	if build.ref != imageRef || build.opts.ResolvedRoot != root || build.opts.BlobSource != knarr.BlobSource(sn.blobs) {
 		t.Fatalf("NewBuild(%q, %+v), want %q rooted at %s from the content store", build.ref, build.opts, imageRef, root)
 	}
-	wantCalls := []string{"build0.ingest(0)", "build0.ingest(1)", "build0.finish", "hold"}
+	wantCalls := []string{"build0.ingest(0)", "build0.ingest(1)", "build0.finish"}
 	if !slices.Equal(engine.calls, wantCalls) {
 		t.Fatalf("engine calls = %v, want %v", engine.calls, wantCalls)
 	}
-	want := []holdCall{{ref: root.String(), holder: recordHolder(parent)}}
+	// The build holds the image when it finishes, under a holder named after
+	// the staging snapshot that started it; no commit holds or releases.
+	holder := buildHolder("moby", "moby/0/extract")
+	want := []holdCall{{ref: root.String(), holder: holder}}
 	if !slices.Equal(engine.holds, want) {
 		t.Fatalf("engine Hold calls = %+v, want %+v", engine.holds, want)
 	}
@@ -778,8 +782,8 @@ func TestApplyDrivesBuild(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Stat(%q) error = %v", parent, err)
 	}
-	if leaf.Labels[chainMemberLabel] == "" || leaf.Labels[rootDigestLabel] != root.String() {
-		t.Fatalf("leaf labels = %v, want an image chain member holding %s", leaf.Labels, root)
+	if leaf.Labels[chainMemberLabel] == "" || leaf.Labels[rootDigestLabel] != root.String() || leaf.Labels[holderLabel] != holder {
+		t.Fatalf("leaf labels = %v, want an image chain member holding %s under %s", leaf.Labels, root, holder)
 	}
 	if leaf.Labels[stagingLabel] != "" {
 		t.Fatalf("leaf labels = %v, want the staging marker gone", leaf.Labels)
@@ -1038,11 +1042,11 @@ func TestCommitStagedRecordReadsNothing(t *testing.T) {
 	if err := sn.Commit(ctx, leaf, "extract-leaf"); err != nil {
 		t.Fatalf("Commit(leaf) error = %v", err)
 	}
-	want := []string{"build0.finish", "hold"}
+	want := []string{"build0.finish"}
 	if !slices.Equal(engine.calls, want) {
 		t.Fatalf("engine calls = %v, want %v: no build touched by a commit", engine.calls, want)
 	}
-	holds := []holdCall{{ref: root.String(), holder: recordHolder(leaf)}}
+	holds := []holdCall{{ref: root.String(), holder: buildHolder("moby", "extract-leaf")}}
 	if !slices.Equal(engine.holds, holds) {
 		t.Fatalf("engine Hold calls = %+v, want %+v", engine.holds, holds)
 	}
@@ -1059,35 +1063,9 @@ func TestCommitStagedRecordReadsNothing(t *testing.T) {
 	}
 }
 
-// TestCommitFailsClosedWhenHoldFails covers a leaf whose image cannot be
-// pinned: without the hold nothing keeps a knarr remove from taking the
-// content away, so the commit must fail rather than file the record.
-func TestCommitFailsClosedWhenHoldFails(t *testing.T) {
-	ctx := pullNamespace()
-	holdErr := errors.New("hold failed")
-	engine := fakeEngineForImages()
-	engine.holdErr = holdErr
-	sn := newStagingSnapshotter(t, engine)
-	layers := []digest.Digest{digest.FromString("layer-1")}
-	root, chains := stageImage(t, sn, layers...)
-
-	if _, err := sn.Prepare(ctx, "extract", "", snapshots.WithLabels(stagedLabels("app:v1", root, chains[0]))); err != nil {
-		t.Fatalf("Prepare() error = %v", err)
-	}
-	if err := applyStaged(ctx, sn, "extract", layers[0]); err != nil {
-		t.Fatalf("Apply() error = %v", err)
-	}
-	name := "moby/1/" + chains[0].String()
-	if err := sn.Commit(ctx, name, "extract"); !errors.Is(err, holdErr) {
-		t.Fatalf("Commit() error = %v, want %v", err, holdErr)
-	}
-	if _, err := sn.Stat(ctx, name); !errdefs.IsNotFound(err) {
-		t.Fatalf("Stat() after failed commit = %v, want not found", err)
-	}
-}
-
 // TestCommitConvergesOnDuplicateLeaves covers two pulls of the same image
-// racing to commit the chain: both hold, and only one record survives.
+// racing to commit the chain: each build holds under its own holder, only one
+// record survives, and it carries the holder of the build whose commit won.
 func TestCommitConvergesOnDuplicateLeaves(t *testing.T) {
 	ctx := pullNamespace()
 	engine := fakeEngineForImages()
@@ -1127,10 +1105,11 @@ func TestCommitConvergesOnDuplicateLeaves(t *testing.T) {
 	if failed != 1 {
 		t.Fatalf("%d of 2 concurrent commits failed, want exactly 1", failed)
 	}
-	// Both commits hold, under the one name the surviving record is known by;
-	// the loser must not give that hold back with the record still standing.
-	held := holdCall{ref: root.String(), holder: recordHolder(name)}
-	if want := []holdCall{held, held}; !slices.Equal(engine.holds, want) {
+	// Each build held when it finished; a commit neither holds nor releases,
+	// so the loser's hold stands until its staging record is removed.
+	holders := []string{buildHolder("moby", "extract-a"), buildHolder("moby", "extract-b")}
+	want := []holdCall{{ref: root.String(), holder: holders[0]}, {ref: root.String(), holder: holders[1]}}
+	if !slices.Equal(engine.holds, want) {
 		t.Fatalf("engine Hold calls = %+v, want %+v", engine.holds, want)
 	}
 	if len(engine.releases) != 0 {
@@ -1140,8 +1119,8 @@ func TestCommitConvergesOnDuplicateLeaves(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Stat(%q) error = %v", name, err)
 	}
-	if info.Labels[rootDigestLabel] != root.String() {
-		t.Fatalf("committed labels = %v, want the built image's digest", info.Labels)
+	if info.Labels[rootDigestLabel] != root.String() || !slices.Contains(holders, info.Labels[holderLabel]) {
+		t.Fatalf("committed labels = %v, want the built image's digest under one of %v", info.Labels, holders)
 	}
 }
 
@@ -1167,10 +1146,11 @@ func TestPrepareReadmissionKeepsHold(t *testing.T) {
 	}
 }
 
-// TestCommitReleasesHoldWhenRecordFails covers a held image whose leaf record
-// then fails to land: the hold names that record, so with the record gone
-// nothing would ever release it.
-func TestCommitReleasesHoldWhenRecordFails(t *testing.T) {
+// TestRemoveOfStagingLeafReleasesBuildHold covers a finished image whose leaf
+// record never lands: the commit fails, and the hold the build took stays
+// with the staging record, which releases it when the runtime's unwinding
+// removes the record.
+func TestRemoveOfStagingLeafReleasesBuildHold(t *testing.T) {
 	ctx := pullNamespace()
 	engine := fakeEngineForImages()
 	sn := newStagingSnapshotter(t, engine)
@@ -1191,12 +1171,19 @@ func TestCommitReleasesHoldWhenRecordFails(t *testing.T) {
 	if err := sn.Commit(ctx, name, "extract", failing); !errors.Is(err, recordErr) {
 		t.Fatalf("Commit() error = %v, want %v", err, recordErr)
 	}
-	want := []holdCall{{ref: root.String(), holder: recordHolder(name)}}
+	want := []holdCall{{ref: root.String(), holder: buildHolder("moby", "extract")}}
 	if !slices.Equal(engine.holds, want) {
 		t.Fatalf("engine Hold calls = %+v, want %+v", engine.holds, want)
 	}
+	if len(engine.releases) != 0 {
+		t.Fatalf("engine Release calls = %+v, want none from a failed commit", engine.releases)
+	}
+
+	if err := sn.Remove(ctx, "extract"); err != nil {
+		t.Fatalf("Remove(staging leaf) error = %v", err)
+	}
 	if !slices.Equal(engine.releases, want) {
-		t.Fatalf("engine Release calls = %+v, want the hold given back", engine.releases)
+		t.Fatalf("engine Release calls = %+v, want the build's hold given back", engine.releases)
 	}
 }
 
@@ -1224,11 +1211,11 @@ func TestRemoveKeepsImageHeldForOtherRecords(t *testing.T) {
 		}
 	}
 	want := []holdCall{
-		{ref: root.String(), holder: recordHolder(names[0])},
-		{ref: root.String(), holder: recordHolder(names[1])},
+		{ref: root.String(), holder: buildHolder("moby", "extract")},
+		{ref: root.String(), holder: buildHolder("k8s.io", "extract")},
 	}
 	if !slices.Equal(engine.holds, want) {
-		t.Fatalf("engine Hold calls = %+v, want one per record", engine.holds)
+		t.Fatalf("engine Hold calls = %+v, want one per pull", engine.holds)
 	}
 
 	if err := sn.Remove(namespaces.WithNamespace(context.Background(), "moby"), names[0]); err != nil {
@@ -1286,8 +1273,8 @@ func TestApplySeparatesBuildsByNamespace(t *testing.T) {
 		}
 	}
 	want := []holdCall{
-		{ref: root.String(), holder: recordHolder("moby/2/" + chains[1].String())},
-		{ref: root.String(), holder: recordHolder("k8s.io/2/" + chains[1].String())},
+		{ref: root.String(), holder: buildHolder("moby", "moby/1/extract")},
+		{ref: root.String(), holder: buildHolder("k8s.io", "k8s.io/1/extract")},
 	}
 	if !slices.Equal(engine.holds, want) {
 		t.Fatalf("engine Hold calls = %+v, want %+v", engine.holds, want)
@@ -1340,7 +1327,7 @@ func TestApplyResumesAfterRestart(t *testing.T) {
 	if err := second.Commit(ctx, leaf, "moby/2/extract"); err != nil {
 		t.Fatalf("Commit(leaf) error = %v", err)
 	}
-	want = append(want, "build1.finish", "hold")
+	want = append(want, "build1.finish")
 	if !slices.Equal(engine.calls, want) {
 		t.Fatalf("engine calls = %v, want %v", engine.calls, want)
 	}
@@ -1506,7 +1493,7 @@ func TestRemoveLeavesOtherBuildsOpen(t *testing.T) {
 			t.Fatalf("Remove(%s) error = %v", key, err)
 		}
 	}
-	want := []string{"build0.ingest(0)", "build1.finish", "hold", "build2.ingest(0)", "build2.close"}
+	want := []string{"build0.ingest(0)", "build1.finish", "build2.ingest(0)", "build2.close"}
 	if !slices.Equal(engine.calls, want) {
 		t.Fatalf("engine calls = %v, want %v", engine.calls, want)
 	}
@@ -1569,7 +1556,7 @@ func TestRemoveReleasesByRecordedDigest(t *testing.T) {
 	if err := sn.Remove(ctx, name); err != nil {
 		t.Fatalf("Remove() error = %v", err)
 	}
-	want := []holdCall{{ref: root.String(), holder: recordHolder(name)}}
+	want := []holdCall{{ref: root.String(), holder: buildHolder("moby", "extract")}}
 	if !slices.Equal(engine.releases, want) {
 		t.Fatalf("engine Release calls = %+v, want %+v", engine.releases, want)
 	}
@@ -1600,7 +1587,7 @@ func TestRemoveToleratesReleaseFailure(t *testing.T) {
 	if err := sn.Remove(ctx, name); err != nil {
 		t.Fatalf("Remove() error = %v, want success despite the failed release", err)
 	}
-	want := []holdCall{{ref: root.String(), holder: recordHolder(name)}}
+	want := []holdCall{{ref: root.String(), holder: buildHolder("moby", "extract")}}
 	if !slices.Equal(engine.releases, want) {
 		t.Fatalf("engine Release calls = %+v, want %+v", engine.releases, want)
 	}
@@ -2162,6 +2149,16 @@ type fakeEngine struct {
 	// engine creates.
 	ingestErr error
 	finishErr error
+	// finishGate, when set, blocks every build's Finish until the gate is
+	// closed; Close closes it and then waits for finishDone, the way a real
+	// Close lets a finish already under way complete before it returns.
+	finishGate     chan struct{}
+	finishDone     chan struct{}
+	finishGateOnce sync.Once
+	finishDoneOnce sync.Once
+	// events records, in order, every hold a build's Finish takes and every
+	// Release, so a test can tell which came first.
+	events []string
 
 	// mu guards the call records, which concurrent commits append to.
 	mu sync.Mutex
@@ -2201,7 +2198,7 @@ func (e *fakeEngine) NewBuild(ctx context.Context, ref string, opts ...knarr.Pul
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.builds = append(e.builds, buildCall{ref: ref, opts: pullOpts})
-	return &fakeBuild{engine: e, name: fmt.Sprintf("build%d", len(e.builds)-1)}, nil
+	return &fakeBuild{engine: e, name: fmt.Sprintf("build%d", len(e.builds)-1), opts: pullOpts}, nil
 }
 
 func (e *fakeEngine) record(call string) {
@@ -2222,6 +2219,7 @@ func (e *fakeEngine) Release(_ context.Context, ref, holder string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.releases = append(e.releases, holdCall{ref: ref, holder: holder})
+	e.events = append(e.events, "release:"+holder)
 	return e.releaseErr
 }
 
@@ -2278,10 +2276,12 @@ type buildCall struct {
 }
 
 // fakeBuild stands in for a knarr image build, recording its calls on the
-// engine that created it.
+// engine that created it. A build opened with a hold records that hold, on
+// the root it was resolved to, when it finishes, as the real one does.
 type fakeBuild struct {
 	engine *fakeEngine
 	name   string
+	opts   knarr.PullOptions
 }
 
 func (b *fakeBuild) Ingest(_ context.Context, i int) error {
@@ -2291,14 +2291,39 @@ func (b *fakeBuild) Ingest(_ context.Context, i int) error {
 
 func (b *fakeBuild) Finish(context.Context) (*knarr.Image, error) {
 	b.engine.record(b.name + ".finish")
+	if b.engine.finishGate != nil {
+		<-b.engine.finishGate
+	}
 	if b.engine.finishErr != nil {
 		return nil, b.engine.finishErr
+	}
+	if b.opts.Hold != "" {
+		b.engine.mu.Lock()
+		b.engine.holds = append(b.engine.holds, holdCall{ref: b.opts.ResolvedRoot.String(), holder: b.opts.Hold})
+		b.engine.events = append(b.engine.events, "hold:"+b.opts.Hold)
+		b.engine.mu.Unlock()
+	}
+	if b.engine.finishDone != nil {
+		b.engine.finishDoneOnce.Do(func() { close(b.engine.finishDone) })
 	}
 	return &knarr.Image{}, nil
 }
 
 func (b *fakeBuild) Close() {
 	b.engine.record(b.name + ".close")
+	if b.engine.finishGate != nil {
+		b.engine.finishGateOnce.Do(func() { close(b.engine.finishGate) })
+	}
+	if b.engine.finishDone != nil {
+		<-b.engine.finishDone
+	}
+}
+
+// calls returns a copy of the engine's ordered call log.
+func (e *fakeEngine) callLog() []string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return slices.Clone(e.calls)
 }
 
 type holdCall struct {
@@ -2577,4 +2602,62 @@ func optionValue(t *testing.T, m mount.Mount, key string) string {
 	}
 	t.Fatalf("mount options %v carry no %s", m.Options, key)
 	return ""
+}
+
+// TestRemoveWaitsForFinishingBuild covers containerd unwinding a pull while
+// its last layer's apply is finishing the image: Remove of the staging leaf
+// record closes that build first — waiting for the finish, which takes the
+// hold as it completes — and only then releases the record's holder, so a
+// hold that lands during the removal is not left with nothing to release it.
+func TestRemoveWaitsForFinishingBuild(t *testing.T) {
+	ctx := pullNamespace()
+	engine := fakeEngineForImages()
+	engine.finishGate = make(chan struct{})
+	engine.finishDone = make(chan struct{})
+	sn := newStagingSnapshotter(t, engine)
+	layers := []digest.Digest{digest.FromString("layer-1")}
+	root, chains := stageImage(t, sn, layers...)
+
+	if _, err := sn.Prepare(ctx, "moby/1/extract", "", snapshots.WithLabels(stagedLabels("app:v1", root, chains[0]))); err != nil {
+		t.Fatalf("Prepare() error = %v", err)
+	}
+	applied := make(chan error, 1)
+	go func() { applied <- applyStaged(ctx, sn, "moby/1/extract", layers[0]) }()
+	deadline := time.Now().Add(5 * time.Second)
+	for !slices.Contains(engine.callLog(), "build0.finish") {
+		if time.Now().After(deadline) {
+			t.Fatal("the apply never reached Finish")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	if err := sn.Remove(context.Background(), "moby/1/extract"); err != nil {
+		t.Fatalf("Remove() error = %v", err)
+	}
+	if err := <-applied; err != nil {
+		t.Logf("Apply() after the removal returned %v", err)
+	}
+	holder := buildHolder("moby", "moby/1/extract")
+	want := []holdCall{{ref: root.String(), holder: holder}}
+	engine.mu.Lock()
+	holds, releases := slices.Clone(engine.holds), slices.Clone(engine.releases)
+	engine.mu.Unlock()
+	if !slices.Equal(holds, want) {
+		t.Fatalf("engine Hold calls = %+v, want the finishing build's hold %+v", holds, want)
+	}
+	if !slices.Equal(releases, want) {
+		t.Fatalf("engine Release calls = %+v, want the hold released after the finish", releases)
+	}
+	if calls := engine.callLog(); slices.Index(calls, "build0.close") < slices.Index(calls, "build0.finish") {
+		t.Fatalf("engine calls = %v, want the close after the finish began", calls)
+	}
+	engine.mu.Lock()
+	events := slices.Clone(engine.events)
+	engine.mu.Unlock()
+	if want := []string{"hold:" + holder, "release:" + holder}; !slices.Equal(events, want) {
+		t.Fatalf("hold/release order = %v, want %v: the release must follow the finish's hold", events, want)
+	}
+	if len(sn.finishing) != 0 {
+		t.Fatalf("finishing builds = %d after the removal, want none", len(sn.finishing))
+	}
 }
