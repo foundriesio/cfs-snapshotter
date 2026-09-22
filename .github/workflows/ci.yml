@@ -75,7 +75,7 @@ jobs:
       # pre-fetch it here into the module cache the container bind-mounts and
       # reuses; the build inside then resolves knarr offline.
       - name: Pre-fetch modules into the shared devcontainer cache
-        run: GOMODCACHE=/tmp/cfs-gomodcache go mod download
+        run: GOMODCACHE=$HOME/.cache/cfs-snapshotter/go-mod go mod download
       # Builds the version-pinned devcontainer image and verifies the knarr-fed
       # composefs data plane through Docker.
       - run: ./devshell.sh make test-e2e
