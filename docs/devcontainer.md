@@ -24,6 +24,13 @@ exact version the snapshotter pins and mounts the binary at
 get it, and `make test-e2e` (which needs it) will fail there — use
 `./devshell.sh` for the e2e.
 
+The container's Go build and module caches and that knarr binary are kept on
+the host under `~/.cache/cfs-snapshotter` (`$XDG_CACHE_HOME` when set), so
+they survive container runs and stay off a size-limited `/tmp`. Set
+`CFS_DEV_CACHE` to put them elsewhere. Anything that pre-fetches modules for
+the container, as CI does, must use the same module cache:
+`GOMODCACHE=~/.cache/cfs-snapshotter/go-mod go mod download`.
+
 The container is intentionally for development and conformance-style wiring
 checks only. It does not add Docker or container lifecycle behavior to
 cfs-snapshotter itself.

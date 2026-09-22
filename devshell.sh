@@ -12,6 +12,15 @@ DOCKER="${DOCKER:-docker}"
 LABEL_DEVSHELL=io.foundries.cfs-snapshotter.devshell
 LABEL_WORKSPACE=io.foundries.cfs-snapshotter.workspace
 
+# The host directories behind the container's Go caches and the knarr CLI it
+# is handed. They live under the user's cache directory rather than /tmp: a
+# tmpfs /tmp with a user quota fills up with a root-written build cache, and
+# then the ownership hand-back below fails and so does every other write.
+CACHE_DIR="${CFS_DEV_CACHE:-${XDG_CACHE_HOME:-${HOME}/.cache}/cfs-snapshotter}"
+GOCACHE_DIR="${CACHE_DIR}/go-build"
+GOMODCACHE_DIR="${CACHE_DIR}/go-mod"
+KNARR_BIN_DIR="${CACHE_DIR}/bin"
+
 find_running_container() {
 	"${DOCKER}" ps -q \
 		--filter "label=${LABEL_DEVSHELL}=1" \
@@ -44,15 +53,14 @@ exec_running_container() {
 
 # reconcile_cache_ownership hands the shared Go caches back to the host user.
 # The devcontainer runs as root (dockerd/containerd need it), so anything the
-# container writes into the host-bind-mounted /tmp/cfs-go{cache,modcache}
-# lands root-owned; the Go module cache in particular marks its directories
+# container writes into the host-bind-mounted Go caches lands root-owned; the Go module cache in particular marks its directories
 # read-only, so a later host-side `go` invocation can't even delete its way
 # out of it, only reset ownership. Run as a trap so it still fires if the
 # devshell command fails or is interrupted.
 reconcile_cache_ownership() {
 	"${DOCKER}" run --rm --entrypoint "" \
-		-v /tmp/cfs-gocache:/tmp/cfs-gocache \
-		-v /tmp/cfs-gomodcache:/tmp/cfs-gomodcache \
+		-v "${GOCACHE_DIR}:/tmp/cfs-gocache" \
+		-v "${GOMODCACHE_DIR}:/tmp/cfs-gomodcache" \
 		"${IMAGE}" chown -R "$(id -u):$(id -g)" /tmp/cfs-gocache /tmp/cfs-gomodcache
 }
 
@@ -61,7 +69,7 @@ run_new_container() {
 		set -- bash -il
 	fi
 
-	mkdir -p /tmp/cfs-gocache /tmp/cfs-gomodcache
+	mkdir -p "${GOCACHE_DIR}" "${GOMODCACHE_DIR}" "${KNARR_BIN_DIR}"
 
 	"${DOCKER}" build -f "${ROOT_DIR}/.devcontainer/Dockerfile" -t "${IMAGE}" "${ROOT_DIR}/.devcontainer"
 	trap reconcile_cache_ownership EXIT
@@ -80,20 +88,20 @@ run_new_container() {
 	# Portable across setups and CI, unlike bind-mounting a checkout. Best-effort:
 	# a plain shell still opens when the CLI is not needed or cannot be built.
 	#
-	# This also populates /tmp/cfs-gomodcache with the pinned knarr module, so the
-	# container's own `go build` (same GOMODCACHE, bind-mounted below) finds it
-	# without needing network access.
+	# This also populates the shared module cache with the pinned knarr module, so
+	# the container's own `go build` (same GOMODCACHE, bind-mounted below) finds
+	# it without needing network access.
 	# Both go commands run against the shared module cache rather than the
 	# caller's: the version probe needs the pinned module's go.mod, and a
 	# caller cache that misses it would send the probe to the network — where
 	# a not-yet-pushed pin does not resolve. GOFLAGS is cleared because flags
 	# like -mod are rejected by `go install pkg@version`, and a stray export
 	# would fail the build.
-	local knarr_goenv=(GOMODCACHE=/tmp/cfs-gomodcache GOTOOLCHAIN=auto GOPRIVATE=github.com/foundriesio GOFLAGS=)
+	local knarr_goenv=(GOMODCACHE="${GOMODCACHE_DIR}" GOTOOLCHAIN=auto GOPRIVATE=github.com/foundriesio GOFLAGS=)
 	local knarr_version
 	if knarr_version="$(cd "${ROOT_DIR}" && env "${knarr_goenv[@]}" go list -m -f '{{.Version}}' github.com/foundriesio/knarr)" &&
-		env "${knarr_goenv[@]}" GOBIN=/tmp/cfs-knarr-bin go install "github.com/foundriesio/knarr/cmd/knarr@${knarr_version}"; then
-		run_flags+=(-v /tmp/cfs-knarr-bin/knarr:/opt/cfs-dev/bin/knarr:ro)
+		env "${knarr_goenv[@]}" GOBIN="${KNARR_BIN_DIR}" go install "github.com/foundriesio/knarr/cmd/knarr@${knarr_version}"; then
+		run_flags+=(-v "${KNARR_BIN_DIR}/knarr:/opt/cfs-dev/bin/knarr:ro")
 	else
 		echo "warning: could not build the knarr CLI on the host; any e2e that needs it will fail" >&2
 	fi
@@ -109,8 +117,8 @@ run_new_container() {
 		-e PATH=/opt/cfs-dev/bin:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
 		-e GOCACHE=/tmp/cfs-gocache \
 		-e GOMODCACHE=/tmp/cfs-gomodcache \
-		-v /tmp/cfs-gocache:/tmp/cfs-gocache \
-		-v /tmp/cfs-gomodcache:/tmp/cfs-gomodcache \
+		-v "${GOCACHE_DIR}:/tmp/cfs-gocache" \
+		-v "${GOMODCACHE_DIR}:/tmp/cfs-gomodcache" \
 		-v "${ROOT_DIR}:/workspace" \
 		-w /workspace \
 		"${IMAGE}" \
