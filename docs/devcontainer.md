@@ -174,6 +174,14 @@ store with `knarr pull --from-dir` pinned by manifest digest:
 - Tampering with a backing object in the store makes the container fail with
   an I/O error — fs-verity rejects the modified content when overlayfs opens
   the file.
+- An image staged by `knarr pull --delta` is served like any other: two
+  zstd:chunked releases sharing a base layer (the pinned knarr module's own
+  fixtures, pushed to Zot blob by blob) are pulled with the first held as the
+  delta base, the second is fetched by ranges only and builds the composefs
+  image a plain pull builds, `docker pull` fetches none of its layers, a
+  container's export reads its changed, added and removed files through the
+  snapshotter, and releasing, removing and collecting the base reclaims what
+  only the first release carried while the second stays whole.
 
 The cold phase then restarts the snapshotter in the staged mode — the boot
 default — with
