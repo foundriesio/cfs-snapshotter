@@ -7,6 +7,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "${SCRIPT_DIR}/require-devcontainer.sh"
 require_cfs_devcontainer
 
+ROOT_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 CONTAINERD_SOCKET=/run/containerd/containerd.sock
 DOCKER_NAMESPACE=moby
 REGISTRY=127.0.0.1:5000
@@ -37,6 +38,10 @@ cold_ref=""
 share_ref=""
 share_more_ref=""
 partial_ref=""
+delta_ref=""
+# delta_base_ref is release N of the delta leg while the leg holds it as the
+# delta base, so a failure inside the leg does not leave the hold behind.
+delta_base_ref=""
 pull_pid=""
 # cold_composefs is the digest of the composefs image the cold pull built at
 # one ingest worker, which the two-worker re-pull and a knarr pull of the same
@@ -53,14 +58,14 @@ cleanup() {
 		wait "${pull_pid}" 2>/dev/null || true
 	fi
 	local name
-	for name in cfs-e2e-1 cfs-e2e-2 cfs-e2e-recovery cfs-e2e-cold; do
+	for name in cfs-e2e-1 cfs-e2e-2 cfs-e2e-recovery cfs-e2e-cold cfs-e2e-delta; do
 		if docker container inspect "${name}" >/dev/null 2>&1; then
 			docker rm -f "${name}" >/dev/null 2>&1 || echo "warning: failed to remove ${name}" >&2
 		fi
 	done
 	local ref
 	for ref in "${image_ref}" "${unheld_ref}" "${base_ref}" "${substitution_ref}" \
-		"${cold_ref}" "${share_ref}" "${share_more_ref}" "${partial_ref}"; do
+		"${cold_ref}" "${share_ref}" "${share_more_ref}" "${partial_ref}" "${delta_ref}"; do
 		if [ -n "${ref}" ] && docker image inspect "${ref}" >/dev/null 2>&1; then
 			docker rmi -f "${ref}" >/dev/null 2>&1 || echo "warning: failed to remove ${ref}" >&2
 		fi
@@ -70,6 +75,20 @@ cleanup() {
 	fi
 	if [ -n "${fresh_knarr_root}" ] && [ -e "${fresh_knarr_root}" ]; then
 		rm -rf "${fresh_knarr_root}" || echo "warning: failed to remove ${fresh_knarr_root}" >&2
+	fi
+	# The delta leg's hold and references live in the warm store; a failure
+	# inside the leg must not leave them for the next run to trip over.
+	if [ -n "${delta_base_ref}" ]; then
+		"${KNARR_BIN}" --root "${WARM_KNARR_ROOT}" release --holder delta-base "${delta_base_ref}" >/dev/null 2>&1 ||
+			echo "warning: failed to release the delta base ${delta_base_ref}" >&2
+		for ref in "${delta_base_ref}" "${delta_ref}"; do
+			[ -n "${ref}" ] || continue
+			"${KNARR_BIN}" --root "${WARM_KNARR_ROOT}" inspect "${ref}" >/dev/null 2>&1 || continue
+			"${KNARR_BIN}" --root "${WARM_KNARR_ROOT}" remove "${ref}" >/dev/null 2>&1 ||
+				echo "warning: failed to remove ${ref} from the warm store" >&2
+		done
+		"${KNARR_BIN}" --root "${WARM_KNARR_ROOT}" gc >/dev/null 2>&1 ||
+			echo "warning: failed to collect the warm store" >&2
 	fi
 	# Either phase's failure leaves its own daemon running; put the
 	# devcontainer back in its boot posture (staged mode, default stores),
@@ -612,6 +631,179 @@ assert_warm_tag_identity() {
 	echo "PASS: a tag staged out of band admitted, held, and removed by its manifest identity"
 }
 
+# knarr_fixtures prints the directory of the pinned knarr module's
+# zstd:chunked fixtures: two releases sharing a base layer, written by
+# skopeo, as linux/amd64 single-image OCI layouts. The module lives in the
+# module cache devshell hands the container.
+knarr_fixtures() {
+	local dir
+	dir="$(cd "${ROOT_DIR}" && go list -m -f '{{.Dir}}' github.com/foundriesio/knarr)" ||
+		fail "cannot locate the pinned knarr module in the module cache"
+	dir="${dir}/internal/zstdchunked/testdata"
+	[ -f "${dir}/release-n/index.json" ] && [ -f "${dir}/release-n1/index.json" ] ||
+		fail "the pinned knarr module has no delta fixtures under ${dir}"
+	printf '%s\n' "${dir}"
+}
+
+# push_layout publishes a single-image OCI layout to the registry under a
+# tag, blob by blob over the distribution API, so the manifest lands byte
+# for byte: the zstd:chunked annotations on its layer descriptors are what
+# a delta pull reads. It checks the registry serves the manifest back under
+# the digest the layout names it by.
+push_layout() {
+	local layout="$1" repo="$2" tag="$3" mdigest mtype blob digest location served
+	mdigest="$(manifest_digest "${layout}")" || fail "cannot read the manifest digest of ${layout}"
+	mtype="$(jq -r '.manifests[0].mediaType' "${layout}/index.json")" ||
+		fail "cannot read the manifest media type of ${layout}"
+	for blob in "${layout}"/blobs/sha256/*; do
+		digest="sha256:${blob##*/}"
+		[ "${digest}" != "${mdigest}" ] || continue
+		location="$(curl -fsS -X POST -o /dev/null -D - "http://${REGISTRY}/v2/${repo}/blobs/uploads/" |
+			awk 'tolower($1) == "location:" {print $2}' | tr -d '\r')" ||
+			fail "cannot start the upload of ${digest}"
+		[ -n "${location}" ] || fail "the registry offered no upload location for ${digest}"
+		case "${location}" in
+		http://* | https://*) ;;
+		*) location="http://${REGISTRY}${location}" ;;
+		esac
+		case "${location}" in
+		*\?*) location="${location}&digest=${digest}" ;;
+		*) location="${location}?digest=${digest}" ;;
+		esac
+		curl -fsS -X PUT -H 'Content-Type: application/octet-stream' \
+			--data-binary "@${blob}" -o /dev/null "${location}" ||
+			fail "cannot push blob ${digest} of ${layout}"
+	done
+	curl -fsS -X PUT -H "Content-Type: ${mtype}" \
+		--data-binary "@${layout}/blobs/sha256/${mdigest#sha256:}" -o /dev/null \
+		"http://${REGISTRY}/v2/${repo}/manifests/${tag}" ||
+		fail "cannot push the manifest of ${layout} as ${repo}:${tag}"
+	served="$(curl -fsS -H "Accept: ${mtype}" "http://${REGISTRY}/v2/${repo}/manifests/${tag}" |
+		sha256sum | cut -d' ' -f1)" || fail "cannot read back ${repo}:${tag}"
+	[ "sha256:${served}" = "${mdigest}" ] ||
+		fail "the registry serves ${repo}:${tag} as sha256:${served}, pushed ${mdigest}"
+}
+
+# assert_delta_rootfs reads release N+1's rootfs the way the runtime serves
+# it — a container's export goes through the snapshotter's mounts — without
+# running anything: the fixture carries no program, and create never runs
+# the command it is given.
+assert_delta_rootfs() {
+	local tar="${work}/delta-rootfs.tar" listing
+	docker create --network=none --name cfs-e2e-delta "${delta_ref}" /nonexistent >/dev/null ||
+		fail "cannot create a container from the delta-pulled image"
+	docker export -o "${tar}" cfs-e2e-delta || fail "cannot export the delta-pulled container's rootfs"
+	docker rm cfs-e2e-delta >/dev/null || fail "cannot remove the exported container"
+	[ "$(tar -xOf "${tar}" app/config)" = "v=2" ] ||
+		fail "release N+1's app/config is not the delta-fetched content"
+	listing="$(tar -tf "${tar}")" || fail "cannot list the exported rootfs"
+	grep -Fxq app/new <<<"${listing}" || fail "release N+1's app/new is missing from the exported rootfs"
+	! grep -Fxq app/old <<<"${listing}" || fail "release N's app/old is still in release N+1's rootfs"
+}
+
+# assert_delta_fast_path covers an image that entered the store by a delta
+# pull. Release N is pulled and held as the delta base; release N+1 — the
+# same base layer, an app layer that changes one file, drops one and adds
+# one — is pulled by ranges over it and must be the image a plain pull
+# builds; the runtime then gets it through the fast path like any staged
+# image. Releasing, removing and collecting the base afterwards reclaims what
+# only N carried and leaves N+1 whole.
+assert_delta_fast_path() {
+	local fixtures repo="cfs/e2e-release" n_layout n1_layout n_ref n1_digest n1_manifest
+	local app_layer old_object log summary fetched size info plain_info config
+
+	# The fixtures are linux/amd64 images; a host of another architecture
+	# cannot pull them, so the leg is skipped there rather than failed.
+	local arch
+	arch="$(go env GOHOSTARCH)" || fail "cannot determine the host architecture"
+	if [ "${arch}" != amd64 ]; then
+		echo "== skipped: the delta fixtures are linux/amd64 images" >&2
+		return 0
+	fi
+	fixtures="$(knarr_fixtures)"
+	n_layout="${fixtures}/release-n"
+	n1_layout="${fixtures}/release-n1"
+	push_layout "${n_layout}" "${repo}" n
+	push_layout "${n1_layout}" "${repo}" n1
+	n_ref="$(pinned_ref "${REGISTRY}/${repo}" "${n_layout}")" || fail "cannot pin release N"
+	delta_ref="$(pinned_ref "${REGISTRY}/${repo}" "${n1_layout}")" || fail "cannot pin release N+1"
+	n1_digest="$(manifest_digest "${n1_layout}")"
+	n1_manifest="$(cat "${n1_layout}/blobs/sha256/${n1_digest#sha256:}")"
+	[ "$(jq -r '.layers[0].digest' <<<"${n1_manifest}")" = "$(image_layers "${n_layout}" | jq -r '.[0]')" ] ||
+		fail "the two releases do not share their base layer"
+	app_layer="$(jq -r '.layers[1].digest' <<<"${n1_manifest}")"
+	# app/old is the one file only N carries; its object goes when N does.
+	old_object="$(sharded_path "$(cas_dir)" "$(printf 'this file is bigger than sixty-four bytes so it is stored as an object.\nold\n' |
+		sha256sum | cut -d' ' -f1)")"
+
+	knarr_cli pull --delta "${n_ref}" >&2 || fail "delta pull of release N failed"
+	[ -f "${old_object}" ] || fail "release N's app/old is not a store object after its pull"
+	delta_base_ref="${n_ref}"
+	knarr_cli hold --holder delta-base "${n_ref}" >&2 || fail "cannot hold release N as the delta base"
+
+	log="${work}/delta.log"
+	if ! knarr_cli pull --delta "${delta_ref}" >/dev/null 2>"${log}"; then
+		cat "${log}" >&2
+		fail "delta pull of release N+1 failed"
+	fi
+	cat "${log}" >&2
+	[ "$(grep -c 'msg="delta: layer"' "${log}")" -eq 2 ] ||
+		fail "the delta pull did not log one line per layer of release N+1"
+	if grep 'msg="delta: layer"' "${log}" | grep -qv 'fallback=none'; then
+		fail "a layer of release N+1 fell back to a whole fetch"
+	fi
+	grep -Eq "msg=\"delta: layer\" layer=${app_layer} .* requests=[1-9][0-9]* .* fallback=none" "${log}" ||
+		fail "the app layer of release N+1 was not fetched by ranges"
+	summary="$(grep 'msg="delta: pull"' "${log}")" || fail "the delta pull logged no summary line"
+	fetched="$(sed -n 's/.* fetched=\([0-9]*\).*/\1/p' <<<"${summary}")"
+	size="$(sed -n 's/.* size=\([0-9]*\).*/\1/p' <<<"${summary}")"
+	[ "${fetched}" -gt 0 ] && [ "${fetched}" -lt "${size}" ] ||
+		fail "the delta pull fetched ${fetched} of ${size} layer bytes"
+	echo "PASS: release N+1 was pulled by ranges over the held release N"
+
+	# The fresh store must sit on the shared fs-verity filesystem, like every
+	# other store the devcontainer uses.
+	fresh_knarr_root="$(mktemp -d /var/lib/cfs-shared-root/knarr-e2e-plain.XXXXXX)" ||
+		fail "cannot create a fresh knarr root"
+	"${KNARR_BIN}" --root "${fresh_knarr_root}" pull "${delta_ref}" >&2 ||
+		fail "plain pull of release N+1 into a fresh store failed"
+	info="$(knarr_cli inspect --format json "${delta_ref}")" ||
+		fail "the knarr store does not hold the delta-pulled release N+1"
+	plain_info="$("${KNARR_BIN}" --root "${fresh_knarr_root}" inspect --format json "${delta_ref}")" ||
+		fail "the fresh store does not hold the plain-pulled release N+1"
+	[ "$(jq -r '.composefs.digest' <<<"${info}")" = "$(jq -r '.composefs.digest' <<<"${plain_info}")" ] ||
+		fail "the delta pull built a different composefs image than the plain pull"
+	[ "$(jq -r '.fsverity' <<<"${info}")" = "$(jq -r '.fsverity' <<<"${plain_info}")" ] ||
+		fail "the delta pull's fs-verity digest differs from the plain pull's"
+	rm -rf "${fresh_knarr_root}" || fail "cannot remove the fresh knarr root"
+	fresh_knarr_root=""
+	echo "PASS: the delta pull built the composefs image a plain pull builds"
+
+	config="$(jq -r '.config.digest' <<<"${n1_manifest}")"
+	layers_absent "${n1_manifest}" || fail "a layer of release N+1 was in containerd's content store before the pull"
+	docker pull "${delta_ref}" >/dev/null || fail "docker pull of the delta-pulled image failed"
+	docker image inspect "${delta_ref}" >/dev/null || fail "the runtime does not list the delta-pulled image"
+	layers_absent "${n1_manifest}" || fail "docker pull fetched a layer of the delta-pulled image"
+	content_has "${config}" || fail "image config was not fetched"
+	echo "PASS: docker pull of the delta-pulled image fetched no layer"
+
+	assert_delta_rootfs
+	echo "PASS: the runtime read release N+1's delta-fetched files through the snapshotter"
+
+	knarr_cli release --holder delta-base "${n_ref}" >&2 || fail "cannot release the delta base"
+	knarr_cli remove "${n_ref}" >&2 || fail "cannot remove release N"
+	delta_base_ref=""
+	knarr_cli gc >&2 || fail "knarr gc after removing release N failed"
+	[ ! -e "${old_object}" ] || fail "release N's app/old object survived its removal and collection"
+	[ "$(image_bindings "${n1_digest}")" -eq 1 ] || fail "release N+1 lost its composefs image"
+	assert_delta_rootfs
+	echo "PASS: releasing, removing and collecting the delta base kept release N+1 whole"
+
+	docker rmi "${delta_ref}" >/dev/null || fail "docker rmi of the delta-pulled image failed"
+	knarr_remove_when_released "${delta_ref}"
+	knarr_cli gc >&2 || fail "knarr gc after removing release N+1 failed"
+}
+
 assert_concurrent_shared_mount() {
 	local chainfs="$1" before after pid fstype
 	before="$(chain_mounts)"
@@ -1127,6 +1319,7 @@ warm_phase() {
 	assert_tamper_fails_at_open
 	assert_warm_hold_released
 	assert_warm_tag_identity "${nonce}"
+	assert_delta_fast_path
 }
 
 cold_phase() {
@@ -1173,7 +1366,7 @@ mounts it into the container (a container started any other way has none)"
 	warm_phase "${nonce}"
 	cold_phase "${nonce}"
 	echo "E2E PASS: handshake identity, real content, recovery, concurrency, teardown," \
-		"tamper enforcement, holds, tag identity, cold conversion, rmi reclaim, dedup," \
+		"tamper enforcement, holds, tag identity, delta fast path, cold conversion, rmi reclaim, dedup," \
 		"interrupted-pull recovery, mixed-door identity, adoption, self-heal, and worker-count identity"
 }
 
