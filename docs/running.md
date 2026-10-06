@@ -244,10 +244,10 @@ Four residuals of routing layers through the differ are worth knowing:
   removal as that pull being unwound, closing the build of the new pull if
   one is under way for the same image. One layer apply of the new pull then
   fails; a retry converges.
-- Where containerd's content store lives matters: every layer is read back
-  from it, so a slow root filesystem slows the ingest. On a device with a
-  faster secondary disk, moving containerd's root there is worth more than
-  any worker count.
+- Where containerd's content store lives matters: every layer the store has
+  not read before is read back from it, so a slow root filesystem slows the
+  ingest. On a device with a faster secondary disk, moving containerd's
+  root there is worth more than any worker count.
 
 The two work modes are exclusive, and the flag defaults to on:
 
