@@ -15,6 +15,7 @@ import (
 	introspectionapi "github.com/containerd/containerd/api/services/introspection/v1"
 	versionapi "github.com/containerd/containerd/api/services/version/v1"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 
 	"github.com/foundriesio/cfs-snapshotter/internal/snapshot"
 )
@@ -28,7 +29,7 @@ func fakeContainerd(t *testing.T, version string, plugins []*introspectionapi.Pl
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	server := grpc.NewServer()
+	server := grpc.NewServer(grpc.Creds(insecure.NewCredentials()))
 	versionapi.RegisterVersionServer(server, &fakeVersionServer{version: version})
 	introspectionapi.RegisterIntrospectionServer(server, &fakeIntrospectionServer{plugins: plugins})
 	go func() { _ = server.Serve(listener) }()

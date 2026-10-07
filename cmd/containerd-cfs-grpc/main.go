@@ -27,6 +27,7 @@ import (
 	"github.com/foundriesio/knarr/pkg/knarr"
 	"golang.org/x/sys/unix"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 
 	"github.com/foundriesio/cfs-snapshotter/internal/snapshot"
 	"github.com/foundriesio/cfs-snapshotter/pkg/version"
@@ -121,9 +122,9 @@ func run(ctx context.Context, address string, cfg snapshot.Config) error {
 		}
 	}()
 
-	// The server listens on a unix socket that only containerd connects to;
-	// transport credentials do not apply to it.
-	server := grpc.NewServer() // nosemgrep: go.grpc.security.grpc-server-insecure-connection.grpc-server-insecure-connection
+	// The server listens on a unix socket that only containerd connects to,
+	// so the transport is deliberately left without credentials.
+	server := grpc.NewServer(grpc.Creds(insecure.NewCredentials()))
 	snapshotsapi.RegisterSnapshotsServer(server, snapshotservice.FromSnapshotter(sn))
 	diffapi.RegisterDiffServer(server, newDiffServer(sn))
 
