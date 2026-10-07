@@ -123,6 +123,11 @@ RUN set -eux; \
     install -m 0644 /tmp/cfs-devcontainer-config/zot-config.json /etc/zot/config.json; \
     rm -rf /tmp/cfs-devcontainer-config
 
+# The container runs as root on purpose: the entrypoint and the end-to-end
+# tests mount filesystems, set up loop devices and run containerd and dockerd,
+# and the devcontainer is started --privileged for the same reason.
+# nosemgrep: dockerfile.security.missing-user-entrypoint.missing-user-entrypoint
 ENTRYPOINT ["/workspace/.devcontainer/scripts/entrypoint.sh"]
 # Keep editor-managed devcontainer sessions alive when no command is provided.
+# nosemgrep: dockerfile.security.missing-user.missing-user
 CMD ["sleep", "infinity"]
