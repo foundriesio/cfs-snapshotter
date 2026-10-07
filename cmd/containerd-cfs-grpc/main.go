@@ -121,7 +121,9 @@ func run(ctx context.Context, address string, cfg snapshot.Config) error {
 		}
 	}()
 
-	server := grpc.NewServer()
+	// The server listens on a unix socket that only containerd connects to;
+	// transport credentials do not apply to it.
+	server := grpc.NewServer() // nosemgrep: go.grpc.security.grpc-server-insecure-connection.grpc-server-insecure-connection
 	snapshotsapi.RegisterSnapshotsServer(server, snapshotservice.FromSnapshotter(sn))
 	diffapi.RegisterDiffServer(server, newDiffServer(sn))
 
