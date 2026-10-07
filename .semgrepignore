@@ -1,0 +1,4 @@
+# The dev container runs as root on purpose: its entrypoint and the end-to-end
+# tests mount filesystems, set up loop devices and run containerd and dockerd.
+# It is not a shipped artifact, so the Dockerfile security rules do not apply.
+.devcontainer/

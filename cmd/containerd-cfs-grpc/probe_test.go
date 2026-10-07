@@ -19,6 +19,7 @@ import (
 	"github.com/sirupsen/logrus"
 	logrustest "github.com/sirupsen/logrus/hooks/test"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/protobuf/types/known/emptypb"
 
 	"github.com/foundriesio/cfs-snapshotter/internal/snapshot"
@@ -87,7 +88,7 @@ func runProbe(t *testing.T, version string, plugins []*introspectionapi.Plugin, 
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	server := grpc.NewServer()
+	server := grpc.NewServer(grpc.Creds(insecure.NewCredentials()))
 	versionapi.RegisterVersionServer(server, &fakeVersionServer{version: version})
 	introspectionapi.RegisterIntrospectionServer(server, &fakeIntrospectionServer{plugins: plugins})
 	go func() { _ = server.Serve(listener) }()
@@ -215,7 +216,7 @@ func TestProbeReportsRecovery(t *testing.T) {
 	}
 	wired := wiredPlugins(map[string]string{"enable_remote_snapshot_annotations": "true"})
 	introspection := &fakeIntrospectionServer{plugins: wired}
-	server := grpc.NewServer()
+	server := grpc.NewServer(grpc.Creds(insecure.NewCredentials()))
 	versionapi.RegisterVersionServer(server, &fakeVersionServer{version: "v2.2.3"})
 	introspectionapi.RegisterIntrospectionServer(server, introspection)
 	go func() { _ = server.Serve(listener) }()
