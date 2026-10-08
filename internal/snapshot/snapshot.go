@@ -225,8 +225,15 @@ type snapshotter struct {
 	// cancels before it waits for that goroutine. Neither channel is ever
 	// closed: kick wakes the goroutine to collect now, retry to collect once
 	// the interval has passed after a busy store.
+	//
+	// releases counts the holds Remove has released, and covered is the count
+	// the last completed collection had seen when it began, so a cleanup with
+	// no release left to cover returns without waiting for a collection that
+	// is running for another reason.
 	reclaimMu sync.Mutex
 	dirty     atomic.Bool
+	releases  atomic.Uint64
+	covered   atomic.Uint64
 	kick      chan struct{}
 	retry     chan struct{}
 	lifetime  context.Context
@@ -398,8 +405,14 @@ func (s *snapshotter) reconcileHolds(ctx context.Context) error {
 // the client asked to be synchronous, as docker's is — waits for it, so the
 // store is reclaimed by the time the client's command returns. The
 // collection runs on the snapshotter's own context: the RPC's only waits.
+// A cycle that released no hold since the last completed collection, such as
+// a container's removal, returns at once instead of waiting for a collection
+// the snapshotter is running for another reason.
 func (s *snapshotter) Cleanup(ctx context.Context) error {
 	log.G(ctx).Trace("cfs snapshotter: cleanup")
+	if s.covered.Load() >= s.releases.Load() {
+		return nil
+	}
 	return s.collect()
 }
 
@@ -428,6 +441,7 @@ func (s *snapshotter) collect() error {
 	if !s.dirty.Swap(false) {
 		return nil
 	}
+	releases := s.releases.Load()
 	report, err := s.engine.GC(s.lifetime)
 	switch {
 	case errors.Is(err, knarr.ErrStoreBusy):
@@ -441,9 +455,11 @@ func (s *snapshotter) collect() error {
 	case s.lifetime.Err() != nil:
 		return nil
 	case err != nil:
+		s.covered.Store(releases)
 		log.L.WithError(err).Error("cfs snapshotter: store collection failed")
 		return fmt.Errorf("collect the knarr store: %w", err)
 	}
+	s.covered.Store(releases)
 	entry := log.L.WithFields(log.Fields{
 		"objects":  report.ObjectsRemoved,
 		"bytes":    report.BytesFreed,
@@ -836,6 +852,9 @@ func (s *snapshotter) Remove(ctx context.Context, key string) (err error) {
 	// the release leaves unwanted is the next collection's to reclaim.
 	if root := labels[rootDigestLabel]; root != "" {
 		s.releaseHold(ctx, root, labels[holderLabel])
+		// Counted before the store is marked, so a collection that reads the
+		// count too early to cover this release leaves the mark for the next.
+		s.releases.Add(1)
 		s.dirty.Store(true)
 	}
 	return nil

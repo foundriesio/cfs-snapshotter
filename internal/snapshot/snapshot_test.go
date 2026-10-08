@@ -2150,9 +2150,11 @@ type fakeEngine struct {
 	ingestErr error
 	finishErr error
 	// held is what Holds reports; gcErr fails every GC and gcs counts them.
-	held  map[digest.Digest][]string
-	gcErr error
-	gcs   int
+	// gcGate, when set, holds every GC, already counted, until it is closed.
+	held   map[digest.Digest][]string
+	gcErr  error
+	gcs    int
+	gcGate chan struct{}
 	// finishGate, when set, blocks every build's Finish until the gate is
 	// closed; Close closes it and then waits for finishDone, the way a real
 	// Close lets a finish already under way complete before it returns.
@@ -2238,12 +2240,27 @@ func (e *fakeEngine) GC(ctx context.Context, _ ...knarr.GCOption) (*knarr.GCRepo
 		return nil, err
 	}
 	e.mu.Lock()
-	defer e.mu.Unlock()
 	e.gcs++
-	if e.gcErr != nil {
-		return nil, e.gcErr
+	gate, gcErr := e.gcGate, e.gcErr
+	e.mu.Unlock()
+	if gate != nil {
+		select {
+		case <-gate:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	if gcErr != nil {
+		return nil, gcErr
 	}
 	return &knarr.GCReport{}, nil
+}
+
+// setGCGate makes every later collection wait until gate is closed.
+func (e *fakeEngine) setGCGate(gate chan struct{}) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.gcGate = gate
 }
 
 // gcCount reports how many collections the engine has run.
@@ -2843,9 +2860,147 @@ func TestCleanupReportsOtherFailuresOnce(t *testing.T) {
 	if err := sn.Cleanup(context.Background()); err != nil {
 		t.Fatalf("Cleanup() with nothing to collect error = %v", err)
 	}
-	sn.dirty.Store(true)
+	name := commitStaged(t, sn, "app", digest.FromString("layer-1"))
+	awaitGCs(t, engine, 2)
+	if err := sn.Remove(pullNamespace(), name); err != nil {
+		t.Fatalf("Remove() error = %v", err)
+	}
 	if err := sn.Cleanup(context.Background()); !errors.Is(err, broken) {
 		t.Fatalf("Cleanup() on a broken store error = %v, want %v", err, broken)
+	}
+	if err := sn.Cleanup(context.Background()); err != nil {
+		t.Fatalf("Cleanup() after the failure was reported error = %v, want none", err)
+	}
+	if got := engine.gcCount(); got != 3 {
+		t.Fatalf("collections = %d, want 3: a reported failure is not retried", got)
+	}
+}
+
+// commitStaged pulls a one-layer image through the staging path, commits its
+// leaf under a runtime name and returns that name. The build's end kicks a collection.
+func commitStaged(t *testing.T, sn *snapshotter, author string, layer digest.Digest) string {
+	t.Helper()
+	ctx := pullNamespace()
+	root, chains := stageImageBy(t, sn, author, layer)
+	key := "extract-" + author
+	if _, err := sn.Prepare(ctx, key, "", snapshots.WithLabels(stagedLabels(author+":v1", root, chains[0]))); err != nil {
+		t.Fatalf("Prepare() error = %v", err)
+	}
+	if err := applyStaged(ctx, sn, key, layer); err != nil {
+		t.Fatalf("Apply() error = %v", err)
+	}
+	name := "moby/1/" + chains[0].String()
+	if err := sn.Commit(ctx, name, key); err != nil {
+		t.Fatalf("Commit() error = %v", err)
+	}
+	return name
+}
+
+// cleanupAsync runs Cleanup on its own goroutine and returns its result.
+func cleanupAsync(sn *snapshotter) <-chan error {
+	done := make(chan error, 1)
+	go func() { done <- sn.Cleanup(context.Background()) }()
+	return done
+}
+
+// TestCleanupSkipsWhenNothingReleased covers a cycle that released no hold,
+// such as a container's removal, arriving while a collection runs for
+// another reason: its cleanup returns at once instead of waiting for it.
+func TestCleanupSkipsWhenNothingReleased(t *testing.T) {
+	engine := fakeEngineForImages()
+	gate := make(chan struct{})
+	engine.gcGate = gate
+	sn := newStagingSnapshotter(t, engine)
+	awaitGCs(t, engine, 1)
+	select {
+	case err := <-cleanupAsync(sn):
+		if err != nil {
+			t.Fatalf("Cleanup() error = %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Cleanup() waited for a collection that covers no release of its cycle")
+	}
+	close(gate)
+}
+
+// TestCleanupWaitsForCoveringCollection covers an image's removal while the
+// snapshotter is already collecting: the cleanup waits for that collection
+// when it covers the release, and runs one of its own when the running one
+// began before the release, so the store is reclaimed when it returns.
+func TestCleanupWaitsForCoveringCollection(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		releaseFirst bool
+		wantGCs      int
+	}{
+		{name: "running collection covers the release", releaseFirst: true, wantGCs: 3},
+		{name: "running collection began before the release", releaseFirst: false, wantGCs: 4},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			engine := fakeEngineForImages()
+			sn := newStagingSnapshotter(t, engine)
+			awaitGCs(t, engine, 1)
+			name := commitStaged(t, sn, "app", digest.FromString("layer-1"))
+			awaitGCs(t, engine, 2)
+			waitClean(t, sn)
+
+			gate := make(chan struct{})
+			engine.setGCGate(gate)
+			remove := func() {
+				if err := sn.Remove(pullNamespace(), name); err != nil {
+					t.Fatalf("Remove() error = %v", err)
+				}
+			}
+			if tc.releaseFirst {
+				remove()
+			}
+			sn.collectSoon()
+			awaitGCs(t, engine, 3)
+			if !tc.releaseFirst {
+				remove()
+			}
+
+			// What the collections had covered when Cleanup returned: a
+			// Cleanup that returned before the release was collected shows
+			// it, whatever the scheduling.
+			coveredAtReturn := make(chan uint64, 1)
+			go func() {
+				if err := sn.Cleanup(context.Background()); err != nil {
+					t.Errorf("Cleanup() error = %v", err)
+				}
+				coveredAtReturn <- sn.covered.Load()
+			}()
+			close(gate)
+			select {
+			case covered := <-coveredAtReturn:
+				if released := sn.releases.Load(); covered != released {
+					t.Fatalf("Cleanup() returned with %d releases collected, want all %d", covered, released)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("Cleanup() did not return after the collection finished")
+			}
+			if got := engine.gcCount(); got != tc.wantGCs {
+				t.Fatalf("collections = %d, want %d", got, tc.wantGCs)
+			}
+		})
+	}
+}
+
+// waitClean waits until no collection is pending or running.
+func waitClean(t *testing.T, sn *snapshotter) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		sn.reclaimMu.Lock()
+		dirty := sn.dirty.Load()
+		sn.reclaimMu.Unlock()
+		if !dirty {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the store stayed marked dirty")
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
 
