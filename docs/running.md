@@ -220,8 +220,11 @@ prefix of another image the runtime still lists stays in the store with that
 image: containerd keeps its last record as the other's ancestor, and both are
 reclaimed when the other goes. The collection is a walk of the whole store,
 not a delete proportional to the image, so `docker image rm` costs a store
-walk. `docker images` reports a staged image's size as its composefs
-metadata, not its content.
+walk; the walk does not hold up a mount or a pull started meanwhile, and a
+collection that meets one still running when it moves on to deleting is
+retried the same way as one that found the store busy at its start.
+`docker images` reports a staged image's size as its composefs metadata, not
+its content.
 
 A `knarr gc` while a staged pull is in progress, or shortly after one was
 interrupted, reports the store busy: the pull's build keeps the store's shared
