@@ -205,13 +205,18 @@ with `knarr gc` — reclaiming what an agent let go is the agent's call, not
 the snapshotter's. A runtime pull never displaces a reference the agent
 recorded for the same name: the image is then held but not named.
 
-The store is also collected after every pull, whether it finished or was
-abandoned: a pull writes every file of every layer, and the files a later
-layer replaced or removed are objects no image references, so the daemon
-collects them in the background as soon as the image is built. A collection
-that finds the store busy — a pull or a mount in flight — is retried by the
-daemon shortly after, so a removal during a pull reclaims a little later than
-the command's return. A collection that fails for any
+A pull writes every file of every layer, and the files a later layer
+replaced or removed are objects this image no longer references. A finished
+pull does not request a collection for them: those nothing else retains go
+with the next one, whoever asks for it — an agent's `knarr gc` once the new
+image is running, a `docker rmi` that releases a hold, the daemon's start, or
+a pull that failed — so on a machine that only ever pulls they stay until one
+of those happens, and for an image that writes and later deletes large files
+they can be large. A pull that failed or was interrupted is collected in the
+background as soon as its build is abandoned. A collection that finds the
+store busy — a pull or a mount in flight — is retried by the daemon shortly
+after, so a removal during a pull reclaims a little later than the command's
+return. A collection that fails for any
 other reason is logged and does not fail the docker command; nothing of it
 reaches the docker CLI. A hold of the snapshotter's own that no record owns —
 what a crash between a finished build and its record leaves behind — is

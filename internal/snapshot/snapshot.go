@@ -417,9 +417,9 @@ func (s *snapshotter) Cleanup(ctx context.Context) error {
 }
 
 // collectSoon marks the store to be collected and wakes the reclaim
-// goroutine to do it. A build that ended is what calls it: finished or not,
-// the build wrote every file of every layer it saw, and the files a later
-// layer replaced or removed are objects no image references.
+// goroutine to do it. A build that failed or was abandoned is what calls
+// it. The files a finished build wrote which its image does not reference
+// wait for the next collection, whatever requests it.
 func (s *snapshotter) collectSoon() {
 	s.dirty.Store(true)
 	select {
@@ -429,7 +429,7 @@ func (s *snapshotter) collectSoon() {
 }
 
 // collect runs one collection of the knarr store if a hold was released, or
-// a build ended, since the last one. A store busy with a pull, hold or mount
+// a build failed, since the last one. A store busy with a pull, hold or mount
 // defers the collection to the reclaim goroutine — the removal that made it
 // necessary has already happened, only the reclaiming waits — while any
 // other failure is reported and not retried: a store the collector cannot
