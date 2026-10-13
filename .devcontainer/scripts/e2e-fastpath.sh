@@ -370,15 +370,20 @@ knarr_holder_of_digest() {
 	jq -r --arg d "${digest}" 'map(select(.digest == $d)) | .[0].holder // ""' <<<"${listing}"
 }
 
-# store_settled reports whether a collection would reclaim nothing: the
-# snapshotter collects the store on its own after each pull, so the shadowed
-# content a pull leaves is gone shortly after the pull returns. While that
-# collection runs the store is busy and the probe fails, which is "not yet",
-# not an error.
+# store_settled reports whether a collection would reclaim nothing: a build
+# abandoned midway requests a collection, so what an interrupted pull wrote
+# is gone shortly after its build is closed. While that collection runs the
+# store is busy and the probe fails, which is "not yet", not an error.
 store_settled() {
 	local report
 	report="$(knarr_cli gc --dry-run --format json 2>/dev/null)" || return 1
 	[ "$(jq -r '.objectsRemoved' <<<"${report}")" -eq 0 ]
+}
+
+# collect_store runs one collection; a store busy with a pull or a mount
+# makes it fail, which under wait_until is "not yet".
+collect_store() {
+	knarr_cli gc >/dev/null 2>&1
 }
 
 # shadow_object reports the store path of the shadow.txt a seeded layer
@@ -967,10 +972,16 @@ assert_cold_pull_lands_composefs() {
 	*) fail "the staged image's reference is not a runtime reference for a cfs build holder" ;;
 	esac
 	# The pull wrote three versions of shadow.txt; the image references the
-	# last. The snapshotter collects the other two without being asked.
-	wait_until "the pull's shadowed content to be collected" 60 0.5 store_settled
+	# last. A finished pull leaves the other two for the next collection.
+	[ -e "$(shadow_object "${nonce}-cold" 1)" ] ||
+		fail "the first layer's shadowed file was collected by the pull itself"
+	[ -e "$(shadow_object "${nonce}-cold" 2)" ] ||
+		fail "the second layer's shadowed file was collected by the pull itself"
+	wait_until "the store to be collected" 60 0.5 collect_store
 	[ ! -e "$(shadow_object "${nonce}-cold" 1)" ] ||
-		fail "the first layer's shadowed file survived the collection after the pull"
+		fail "the first layer's shadowed file survived the collection"
+	[ ! -e "$(shadow_object "${nonce}-cold" 2)" ] ||
+		fail "the second layer's shadowed file survived the collection"
 	[ -e "$(shadow_object "${nonce}-cold" 3)" ] ||
 		fail "the last layer's file, which the image references, was collected"
 
@@ -1104,7 +1115,6 @@ assert_staged_rmi_reclaims() {
 	local root bytes
 	root="$(manifest_digest "${work}/cold-layout")"
 	knarr_lists_digest "${root}" || fail "the knarr store does not list the staged image"
-	wait_until "the re-pull's shadowed content to be collected" 60 0.5 store_settled
 	docker rmi "${cold_ref}" >/dev/null || fail "docker rmi of the converted image failed"
 	if docker image inspect "${cold_ref}" >/dev/null 2>&1; then
 		fail "the runtime still lists the image after docker rmi returned"
@@ -1336,6 +1346,12 @@ cold_phase() {
 	# One ingest worker first; the last leg switches to two and compares.
 	CFS_INGEST_WORKERS=1 CFS_ALLOW_UNSTAGED_PULLS=1 CFS_ROOT="${COLD_CFS_ROOT}" KNARR_ROOT="${COLD_KNARR_ROOT}" \
 		"${SCRIPT_DIR}/run-cfs.sh" >&2 || fail "start the snapshotter in cold-pull mode"
+	# The daemon collects the store once at start, on its own and retried
+	# while busy; run-cfs.sh truncated the log, so the first such entry is
+	# this daemon's. The cold pull's shadowed-object assertions need that
+	# collection to be over, since it may reclaim them.
+	wait_until "the snapshotter's startup collection" 120 0.5 \
+		grep -q "cfs snapshotter: collected the store" "${CFS_LOG}"
 	forget_knarr_images
 
 	assert_cold_pull_lands_composefs "${nonce}"

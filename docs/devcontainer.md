@@ -192,8 +192,8 @@ of an image nobody staged:
 - lands in the knarr store as exactly one composefs image, present in the CAS
   and named in the fs-verity view, with no staging directories on disk and
   the chain's snapshot records kept — and the content its layers wrote that
-  the image does not reference (every layer rewrites one file) is collected
-  by the snapshotter right after the pull, without a `knarr gc`;
+  the image does not reference (every layer rewrites one file) is left in
+  the store by the pull and reclaimed by the `knarr gc` the test then runs;
 - reaches the store a layer at a time through the differ: a known file of the
   first layer is a store object while the last, large layer is still being
   transferred;

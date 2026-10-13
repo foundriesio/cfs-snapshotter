@@ -330,10 +330,10 @@ func (s *snapshotter) ingest(ctx context.Context, ns string, b *openBuild, layer
 		return nil
 	}
 	_, err := b.build.Finish(ctx)
-	// Finished or failed, the build is over and the store holds what it
-	// wrote; the part of it no image references is the collector's.
-	s.collectSoon()
 	if err != nil {
+		// The build is over with no image to reference what it wrote;
+		// its unreferenced objects can be reclaimed.
+		s.collectSoon()
 		return err
 	}
 	closeBuilds(s.takeBuilds(func(key buildKey, other *openBuild) bool {

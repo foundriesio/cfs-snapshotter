@@ -1439,9 +1439,16 @@ func TestRemoveClosesCollectedStagedRecordBuild(t *testing.T) {
 	if err := sn.Commit(ctx, base, "moby/1/extract", labels); err != nil {
 		t.Fatalf("Commit() error = %v", err)
 	}
+	waitClean(t, sn)
+	if got := engine.gcCount(); got != 1 {
+		t.Fatalf("collections before the remove = %d, want the startup one alone", got)
+	}
 	if err := sn.Remove(context.Background(), base); err != nil {
 		t.Fatalf("Remove(%s) error = %v", base, err)
 	}
+	// The staged record releases no hold, so the count can only move by
+	// the abandoned build's own request.
+	awaitGCs(t, engine, 2)
 	want := []string{"build0.ingest(0)", "build0.close"}
 	if !slices.Equal(engine.calls, want) {
 		t.Fatalf("engine calls = %v, want %v", engine.calls, want)
@@ -2758,33 +2765,37 @@ func TestCleanupCollectsAfterRemove(t *testing.T) {
 	if err := sn.Commit(ctx, name, "extract"); err != nil {
 		t.Fatalf("Commit() error = %v", err)
 	}
-	// The finished build kicked a collection of its own leftovers.
-	awaitGCs(t, engine, 2)
+	// A finished build requests no collection of its own.
+	waitClean(t, sn)
+	if got := engine.gcCount(); got != 1 {
+		t.Fatalf("collections after a finished build = %d, want the startup one alone", got)
+	}
 	if err := sn.Remove(ctx, name); err != nil {
 		t.Fatalf("Remove() error = %v", err)
 	}
-	if got := engine.gcCount(); got != 2 {
+	if got := engine.gcCount(); got != 1 {
 		t.Fatalf("collections after a remove = %d, want none until cleanup", got)
 	}
 	if err := sn.Cleanup(ctx); err != nil {
 		t.Fatalf("Cleanup() error = %v", err)
 	}
-	if got := engine.gcCount(); got != 3 {
-		t.Fatalf("collections after cleanup = %d, want 3", got)
+	if got := engine.gcCount(); got != 2 {
+		t.Fatalf("collections after cleanup = %d, want 2", got)
 	}
 	if err := sn.Cleanup(ctx); err != nil {
 		t.Fatalf("second Cleanup() error = %v", err)
 	}
-	if got := engine.gcCount(); got != 3 {
-		t.Fatalf("collections after a second cleanup = %d, want still 3", got)
+	if got := engine.gcCount(); got != 2 {
+		t.Fatalf("collections after a second cleanup = %d, want still 2", got)
 	}
 }
 
-// TestApplyCollectsWhenBuildEnds covers the store being collected after a
-// pull, not only after a removal: a build writes every file of every layer,
-// and the ones a later layer replaced are nobody's once the image is built.
-// A build abandoned midway leaves the same kind of leftovers.
-func TestApplyCollectsWhenBuildEnds(t *testing.T) {
+// TestApplyCollectsOnlyWhenBuildFails covers which builds request a
+// collection: a finished build leaves the files its image does not
+// reference to the next collection, whoever asks for it, while a build that
+// failed or was abandoned has no image to reference what it wrote and
+// requests one itself.
+func TestApplyCollectsOnlyWhenBuildFails(t *testing.T) {
 	ctx := pullNamespace()
 	engine := fakeEngineForImages()
 	sn := newStagingSnapshotter(t, engine)
@@ -2798,7 +2809,10 @@ func TestApplyCollectsWhenBuildEnds(t *testing.T) {
 	if err := applyStaged(ctx, sn, "extract", layers[0]); err != nil {
 		t.Fatalf("Apply() error = %v", err)
 	}
-	awaitGCs(t, engine, 2)
+	waitClean(t, sn)
+	if got := engine.gcCount(); got != 1 {
+		t.Fatalf("collections after a finished build = %d, want the startup one alone", got)
+	}
 
 	other, otherChains := stageImageBy(t, sn, "other", digest.FromString("o-1"), digest.FromString("o-2"))
 	engine.ingestErr = errors.New("layer failed")
@@ -2808,7 +2822,28 @@ func TestApplyCollectsWhenBuildEnds(t *testing.T) {
 	if err := applyStaged(ctx, sn, "extract-other", digest.FromString("o-1")); err == nil {
 		t.Fatal("Apply(other) succeeded, want the layer failure")
 	}
+	awaitGCs(t, engine, 2)
+	waitClean(t, sn)
+	if got := engine.gcCount(); got != 2 {
+		t.Fatalf("collections after a failed ingest = %d, want 2", got)
+	}
+
+	// A one-layer image's only layer is the leaf, so its apply finishes
+	// the build.
+	third, thirdChains := stageImageBy(t, sn, "third", digest.FromString("t-1"))
+	engine.ingestErr = nil
+	engine.finishErr = errors.New("finish failed")
+	if _, err := sn.Prepare(ctx, "extract-third", "", snapshots.WithLabels(stagedLabels("third:v1", third, thirdChains[0]))); err != nil {
+		t.Fatalf("Prepare(third) error = %v", err)
+	}
+	if err := applyStaged(ctx, sn, "extract-third", digest.FromString("t-1")); err == nil {
+		t.Fatal("Apply(third) succeeded, want the finish failure")
+	}
 	awaitGCs(t, engine, 3)
+	waitClean(t, sn)
+	if got := engine.gcCount(); got != 3 {
+		t.Fatalf("collections after a failed finish = %d, want 3", got)
+	}
 }
 
 // TestCleanupRetriesWhenStoreBusy covers a collection finding the store busy
@@ -2861,7 +2896,7 @@ func TestCleanupReportsOtherFailuresOnce(t *testing.T) {
 		t.Fatalf("Cleanup() with nothing to collect error = %v", err)
 	}
 	name := commitStaged(t, sn, "app", digest.FromString("layer-1"))
-	awaitGCs(t, engine, 2)
+	waitClean(t, sn)
 	if err := sn.Remove(pullNamespace(), name); err != nil {
 		t.Fatalf("Remove() error = %v", err)
 	}
@@ -2871,13 +2906,13 @@ func TestCleanupReportsOtherFailuresOnce(t *testing.T) {
 	if err := sn.Cleanup(context.Background()); err != nil {
 		t.Fatalf("Cleanup() after the failure was reported error = %v, want none", err)
 	}
-	if got := engine.gcCount(); got != 3 {
-		t.Fatalf("collections = %d, want 3: a reported failure is not retried", got)
+	if got := engine.gcCount(); got != 2 {
+		t.Fatalf("collections = %d, want 2: a reported failure is not retried", got)
 	}
 }
 
 // commitStaged pulls a one-layer image through the staging path, commits its
-// leaf under a runtime name and returns that name. The build's end kicks a collection.
+// leaf under a runtime name and returns that name.
 func commitStaged(t *testing.T, sn *snapshotter, author string, layer digest.Digest) string {
 	t.Helper()
 	ctx := pullNamespace()
@@ -2933,15 +2968,14 @@ func TestCleanupWaitsForCoveringCollection(t *testing.T) {
 		releaseFirst bool
 		wantGCs      int
 	}{
-		{name: "running collection covers the release", releaseFirst: true, wantGCs: 3},
-		{name: "running collection began before the release", releaseFirst: false, wantGCs: 4},
+		{name: "running collection covers the release", releaseFirst: true, wantGCs: 2},
+		{name: "running collection began before the release", releaseFirst: false, wantGCs: 3},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			engine := fakeEngineForImages()
 			sn := newStagingSnapshotter(t, engine)
 			awaitGCs(t, engine, 1)
 			name := commitStaged(t, sn, "app", digest.FromString("layer-1"))
-			awaitGCs(t, engine, 2)
 			waitClean(t, sn)
 
 			gate := make(chan struct{})
@@ -2955,7 +2989,7 @@ func TestCleanupWaitsForCoveringCollection(t *testing.T) {
 				remove()
 			}
 			sn.collectSoon()
-			awaitGCs(t, engine, 3)
+			awaitGCs(t, engine, 2)
 			if !tc.releaseFirst {
 				remove()
 			}
