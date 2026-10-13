@@ -461,10 +461,13 @@ func (s *snapshotter) collect() error {
 	}
 	s.covered.Store(releases)
 	entry := log.L.WithFields(log.Fields{
-		"objects":  report.ObjectsRemoved,
-		"bytes":    report.BytesFreed,
-		"bindings": report.BindingsRemoved,
-		"in_use":   report.InUseSkipped,
+		"objects":    report.ObjectsRemoved,
+		"bytes":      report.BytesFreed,
+		"bindings":   report.BindingsRemoved,
+		"in_use":     report.InUseSkipped,
+		"candidates": report.Candidates,
+		"inventory":  report.InventoryDuration,
+		"mark_sweep": report.MarkSweepDuration,
 	})
 	if report.ObjectsRemoved > 0 || report.BindingsRemoved > 0 {
 		entry.Info("cfs snapshotter: collected the store")
