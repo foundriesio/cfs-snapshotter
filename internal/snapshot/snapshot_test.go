@@ -1641,7 +1641,7 @@ func TestPrepareHoldsAdmittedImage(t *testing.T) {
 
 // TestPrepareAdmissionFailsClosedWhenHoldFails covers admitting a leaf whose
 // image cannot be pinned: the handshake must fail rather than record a chain
-// a ocicfs remove could then take the content away from.
+// an ocicfs remove could then take the content away from.
 func TestPrepareAdmissionFailsClosedWhenHoldFails(t *testing.T) {
 	ctx := context.Background()
 	holdErr := errors.New("hold failed")
@@ -2348,7 +2348,7 @@ type buildCall struct {
 	opts ocicfs.PullOptions
 }
 
-// fakeBuild stands in for a ocicfs image build, recording its calls on the
+// fakeBuild stands in for an ocicfs image build, recording its calls on the
 // engine that created it. A build opened with a hold records that hold, on
 // the root it was resolved to, when it finishes, as the real one does.
 type fakeBuild struct {

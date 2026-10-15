@@ -44,7 +44,7 @@ delta_ref=""
 delta_base_ref=""
 pull_pid=""
 # cold_composefs is the digest of the composefs image the cold pull built at
-# one ingest worker, which the two-worker re-pull and a ocicfs pull of the same
+# one ingest worker, which the two-worker re-pull and an ocicfs pull of the same
 # image must build again byte for byte.
 cold_composefs=""
 cold_store_bytes=""
@@ -1227,9 +1227,9 @@ assert_interrupted_pull_converges() {
 
 # assert_cold_mixed_door covers the two doors meeting on one image: the
 # runtime stages a tag pull, holds the platform manifest it stamped and names
-# it by a runtime reference; a ocicfs pull of the same tag resolves its index
+# it by a runtime reference; an ocicfs pull of the same tag resolves its index
 # down to that same manifest and adopts the image — replacing the runtime's
-# reference with the agent's, not adding a second image — and a ocicfs remove
+# reference with the agent's, not adding a second image — and an ocicfs remove
 # of the tag declines on the runtime's hold instead of orphaning it.
 assert_cold_mixed_door() {
 	local nonce="$1" repo="cfs/e2e-mixed" layout="${work}/mixed-layout"
@@ -1269,12 +1269,12 @@ assert_cold_mixed_door() {
 
 	docker rmi "${tag_ref}" >/dev/null || fail "docker rmi of the mixed-door image failed"
 	ocicfs_remove_when_released "${tag_ref}"
-	echo "PASS: a ocicfs pull of a runtime-staged tag kept one held image and remove declined"
+	echo "PASS: an ocicfs pull of a runtime-staged tag kept one held image and remove declined"
 }
 
 # assert_ingest_workers_converge re-pulls the cold image with the snapshotter
 # at two ingest workers and compares the composefs image it builds with the
-# one built at one worker, and with the one a ocicfs pull of the same image
+# one built at one worker, and with the one an ocicfs pull of the same image
 # builds from its OCI layout into a fresh store: the worker count and the door
 # an image comes in through change the order objects land in the store, never
 # the image.
@@ -1304,7 +1304,7 @@ assert_ingest_workers_converge() {
 	[ "${fresh_composefs}" = "${cold_composefs}" ] ||
 		fail "ocicfs pull built ${fresh_composefs}, the snapshotter built ${cold_composefs}"
 	[ "${root}" = "$(manifest_digest "${layout}")" ] || fail "the cold layout changed underneath the test"
-	echo "PASS: one and two ingest workers and a ocicfs pull built the same composefs image"
+	echo "PASS: one and two ingest workers and an ocicfs pull built the same composefs image"
 }
 
 warm_phase() {
