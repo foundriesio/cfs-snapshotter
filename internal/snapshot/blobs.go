@@ -38,7 +38,7 @@ type contentBlobs struct {
 	client contentapi.ContentClient
 }
 
-// Compile-time assertion that *contentBlobs is a ocicfs blob source.
+// Compile-time assertion that *contentBlobs is an ocicfs blob source.
 var _ ocicfs.BlobSource = (*contentBlobs)(nil)
 
 // newContentBlobs returns a blob source reading containerd's content store at

@@ -23,7 +23,7 @@ func TestSnapshotterConformance(t *testing.T) {
 }
 
 // newConformanceSnapshotter builds the snapshotter the conformance suite
-// drives, with a ocicfs store next to the root the suite hands out.
+// drives, with an ocicfs store next to the root the suite hands out.
 func newConformanceSnapshotter(ctx context.Context, root string) (snapshots.Snapshotter, func() error, error) {
 	sn, err := NewSnapshotter(ctx, Config{
 		Root:       root,

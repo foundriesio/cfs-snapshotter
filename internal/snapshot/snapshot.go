@@ -157,9 +157,9 @@ const (
 	holderLabel               = privateLabelPrefix + "holder"
 )
 
-// recordHolder names the ocicfs hold a single snapshot record takes. Every image
-// the snapshotter hands containerd a record for is held until containerd
-// forgets that record, so a ocicfs remove cannot take content away from
+// recordHolder names the ocicfs hold a single snapshot record takes. Every
+// image the snapshotter hands containerd a record for is held until containerd
+// forgets that record, so an ocicfs remove cannot take content away from
 // underneath a runtime that is counting on it. One name per record, rather than
 // one for the snapshotter, is what keeps two records standing for the same
 // image independent: each takes its own hold, and the image is let go only once
@@ -970,7 +970,7 @@ var errStagePull = errors.New("stage the pull")
 //
 // Admitting the image's last chain also pins the image under this
 // snapshotter. From then on containerd holds a durable record standing for
-// content it will only mount later, and the hold is what stops a ocicfs remove
+// content it will only mount later, and the hold is what stops an ocicfs remove
 // from taking that content away in between — a pull followed by a remove
 // followed by a run would otherwise fail at the run. The hold is taken before
 // the record exists, because a record with no hold would leave content
@@ -1300,8 +1300,8 @@ func isChainMember(labels map[string]string, dir string) bool {
 }
 
 // ensureChainMounted mounts an image's read-only EROFS metadata at fsDir if the
-// shared mount is not already present. The ocicfs store resolves the layer chain
-// to a stored image and mounts it in one call.
+// shared mount is not already present. The ocicfs store resolves the layer
+// chain to a stored image and mounts it in one call.
 func (s *snapshotter) ensureChainMounted(ctx context.Context, chainID, fsDir string) error {
 	s.mountMu.Lock()
 	defer s.mountMu.Unlock()

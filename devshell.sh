@@ -84,7 +84,7 @@ run_new_container() {
 
 	# The container has no credentials for the internal ocicfs module, so build the
 	# ocicfs CLI on the host (which does) at the version cfs pins and mount the
-	# binary in, so the container has a ocicfs CLI matching the pinned module.
+	# binary in, so the container has an ocicfs CLI matching the pinned module.
 	# Portable across setups and CI, unlike bind-mounting a checkout. Best-effort:
 	# a plain shell still opens when the CLI is not needed or cannot be built.
 	#
