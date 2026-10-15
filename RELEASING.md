@@ -67,7 +67,7 @@ Upgrade notes
 Compatibility
 
 - Kernel: Linux 6.6+ (EROFS, fs-verity, overlayfs data-only lowers)
-- knarr: built against <version>
+- ocicfs: built against <version>
 - containerd: <supported range / config notes>
 - Tested on: <distros / devices>
 

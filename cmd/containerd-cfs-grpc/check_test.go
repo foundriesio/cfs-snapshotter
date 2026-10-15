@@ -55,13 +55,13 @@ func TestRunCheckPassesOutOfBand(t *testing.T) {
 	address := fakeContainerd(t, "v2.2.3", wiredPlugins(map[string]string{"enable_remote_snapshot_annotations": "true"}))
 	var out bytes.Buffer
 	code := runCheck(context.Background(), &out,
-		snapshot.Config{KnarrRoot: t.TempDir(), ContainerdAddress: address}, testSocket)
+		snapshot.Config{OcicfsRoot: t.TempDir(), ContainerdAddress: address}, testSocket)
 	if code != 0 {
 		t.Fatalf("runCheck = %d, want 0; output:\n%s", code, out.String())
 	}
 	wantLines(t, out.String(),
 		"1. mkcomposefs: skipped (out-of-band mode",
-		"2. fs-verity on the knarr store: skipped (out-of-band mode",
+		"2. fs-verity on the ocicfs store: skipped (out-of-band mode",
 		"ingest workers: 2",
 		"3. containerd: ok (version v2.2.3)",
 		"4. containerd version 2.1+: ok",
@@ -75,7 +75,7 @@ func TestRunCheckReportsConfiguredWorkers(t *testing.T) {
 	address := fakeContainerd(t, "v2.2.3", wiredPlugins(map[string]string{"enable_remote_snapshot_annotations": "true"}))
 	var out bytes.Buffer
 	code := runCheck(context.Background(), &out,
-		snapshot.Config{KnarrRoot: t.TempDir(), ContainerdAddress: address, IngestWorkers: 4}, testSocket)
+		snapshot.Config{OcicfsRoot: t.TempDir(), ContainerdAddress: address, IngestWorkers: 4}, testSocket)
 	if code != 0 {
 		t.Fatalf("runCheck = %d, want 0; output:\n%s", code, out.String())
 	}
@@ -86,7 +86,7 @@ func TestRunCheckFailsOnOldContainerd(t *testing.T) {
 	address := fakeContainerd(t, "1.7.24~ds1", wiredPlugins(map[string]string{"enable_remote_snapshot_annotations": "true"}))
 	var out bytes.Buffer
 	code := runCheck(context.Background(), &out,
-		snapshot.Config{KnarrRoot: t.TempDir(), ContainerdAddress: address}, testSocket)
+		snapshot.Config{OcicfsRoot: t.TempDir(), ContainerdAddress: address}, testSocket)
 	if code != 1 {
 		t.Fatalf("runCheck = %d, want 1; output:\n%s", code, out.String())
 	}
@@ -105,7 +105,7 @@ func TestRunCheckFailsOnMissingDiffer(t *testing.T) {
 		[]*introspectionapi.Plugin{wiredPlugin(map[string]string{"enable_remote_snapshot_annotations": "true"})})
 	var out bytes.Buffer
 	code := runCheck(context.Background(), &out,
-		snapshot.Config{KnarrRoot: t.TempDir(), ContainerdAddress: address, AllowUnstagedPulls: true},
+		snapshot.Config{OcicfsRoot: t.TempDir(), ContainerdAddress: address, AllowUnstagedPulls: true},
 		testSocket)
 	if code != 1 {
 		t.Fatalf("runCheck = %d, want 1; output:\n%s", code, out.String())
@@ -122,7 +122,7 @@ func TestRunCheckFailsOnUnreachableContainerd(t *testing.T) {
 	defer cancel()
 	var out bytes.Buffer
 	code := runCheck(ctx, &out,
-		snapshot.Config{KnarrRoot: t.TempDir(), ContainerdAddress: filepath.Join(t.TempDir(), "absent.sock")},
+		snapshot.Config{OcicfsRoot: t.TempDir(), ContainerdAddress: filepath.Join(t.TempDir(), "absent.sock")},
 		testSocket)
 	if code != 1 {
 		t.Fatalf("runCheck = %d, want 1; output:\n%s", code, out.String())
@@ -140,7 +140,7 @@ func TestRunCheckFailsOnMissingAnnotationsExport(t *testing.T) {
 	address := fakeContainerd(t, "v2.2.3", wiredPlugins(nil))
 	var out bytes.Buffer
 	code := runCheck(context.Background(), &out,
-		snapshot.Config{KnarrRoot: t.TempDir(), ContainerdAddress: address}, testSocket)
+		snapshot.Config{OcicfsRoot: t.TempDir(), ContainerdAddress: address}, testSocket)
 	if code != 1 {
 		t.Fatalf("runCheck = %d, want 1; output:\n%s", code, out.String())
 	}
@@ -156,7 +156,7 @@ func TestRunCheckReportsAllStagedPrerequisites(t *testing.T) {
 	address := fakeContainerd(t, "v2.2.3", wiredPlugins(map[string]string{"enable_remote_snapshot_annotations": "true"}))
 	var out bytes.Buffer
 	code := runCheck(context.Background(), &out,
-		snapshot.Config{KnarrRoot: t.TempDir(), ContainerdAddress: address, AllowUnstagedPulls: true},
+		snapshot.Config{OcicfsRoot: t.TempDir(), ContainerdAddress: address, AllowUnstagedPulls: true},
 		testSocket)
 	if code != 1 {
 		t.Fatalf("runCheck = %d, want 1; output:\n%s", code, out.String())
@@ -165,7 +165,7 @@ func TestRunCheckReportsAllStagedPrerequisites(t *testing.T) {
 	// both prerequisites appear, each with its own result.
 	wantLines(t, out.String(),
 		"1. mkcomposefs: FAIL:",
-		"2. fs-verity on the knarr store (",
+		"2. fs-verity on the ocicfs store (",
 		"3. containerd: ok (version v2.2.3)",
 		"7. containerd diff proxy_plugins wiring: ok (proxy plugin cfs-diff)",
 		"check failed")
@@ -182,7 +182,7 @@ func TestRunCheckSkipsDifferOutOfBand(t *testing.T) {
 		[]*introspectionapi.Plugin{wiredPlugin(map[string]string{"enable_remote_snapshot_annotations": "true"})})
 	var out bytes.Buffer
 	code := runCheck(context.Background(), &out,
-		snapshot.Config{KnarrRoot: t.TempDir(), ContainerdAddress: address}, testSocket)
+		snapshot.Config{OcicfsRoot: t.TempDir(), ContainerdAddress: address}, testSocket)
 	if code != 0 {
 		t.Fatalf("runCheck = %d, want 0; output:\n%s", code, out.String())
 	}

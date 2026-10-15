@@ -12,14 +12,14 @@ DOCKER="${DOCKER:-docker}"
 LABEL_DEVSHELL=io.foundries.cfs-snapshotter.devshell
 LABEL_WORKSPACE=io.foundries.cfs-snapshotter.workspace
 
-# The host directories behind the container's Go caches and the knarr CLI it
+# The host directories behind the container's Go caches and the ocicfs CLI it
 # is handed. They live under the user's cache directory rather than /tmp: a
 # tmpfs /tmp with a user quota fills up with a root-written build cache, and
 # then the ownership hand-back below fails and so does every other write.
 CACHE_DIR="${CFS_DEV_CACHE:-${XDG_CACHE_HOME:-${HOME}/.cache}/cfs-snapshotter}"
 GOCACHE_DIR="${CACHE_DIR}/go-build"
 GOMODCACHE_DIR="${CACHE_DIR}/go-mod"
-KNARR_BIN_DIR="${CACHE_DIR}/bin"
+OCICFS_BIN_DIR="${CACHE_DIR}/bin"
 
 find_running_container() {
 	"${DOCKER}" ps -q \
@@ -69,7 +69,7 @@ run_new_container() {
 		set -- bash -il
 	fi
 
-	mkdir -p "${GOCACHE_DIR}" "${GOMODCACHE_DIR}" "${KNARR_BIN_DIR}"
+	mkdir -p "${GOCACHE_DIR}" "${GOMODCACHE_DIR}" "${OCICFS_BIN_DIR}"
 
 	"${DOCKER}" build -f "${ROOT_DIR}/.devcontainer/Dockerfile" -t "${IMAGE}" "${ROOT_DIR}/.devcontainer"
 	trap reconcile_cache_ownership EXIT
@@ -82,13 +82,13 @@ run_new_container() {
 		run_flags+=(-t)
 	fi
 
-	# The container has no credentials for the internal knarr module, so build the
-	# knarr CLI on the host (which does) at the version cfs pins and mount the
-	# binary in, so the container has a knarr CLI matching the pinned module.
+	# The container has no credentials for the internal ocicfs module, so build the
+	# ocicfs CLI on the host (which does) at the version cfs pins and mount the
+	# binary in, so the container has a ocicfs CLI matching the pinned module.
 	# Portable across setups and CI, unlike bind-mounting a checkout. Best-effort:
 	# a plain shell still opens when the CLI is not needed or cannot be built.
 	#
-	# This also populates the shared module cache with the pinned knarr module, so
+	# This also populates the shared module cache with the pinned ocicfs module, so
 	# the container's own `go build` (same GOMODCACHE, bind-mounted below) finds
 	# it without needing network access.
 	# Both go commands run against the shared module cache rather than the
@@ -97,13 +97,13 @@ run_new_container() {
 	# a not-yet-pushed pin does not resolve. GOFLAGS is cleared because flags
 	# like -mod are rejected by `go install pkg@version`, and a stray export
 	# would fail the build.
-	local knarr_goenv=(GOMODCACHE="${GOMODCACHE_DIR}" GOTOOLCHAIN=auto GOPRIVATE=github.com/foundriesio GOFLAGS=)
-	local knarr_version
-	if knarr_version="$(cd "${ROOT_DIR}" && env "${knarr_goenv[@]}" go list -m -f '{{.Version}}' github.com/foundriesio/knarr)" &&
-		env "${knarr_goenv[@]}" GOBIN="${KNARR_BIN_DIR}" go install "github.com/foundriesio/knarr/cmd/knarr@${knarr_version}"; then
-		run_flags+=(-v "${KNARR_BIN_DIR}/knarr:/opt/cfs-dev/bin/knarr:ro")
+	local ocicfs_goenv=(GOMODCACHE="${GOMODCACHE_DIR}" GOTOOLCHAIN=auto GOPRIVATE=github.com/foundriesio GOFLAGS=)
+	local ocicfs_version
+	if ocicfs_version="$(cd "${ROOT_DIR}" && env "${ocicfs_goenv[@]}" go list -m -f '{{.Version}}' github.com/foundriesio/ocicfs)" &&
+		env "${ocicfs_goenv[@]}" GOBIN="${OCICFS_BIN_DIR}" go install "github.com/foundriesio/ocicfs/cmd/ocicfs@${ocicfs_version}"; then
+		run_flags+=(-v "${OCICFS_BIN_DIR}/ocicfs:/opt/cfs-dev/bin/ocicfs:ro")
 	else
-		echo "warning: could not build the knarr CLI on the host; any e2e that needs it will fail" >&2
+		echo "warning: could not build the ocicfs CLI on the host; any e2e that needs it will fail" >&2
 	fi
 
 	"${DOCKER}" run "${run_flags[@]}" \

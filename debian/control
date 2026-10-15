@@ -16,7 +16,7 @@ Depends: ${misc:Depends},
          ${shlibs:Depends}
 Recommends: containerd,
             composefs
-Suggests: knarr
+Suggests: ocicfs
 Static-Built-Using: ${misc:Static-Built-Using}
 Description: composefs-backed remote snapshotter for containerd
  cfs-snapshotter is a containerd remote (proxy) snapshotter that serves
@@ -27,5 +27,5 @@ Description: composefs-backed remote snapshotter for containerd
  .
  By default a plain docker/containerd pull fills the store; started with
  -allow-unstaged-pulls=false the daemon instead serves only images placed
- in the store out of band with knarr, pinned by digest. Building pulled
+ in the store out of band with ocicfs, pinned by digest. Building pulled
  images into the store uses mkcomposefs from the composefs package.

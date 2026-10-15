@@ -83,7 +83,7 @@ clean:
 # --- Debian packaging ---------------------------------------------------
 #
 # The .deb is built by debuild inside a local container image (debian/
-# Dockerfile) so no Debian toolchain is needed on the host. The knarr
+# Dockerfile) so no Debian toolchain is needed on the host. The ocicfs
 # dependency is not fetchable from inside that container, so the deb target
 # vendors the module tree on the host first and the packaging build runs
 # fully offline. The Debian version comes from the release tag (v0.1.0 ->

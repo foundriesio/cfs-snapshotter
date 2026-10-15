@@ -24,7 +24,7 @@ import (
 	"github.com/containerd/containerd/v2/core/snapshots/storage"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
 	"github.com/containerd/errdefs"
-	"github.com/foundriesio/knarr/pkg/knarr"
+	"github.com/foundriesio/ocicfs/pkg/ocicfs"
 	"github.com/opencontainers/go-digest"
 	"github.com/opencontainers/image-spec/identity"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
@@ -48,18 +48,18 @@ func TestOptFieldsExposesLabels(t *testing.T) {
 }
 
 func TestNewSnapshotterRejectsEmptyRoot(t *testing.T) {
-	if _, err := NewSnapshotter(context.Background(), Config{KnarrRoot: t.TempDir()}); !errdefs.IsInvalidArgument(err) {
+	if _, err := NewSnapshotter(context.Background(), Config{OcicfsRoot: t.TempDir()}); !errdefs.IsInvalidArgument(err) {
 		t.Fatalf("NewSnapshotter(%q) error = %v, want invalid argument", "", err)
 	}
 }
 
-// verityKnarrRoot returns a fresh knarr root on the dev container's shared
+// verityOcicfsRoot returns a fresh ocicfs root on the dev container's shared
 // fs-verity filesystem, skipping where that filesystem is absent. Staged mode
 // refuses roots that cannot enable fs-verity, so its tests cannot use
 // t.TempDir.
-func verityKnarrRoot(t *testing.T) string {
+func verityOcicfsRoot(t *testing.T) string {
 	t.Helper()
-	dir, err := os.MkdirTemp("/var/lib/cfs-shared-root", "knarr-test-*")
+	dir, err := os.MkdirTemp("/var/lib/cfs-shared-root", "ocicfs-test-*")
 	if err != nil {
 		t.Skipf("verity-capable filesystem unavailable: %v", err)
 	}
@@ -72,7 +72,7 @@ func verityKnarrRoot(t *testing.T) string {
 }
 
 // TestNewSnapshotterServesUnstagedPulls covers that a snapshotter configured
-// to stage unheld pulls comes up: staged layers are turned into knarr content
+// to stage unheld pulls comes up: staged layers are turned into ocicfs content
 // when their chain completes.
 func TestNewSnapshotterServesUnstagedPulls(t *testing.T) {
 	if _, err := exec.LookPath("mkcomposefs"); err != nil {
@@ -80,7 +80,7 @@ func TestNewSnapshotterServesUnstagedPulls(t *testing.T) {
 	}
 	sn, err := NewSnapshotter(context.Background(), Config{
 		Root:               t.TempDir(),
-		KnarrRoot:          verityKnarrRoot(t),
+		OcicfsRoot:         verityOcicfsRoot(t),
 		AllowUnstagedPulls: true,
 		ContainerdAddress:  "/run/containerd/containerd.sock",
 	})
@@ -99,7 +99,7 @@ func TestNewSnapshotterFailsFastWithoutStagedPrerequisites(t *testing.T) {
 	t.Setenv("PATH", t.TempDir())
 	_, err := NewSnapshotter(context.Background(), Config{
 		Root:               t.TempDir(),
-		KnarrRoot:          t.TempDir(),
+		OcicfsRoot:         t.TempDir(),
 		AllowUnstagedPulls: true,
 		ContainerdAddress:  "/run/containerd/containerd.sock",
 	})
@@ -112,7 +112,7 @@ func TestNewSnapshotterFailsFastWithoutStagedPrerequisites(t *testing.T) {
 }
 
 func TestNewSnapshotterAcceptsValidRoot(t *testing.T) {
-	sn, err := NewSnapshotter(context.Background(), Config{Root: t.TempDir(), KnarrRoot: t.TempDir()})
+	sn, err := NewSnapshotter(context.Background(), Config{Root: t.TempDir(), OcicfsRoot: t.TempDir()})
 	if err != nil {
 		t.Fatalf("NewSnapshotter() error = %v", err)
 	}
@@ -174,7 +174,7 @@ func newTestSnapshotter(t *testing.T) *snapshotter {
 
 // imageChain commits an intermediate virtual snapshot named name, the way a
 // pull's unpack handshake would, and makes the same chain available from the
-// fake knarr store.
+// fake ocicfs store.
 func imageChain(t *testing.T, ctx context.Context, sn *snapshotter, name string) {
 	t.Helper()
 	info := testImageInfo("root-"+name, digest.Digest(name))
@@ -595,7 +595,7 @@ func TestPrepareIntermediateSnapshotPropagatesInspectErrors(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			engine := fakeEngineForImages()
 			if tt.inspectErr != nil {
-				engine.inspectFunc = func(context.Context, string) (*knarr.ImageInfo, error) {
+				engine.inspectFunc = func(context.Context, string) (*ocicfs.ImageInfo, error) {
 					return nil, tt.inspectErr
 				}
 			}
@@ -629,10 +629,10 @@ func TestPrepareStagesPulls(t *testing.T) {
 	tests := []struct {
 		name     string
 		imageRef string
-		images   []*knarr.ImageInfo
+		images   []*ocicfs.ImageInfo
 	}{
 		{name: "image not held", imageRef: digest.FromString("unheld-image").String()},
-		{name: "chain not a member", imageRef: held.Root.String(), images: []*knarr.ImageInfo{held}},
+		{name: "chain not a member", imageRef: held.Root.String(), images: []*ocicfs.ImageInfo{held}},
 	}
 
 	for _, tt := range tests {
@@ -760,7 +760,7 @@ func TestApplyDrivesBuild(t *testing.T) {
 		t.Fatalf("engine NewBuild calls = %+v, want one for the whole pull", engine.builds)
 	}
 	build := engine.builds[0]
-	if build.ref != imageRef || build.opts.ResolvedRoot != root || build.opts.BlobSource != knarr.BlobSource(sn.blobs) {
+	if build.ref != imageRef || build.opts.ResolvedRoot != root || build.opts.BlobSource != ocicfs.BlobSource(sn.blobs) {
 		t.Fatalf("NewBuild(%q, %+v), want %q rooted at %s from the content store", build.ref, build.opts, imageRef, root)
 	}
 	wantCalls := []string{"build0.ingest(0)", "build0.ingest(1)", "build0.finish"}
@@ -1641,7 +1641,7 @@ func TestPrepareHoldsAdmittedImage(t *testing.T) {
 
 // TestPrepareAdmissionFailsClosedWhenHoldFails covers admitting a leaf whose
 // image cannot be pinned: the handshake must fail rather than record a chain
-// a knarr remove could then take the content away from.
+// a ocicfs remove could then take the content away from.
 func TestPrepareAdmissionFailsClosedWhenHoldFails(t *testing.T) {
 	ctx := context.Background()
 	holdErr := errors.New("hold failed")
@@ -1673,7 +1673,7 @@ func TestUsageIsComputedForCommittedRecords(t *testing.T) {
 	sn := newStagingSnapshotter(t, engine)
 	layers := []digest.Digest{digest.FromString("layer-1"), digest.FromString("layer-2")}
 	root, chains := stageImage(t, sn, layers...)
-	engine.infos[root.String()] = &knarr.ImageInfo{
+	engine.infos[root.String()] = &ocicfs.ImageInfo{
 		Root:      root,
 		Composefs: ocispec.Descriptor{Size: 4096},
 	}
@@ -1961,7 +1961,7 @@ func TestMountsReusesExistingChainMountWithoutStoreScan(t *testing.T) {
 	mounted := false
 	sn.mounted = func(string) (bool, error) { return mounted, nil }
 	var mountCalls int
-	engine.mountChainFunc = func(context.Context, string, string, ...knarr.MountOption) error {
+	engine.mountChainFunc = func(context.Context, string, string, ...ocicfs.MountOption) error {
 		mountCalls++
 		mounted = true
 		return nil
@@ -2073,7 +2073,7 @@ func TestPrepareWithoutImageAncestorFailsClosed(t *testing.T) {
 func TestPrepareRollsBackOnMountFailure(t *testing.T) {
 	ctx := context.Background()
 	sn, engine, leaf := newBackedSnapshotter(t, notMounted)
-	engine.mountChainFunc = func(context.Context, string, string, ...knarr.MountOption) error {
+	engine.mountChainFunc = func(context.Context, string, string, ...ocicfs.MountOption) error {
 		return errors.New("mount failed")
 	}
 	if _, err := sn.Prepare(ctx, "container", leaf); err == nil {
@@ -2145,9 +2145,9 @@ func TestRemoveWithChildDoesNotUnmount(t *testing.T) {
 }
 
 type fakeEngine struct {
-	infos          map[string]*knarr.ImageInfo
-	inspectFunc    func(context.Context, string) (*knarr.ImageInfo, error)
-	mountChainFunc func(context.Context, string, string, ...knarr.MountOption) error
+	infos          map[string]*ocicfs.ImageInfo
+	inspectFunc    func(context.Context, string) (*ocicfs.ImageInfo, error)
+	mountChainFunc func(context.Context, string, string, ...ocicfs.MountOption) error
 	unmountFunc    func(context.Context, string) error
 	objectsDir     string
 	holdErr        error
@@ -2186,7 +2186,7 @@ type fakeEngine struct {
 
 var _ engineAPI = (*fakeEngine)(nil)
 
-func (e *fakeEngine) Inspect(ctx context.Context, ref string) (*knarr.ImageInfo, error) {
+func (e *fakeEngine) Inspect(ctx context.Context, ref string) (*ocicfs.ImageInfo, error) {
 	if e.inspectFunc != nil {
 		return e.inspectFunc(ctx, ref)
 	}
@@ -2195,13 +2195,13 @@ func (e *fakeEngine) Inspect(ctx context.Context, ref string) (*knarr.ImageInfo,
 	}
 	info, ok := e.infos[ref]
 	if !ok {
-		return nil, fmt.Errorf("inspect %s: %w", ref, knarr.ErrNotFound)
+		return nil, fmt.Errorf("inspect %s: %w", ref, ocicfs.ErrNotFound)
 	}
 	return info, nil
 }
 
-func (e *fakeEngine) NewBuild(ctx context.Context, ref string, opts ...knarr.PullOption) (knarr.Build, error) {
-	var pullOpts knarr.PullOptions
+func (e *fakeEngine) NewBuild(ctx context.Context, ref string, opts ...ocicfs.PullOption) (ocicfs.Build, error) {
+	var pullOpts ocicfs.PullOptions
 	for _, opt := range opts {
 		opt(&pullOpts)
 	}
@@ -2242,7 +2242,7 @@ func (e *fakeEngine) Holds(context.Context) (map[digest.Digest][]string, error) 
 	return e.held, nil
 }
 
-func (e *fakeEngine) GC(ctx context.Context, _ ...knarr.GCOption) (*knarr.GCReport, error) {
+func (e *fakeEngine) GC(ctx context.Context, _ ...ocicfs.GCOption) (*ocicfs.GCReport, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -2260,7 +2260,7 @@ func (e *fakeEngine) GC(ctx context.Context, _ ...knarr.GCOption) (*knarr.GCRepo
 	if gcErr != nil {
 		return nil, gcErr
 	}
-	return &knarr.GCReport{}, nil
+	return &ocicfs.GCReport{}, nil
 }
 
 // setGCGate makes every later collection wait until gate is closed.
@@ -2296,7 +2296,7 @@ func awaitGCs(t *testing.T, engine *fakeEngine, n int) {
 	}
 }
 
-func (e *fakeEngine) MountChain(ctx context.Context, chainID, target string, opts ...knarr.MountOption) error {
+func (e *fakeEngine) MountChain(ctx context.Context, chainID, target string, opts ...ocicfs.MountOption) error {
 	if e.mountChainFunc != nil {
 		return e.mountChainFunc(ctx, chainID, target, opts...)
 	}
@@ -2308,7 +2308,7 @@ func (e *fakeEngine) MountChain(ctx context.Context, chainID, target string, opt
 			return nil
 		}
 	}
-	return fmt.Errorf("mount chain %s: %w", chainID, knarr.ErrNotFound)
+	return fmt.Errorf("mount chain %s: %w", chainID, ocicfs.ErrNotFound)
 }
 
 func (e *fakeEngine) Unmount(ctx context.Context, target string) error {
@@ -2322,10 +2322,10 @@ func (e *fakeEngine) ObjectsDir() (string, error) {
 	return e.objectsDir, nil
 }
 
-func fakeEngineForImages(infos ...*knarr.ImageInfo) *fakeEngine {
+func fakeEngineForImages(infos ...*ocicfs.ImageInfo) *fakeEngine {
 	engine := &fakeEngine{
-		infos:      make(map[string]*knarr.ImageInfo, len(infos)),
-		objectsDir: "/knarr/objects",
+		infos:      make(map[string]*ocicfs.ImageInfo, len(infos)),
+		objectsDir: "/ocicfs/objects",
 	}
 	for _, info := range infos {
 		addFakeImage(engine, info)
@@ -2333,28 +2333,28 @@ func fakeEngineForImages(infos ...*knarr.ImageInfo) *fakeEngine {
 	return engine
 }
 
-func addFakeImage(engine *fakeEngine, info *knarr.ImageInfo) {
+func addFakeImage(engine *fakeEngine, info *ocicfs.ImageInfo) {
 	engine.infos[info.Root.String()] = info
 }
 
 type mountCall struct {
 	chainID string
 	target  string
-	opts    knarr.MountOptions
+	opts    ocicfs.MountOptions
 }
 
 type buildCall struct {
 	ref  string
-	opts knarr.PullOptions
+	opts ocicfs.PullOptions
 }
 
-// fakeBuild stands in for a knarr image build, recording its calls on the
+// fakeBuild stands in for a ocicfs image build, recording its calls on the
 // engine that created it. A build opened with a hold records that hold, on
 // the root it was resolved to, when it finishes, as the real one does.
 type fakeBuild struct {
 	engine *fakeEngine
 	name   string
-	opts   knarr.PullOptions
+	opts   ocicfs.PullOptions
 }
 
 func (b *fakeBuild) Ingest(_ context.Context, i int) error {
@@ -2362,7 +2362,7 @@ func (b *fakeBuild) Ingest(_ context.Context, i int) error {
 	return b.engine.ingestErr
 }
 
-func (b *fakeBuild) Finish(context.Context) (*knarr.Image, error) {
+func (b *fakeBuild) Finish(context.Context) (*ocicfs.Image, error) {
 	b.engine.record(b.name + ".finish")
 	if b.engine.finishGate != nil {
 		<-b.engine.finishGate
@@ -2379,7 +2379,7 @@ func (b *fakeBuild) Finish(context.Context) (*knarr.Image, error) {
 	if b.engine.finishDone != nil {
 		b.engine.finishDoneOnce.Do(func() { close(b.engine.finishDone) })
 	}
-	return &knarr.Image{}, nil
+	return &ocicfs.Image{}, nil
 }
 
 func (b *fakeBuild) Close() {
@@ -2515,7 +2515,7 @@ func stageImageBy(t *testing.T, sn *snapshotter, author string, diffIDs ...diges
 }
 
 // stagedLabels are the labels the runtime attaches to a pull of an image the
-// knarr store does not hold, which Prepare answers with a staging snapshot.
+// ocicfs store does not hold, which Prepare answers with a staging snapshot.
 func stagedLabels(imageRef string, root, chainID digest.Digest) map[string]string {
 	return map[string]string{
 		intermediateSnapshotLabel: chainID.String(),
@@ -2536,7 +2536,7 @@ func newSnapshotterForTest(t *testing.T, engine *fakeEngine, mounted func(string
 }
 
 // newStagingSnapshotter returns a snapshotter configured to stage pulls of
-// images the knarr store does not hold.
+// images the ocicfs store does not hold.
 func newStagingSnapshotter(t *testing.T, engine *fakeEngine) *snapshotter {
 	t.Helper()
 	return newConfiguredSnapshotter(t, Config{Root: t.TempDir(), AllowUnstagedPulls: true}, engine, notMounted)
@@ -2620,8 +2620,8 @@ func commitDelta(t *testing.T, ctx context.Context, sn *snapshotter, name, paren
 }
 
 func recordMounts(engine *fakeEngine, calls *[]mountCall) {
-	engine.mountChainFunc = func(_ context.Context, chainID, target string, opts ...knarr.MountOption) error {
-		var mountOpts knarr.MountOptions
+	engine.mountChainFunc = func(_ context.Context, chainID, target string, opts ...ocicfs.MountOption) error {
+		var mountOpts ocicfs.MountOptions
 		for _, opt := range opts {
 			opt(&mountOpts)
 		}
@@ -2657,12 +2657,12 @@ func isStagingMount(mounts []mount.Mount, key string) bool {
 func notMounted(string) (bool, error)    { return false, nil }
 func alwaysMounted(string) (bool, error) { return true, nil }
 
-func testImageInfo(root string, chains ...digest.Digest) *knarr.ImageInfo {
-	layers := make([]knarr.LayerInfo, len(chains))
+func testImageInfo(root string, chains ...digest.Digest) *ocicfs.ImageInfo {
+	layers := make([]ocicfs.LayerInfo, len(chains))
 	for i, chainID := range chains {
 		layers[i].ChainID = chainID
 	}
-	return &knarr.ImageInfo{Root: digest.FromString(root), Layers: layers}
+	return &ocicfs.ImageInfo{Root: digest.FromString(root), Layers: layers}
 }
 
 // optionValue extracts a key=value mount option, failing the test when absent.
@@ -2854,7 +2854,7 @@ func TestCleanupRetriesWhenStoreBusy(t *testing.T) {
 	gcRetryInterval = 5 * time.Millisecond
 	t.Cleanup(func() { gcRetryInterval = interval })
 	engine := fakeEngineForImages()
-	engine.gcErr = fmt.Errorf("busy: %w", knarr.ErrStoreBusy)
+	engine.gcErr = fmt.Errorf("busy: %w", ocicfs.ErrStoreBusy)
 	sn := newStagingSnapshotter(t, engine)
 	awaitGCs(t, engine, 2)
 	if err := sn.Cleanup(context.Background()); err != nil {
@@ -3045,7 +3045,7 @@ func TestCloseStopsPendingRetry(t *testing.T) {
 	gcRetryInterval = time.Hour
 	t.Cleanup(func() { gcRetryInterval = interval })
 	engine := fakeEngineForImages()
-	engine.gcErr = fmt.Errorf("busy: %w", knarr.ErrStoreBusy)
+	engine.gcErr = fmt.Errorf("busy: %w", ocicfs.ErrStoreBusy)
 	sn, err := newSnapshotter(context.Background(), Config{Root: t.TempDir(), AllowUnstagedPulls: true}, engine)
 	if err != nil {
 		t.Fatalf("newSnapshotter() error = %v", err)

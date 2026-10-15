@@ -11,11 +11,11 @@ ROOT_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 CONTAINERD_SOCKET=/run/containerd/containerd.sock
 DOCKER_NAMESPACE=moby
 REGISTRY=127.0.0.1:5000
-WARM_KNARR_ROOT=/var/lib/knarr
+WARM_OCICFS_ROOT=/var/lib/ocicfs
 WARM_CFS_ROOT=/var/lib/containerd-cfs-grpc
-COLD_KNARR_ROOT=/var/lib/knarr-cold
+COLD_OCICFS_ROOT=/var/lib/ocicfs-cold
 COLD_CFS_ROOT=/var/lib/containerd-cfs-grpc-cold
-KNARR_BIN=${KNARR_BIN:-/opt/cfs-dev/bin/knarr}
+OCICFS_BIN=${OCICFS_BIN:-/opt/cfs-dev/bin/ocicfs}
 CFS_LOG=/var/log/cfs-devcontainer/containerd-cfs-grpc.log
 # Size of the last layer of the image the interrupt leg pulls. It is
 # incompressible, so its transfer outlasts the poll waiting for the layers
@@ -23,12 +23,12 @@ CFS_LOG=/var/log/cfs-devcontainer/containerd-cfs-grpc.log
 PARTIAL_LAYER_BYTES=134217728
 
 work=""
-# knarr_root and cfs_root name the stores the phase in progress runs against.
+# ocicfs_root and cfs_root name the stores the phase in progress runs against.
 # The warm phase pins the out-of-band mode on the devcontainer's default
 # stores; the cold phase runs the staged mode — the boot posture — with
 # stores of its own, because the two work modes are never mixed on one
 # device.
-knarr_root="${WARM_KNARR_ROOT}"
+ocicfs_root="${WARM_OCICFS_ROOT}"
 cfs_root="${WARM_CFS_ROOT}"
 image_ref=""
 unheld_ref=""
@@ -44,11 +44,11 @@ delta_ref=""
 delta_base_ref=""
 pull_pid=""
 # cold_composefs is the digest of the composefs image the cold pull built at
-# one ingest worker, which the two-worker re-pull and a knarr pull of the same
+# one ingest worker, which the two-worker re-pull and a ocicfs pull of the same
 # image must build again byte for byte.
 cold_composefs=""
 cold_store_bytes=""
-fresh_knarr_root=""
+fresh_ocicfs_root=""
 
 cleanup() {
 	# A failure inside the interrupted-pull leg can leave its background pull
@@ -73,28 +73,28 @@ cleanup() {
 	if [ -n "${work}" ] && [ -e "${work}" ]; then
 		rm -rf "${work}" || echo "warning: failed to remove ${work}" >&2
 	fi
-	if [ -n "${fresh_knarr_root}" ] && [ -e "${fresh_knarr_root}" ]; then
-		rm -rf "${fresh_knarr_root}" || echo "warning: failed to remove ${fresh_knarr_root}" >&2
+	if [ -n "${fresh_ocicfs_root}" ] && [ -e "${fresh_ocicfs_root}" ]; then
+		rm -rf "${fresh_ocicfs_root}" || echo "warning: failed to remove ${fresh_ocicfs_root}" >&2
 	fi
 	# The delta leg's hold and references live in the warm store; a failure
 	# inside the leg must not leave them for the next run to trip over.
 	if [ -n "${delta_base_ref}" ]; then
-		"${KNARR_BIN}" --root "${WARM_KNARR_ROOT}" release --holder delta-base "${delta_base_ref}" >/dev/null 2>&1 ||
+		"${OCICFS_BIN}" --root "${WARM_OCICFS_ROOT}" release --holder delta-base "${delta_base_ref}" >/dev/null 2>&1 ||
 			echo "warning: failed to release the delta base ${delta_base_ref}" >&2
 		for ref in "${delta_base_ref}" "${delta_ref}"; do
 			[ -n "${ref}" ] || continue
-			"${KNARR_BIN}" --root "${WARM_KNARR_ROOT}" inspect "${ref}" >/dev/null 2>&1 || continue
-			"${KNARR_BIN}" --root "${WARM_KNARR_ROOT}" remove "${ref}" >/dev/null 2>&1 ||
+			"${OCICFS_BIN}" --root "${WARM_OCICFS_ROOT}" inspect "${ref}" >/dev/null 2>&1 || continue
+			"${OCICFS_BIN}" --root "${WARM_OCICFS_ROOT}" remove "${ref}" >/dev/null 2>&1 ||
 				echo "warning: failed to remove ${ref} from the warm store" >&2
 		done
-		"${KNARR_BIN}" --root "${WARM_KNARR_ROOT}" gc >/dev/null 2>&1 ||
+		"${OCICFS_BIN}" --root "${WARM_OCICFS_ROOT}" gc >/dev/null 2>&1 ||
 			echo "warning: failed to collect the warm store" >&2
 	fi
 	# Either phase's failure leaves its own daemon running; put the
 	# devcontainer back in its boot posture (staged mode, default stores),
 	# pinned against any mode or store the caller's environment carries.
 	# On the success path this reconciles to a no-op.
-	CFS_ALLOW_UNSTAGED_PULLS=1 CFS_ROOT="${WARM_CFS_ROOT}" KNARR_ROOT="${WARM_KNARR_ROOT}" \
+	CFS_ALLOW_UNSTAGED_PULLS=1 CFS_ROOT="${WARM_CFS_ROOT}" OCICFS_ROOT="${WARM_OCICFS_ROOT}" \
 		"${SCRIPT_DIR}/run-cfs.sh" >&2 ||
 		echo "warning: failed to restore the boot snapshotter posture" >&2
 }
@@ -121,8 +121,8 @@ wait_until() {
 	fail "timed out waiting for ${what}"
 }
 
-knarr_cli() {
-	"${KNARR_BIN}" --root "${knarr_root}" "$@"
+ocicfs_cli() {
+	"${OCICFS_BIN}" --root "${ocicfs_root}" "$@"
 }
 
 content_has() {
@@ -253,11 +253,11 @@ wait_unmounted() {
 # those same objects named by their measured fs-verity digest — the names a
 # merged image's redirects resolve through, so it is what a container reads.
 cas_dir() {
-	printf '%s/objects/sha256\n' "${knarr_root}"
+	printf '%s/objects/sha256\n' "${ocicfs_root}"
 }
 
 verity_view_dir() {
-	printf '%s/objects/fsverity-sha256-12\n' "${knarr_root}"
+	printf '%s/objects/fsverity-sha256-12\n' "${ocicfs_root}"
 }
 
 sharded_path() {
@@ -273,13 +273,13 @@ cas_object_bytes() {
 # digest — one per platform, so one on a single-platform device.
 image_bindings() {
 	local hex="${1#sha256:}" dir
-	dir="${knarr_root}/images/sha256/${hex:0:2}/${hex:2}"
-	[ -d "${dir}" ] || fail "the knarr store has no composefs binding for $1"
+	dir="${ocicfs_root}/images/sha256/${hex:0:2}/${hex:2}"
+	[ -d "${dir}" ] || fail "the ocicfs store has no composefs binding for $1"
 	find "${dir}" -type f -printf '.\n' | wc -l
 }
 
 # staging_uppers counts the upper directories of staged layers still on disk.
-# A converted chain has none: its content lives in the knarr store.
+# A converted chain has none: its content lives in the ocicfs store.
 staging_uppers() {
 	find "${cfs_root}/snapshots" -mindepth 2 -maxdepth 2 -name upper -printf '.\n' | wc -l
 }
@@ -323,50 +323,50 @@ drain_runtime_images() {
 	wait_until "containerd to forget the cfs snapshots" 60 1 no_cfs_snapshots
 }
 
-forget_knarr_images() {
+forget_ocicfs_images() {
 	local listing refs ref
-	listing="$(knarr_cli ls --format json)" || fail "cannot list staged knarr images"
-	refs="$(jq -r '.[].ref' <<<"${listing}")" || fail "cannot parse staged knarr images"
+	listing="$(ocicfs_cli ls --format json)" || fail "cannot list staged ocicfs images"
+	refs="$(jq -r '.[].ref' <<<"${listing}")" || fail "cannot parse staged ocicfs images"
 	while IFS= read -r ref; do
 		[ -z "${ref}" ] && continue
-		knarr_cli remove "${ref}" >&2 || fail "cannot forget staged knarr image ${ref}"
+		ocicfs_cli remove "${ref}" >&2 || fail "cannot forget staged ocicfs image ${ref}"
 	done <<<"${refs}"
 }
 
-# knarr_ref_for_digest reports the reference the store recorded for a root
+# ocicfs_ref_for_digest reports the reference the store recorded for a root
 # digest. A pull records the reference it was invoked with, which is docker's
 # for a converted image and the staging command's for one put there out of band.
-knarr_ref_for_digest() {
+ocicfs_ref_for_digest() {
 	local digest="$1" listing ref
-	listing="$(knarr_cli ls --format json)" || fail "cannot list staged knarr images"
+	listing="$(ocicfs_cli ls --format json)" || fail "cannot list staged ocicfs images"
 	ref="$(jq -r --arg d "${digest}" 'map(select(.digest == $d)) | .[0].ref // ""' <<<"${listing}")" ||
-		fail "cannot parse staged knarr images"
-	[ -n "${ref}" ] || fail "the knarr store holds no image for ${digest}"
+		fail "cannot parse staged ocicfs images"
+	[ -n "${ref}" ] || fail "the ocicfs store holds no image for ${digest}"
 	printf '%s\n' "${ref}"
 }
 
-# knarr_lists_digest succeeds when the store lists an image by its identity
+# ocicfs_lists_digest succeeds when the store lists an image by its identity
 # digest, whatever reference it is listed under — none, for an image the
 # runtime staged, which the store keeps by the snapshotter's hold alone.
-knarr_lists_digest() {
+ocicfs_lists_digest() {
 	local digest="$1" listing
-	listing="$(knarr_cli ls --format json)" || fail "cannot list knarr images"
+	listing="$(ocicfs_cli ls --format json)" || fail "cannot list ocicfs images"
 	jq -e --arg d "${digest}" 'any(.[]; .digest == $d)' <<<"${listing}" >/dev/null
 }
 
-# knarr_ref_of_digest prints the reference the store lists a digest under,
+# ocicfs_ref_of_digest prints the reference the store lists a digest under,
 # empty for an image no reference names.
-knarr_ref_of_digest() {
+ocicfs_ref_of_digest() {
 	local digest="$1" listing
-	listing="$(knarr_cli ls --format json)" || fail "cannot list knarr images"
+	listing="$(ocicfs_cli ls --format json)" || fail "cannot list ocicfs images"
 	jq -r --arg d "${digest}" 'map(select(.digest == $d)) | .[0].ref // ""' <<<"${listing}"
 }
 
-# knarr_holder_of_digest prints the holder a runtime reference names a digest
+# ocicfs_holder_of_digest prints the holder a runtime reference names a digest
 # for, empty for an agent's reference or an unnamed image.
-knarr_holder_of_digest() {
+ocicfs_holder_of_digest() {
 	local digest="$1" listing
-	listing="$(knarr_cli ls --format json)" || fail "cannot list knarr images"
+	listing="$(ocicfs_cli ls --format json)" || fail "cannot list ocicfs images"
 	jq -r --arg d "${digest}" 'map(select(.digest == $d)) | .[0].holder // ""' <<<"${listing}"
 }
 
@@ -376,14 +376,14 @@ knarr_holder_of_digest() {
 # store is busy and the probe fails, which is "not yet", not an error.
 store_settled() {
 	local report
-	report="$(knarr_cli gc --dry-run --format json 2>/dev/null)" || return 1
+	report="$(ocicfs_cli gc --dry-run --format json 2>/dev/null)" || return 1
 	[ "$(jq -r '.objectsRemoved' <<<"${report}")" -eq 0 ]
 }
 
 # collect_store runs one collection; a store busy with a pull or a mount
 # makes it fail, which under wait_until is "not yet".
 collect_store() {
-	knarr_cli gc >/dev/null 2>&1
+	ocicfs_cli gc >/dev/null 2>&1
 }
 
 # shadow_object reports the store path of the shadow.txt a seeded layer
@@ -394,26 +394,26 @@ shadow_object() {
 	sharded_path "$(cas_dir)" "${hex}"
 }
 
-assert_knarr_remove_declines() {
+assert_ocicfs_remove_declines() {
 	local ref="$1" output
-	if output="$(knarr_cli remove "${ref}" 2>&1)"; then
-		fail "knarr removed ${ref} while the runtime was still holding it"
+	if output="$(ocicfs_cli remove "${ref}" 2>&1)"; then
+		fail "ocicfs removed ${ref} while the runtime was still holding it"
 	fi
 	grep -Fq 'is held by cfs' <<<"${output}" ||
-		fail "knarr remove ${ref} did not decline on the cfs hold: ${output}"
+		fail "ocicfs remove ${ref} did not decline on the cfs hold: ${output}"
 }
 
-# knarr_remove_when_released removes an image once the snapshotter has let go
+# ocicfs_remove_when_released removes an image once the snapshotter has let go
 # of it. The release rides containerd's garbage collector, so it lands some
 # time after the runtime forgets the image; any other failure is fatal at once.
-knarr_remove_when_released() {
+ocicfs_remove_when_released() {
 	local ref="$1" output=""
 	for _ in $(seq 1 60); do
-		if output="$(knarr_cli remove "${ref}" 2>&1)"; then
+		if output="$(ocicfs_cli remove "${ref}" 2>&1)"; then
 			return 0
 		fi
 		grep -Fq 'is held by cfs' <<<"${output}" ||
-			fail "knarr remove ${ref} failed for another reason: ${output}"
+			fail "ocicfs remove ${ref} failed for another reason: ${output}"
 		sleep 1
 	done
 	fail "the cfs hold on ${ref} was never released: ${output}"
@@ -442,14 +442,14 @@ indexed_manifest_digest() {
 	jq -r '.manifests[0].digest' "${layout}/blobs/sha256/${idx#sha256:}"
 }
 
-# ref_record_field reads one field of the record the knarr store keeps for a
+# ref_record_field reads one field of the record the ocicfs store keeps for a
 # reference, straight from the on-disk refs tree.
 ref_record_field() {
 	local ref="$1" field="$2" value
 	value="$(jq -r --arg r "${ref}" "select(.ref == \$r) | ${field}" \
-		"${knarr_root}"/refs/sha256/*/*.json 2>/dev/null)" ||
-		fail "cannot read the ref records under ${knarr_root}"
-	[ -n "${value}" ] || fail "the knarr store has no ref record for ${ref}"
+		"${ocicfs_root}"/refs/sha256/*/*.json 2>/dev/null)" ||
+		fail "cannot read the ref records under ${ocicfs_root}"
+	[ -n "${value}" ] || fail "the ocicfs store has no ref record for ${ref}"
 	printf '%s\n' "${value}"
 }
 
@@ -457,7 +457,7 @@ ref_record_field() {
 # root digest — the shape image_bindings treats as a test failure.
 no_image_binding() {
 	local hex="${1#sha256:}"
-	[ ! -d "${knarr_root}/images/sha256/${hex:0:2}/${hex:2}" ]
+	[ ! -d "${ocicfs_root}/images/sha256/${hex:0:2}/${hex:2}" ]
 }
 
 pinned_ref() {
@@ -470,8 +470,8 @@ stage_image() {
 	local repo="$1" layout="$2" digest
 	digest="$(manifest_digest "${layout}")" ||
 		fail "cannot read manifest digest for ${repo}"
-	knarr_cli pull --from-dir "${layout}" "${repo}@${digest}" >&2 ||
-		fail "knarr pull failed for ${repo}"
+	ocicfs_cli pull --from-dir "${layout}" "${repo}@${digest}" >&2 ||
+		fail "ocicfs pull failed for ${repo}"
 }
 
 image_layers() {
@@ -546,11 +546,11 @@ assert_handshake_identity() {
 	echo "PASS: an unheld config substitution with identical layers failed during docker pull"
 
 	if output="$(docker pull "${unheld_ref}" 2>&1)"; then
-		fail "docker pull succeeded for an image absent from knarr: ${output}"
+		fail "docker pull succeeded for an image absent from ocicfs: ${output}"
 	fi
 	grep -Fq 'is not present in the local store' <<<"${output}" ||
 		fail "unheld pull did not fail at the handshake identity gate: ${output}"
-	echo "PASS: an unrelated image absent from knarr failed during docker pull"
+	echo "PASS: an unrelated image absent from ocicfs failed during docker pull"
 
 	if output="$(docker pull "${base_ref}" 2>&1)"; then
 		fail "docker pull succeeded for an unheld base prefix: ${output}"
@@ -577,25 +577,25 @@ assert_real_zero_fetch_run() {
 		content_has "${digest}" && fail "layer was fetched: ${digest}"
 	done < <(jq -r '.layers[].digest' <<<"${manifest}")
 	content_has "${config}" || fail "image config was not fetched"
-	echo "PASS: knarr pull -> zero-fetch docker run served real image content"
+	echo "PASS: ocicfs pull -> zero-fetch docker run served real image content"
 }
 
 assert_warm_hold_declines_remove() {
 	local nonce="$1" ref output
-	ref="$(knarr_ref_for_digest "$(manifest_digest "${work}/layout")")"
-	assert_knarr_remove_declines "${ref}"
+	ref="$(ocicfs_ref_for_digest "$(manifest_digest "${work}/layout")")"
+	assert_ocicfs_remove_declines "${ref}"
 	output="$(docker run --rm --network=none "${image_ref}")" ||
 		fail "docker run after the declined removal failed"
 	[ "${output}" = "cfs hello ${nonce}" ] || fail "unexpected container output: ${output}"
-	echo "PASS: an admitted image is cfs-held and knarr declined to remove it"
+	echo "PASS: an admitted image is cfs-held and ocicfs declined to remove it"
 }
 
 assert_warm_hold_released() {
 	local ref
 	# The runtime forgot the image; the agent's reference still names it, so
 	# the store kept it and only the runtime's hold is gone.
-	ref="$(knarr_ref_for_digest "$(manifest_digest "${work}/layout")")"
-	knarr_remove_when_released "${ref}"
+	ref="$(ocicfs_ref_for_digest "$(manifest_digest "${work}/layout")")"
+	ocicfs_remove_when_released "${ref}"
 	echo "PASS: removing the image from the runtime released the cfs hold and kept the agent's image"
 }
 
@@ -613,8 +613,8 @@ assert_warm_tag_identity() {
 	mdigest="$(indexed_manifest_digest "${layout}")" || fail "cannot read the platform manifest digest"
 	[ "${idx}" != "${mdigest}" ] || fail "the seeded tag does not resolve through an index"
 
-	knarr_cli pull "${tag_ref}" >&2 || fail "knarr pull by tag failed"
-	[ "$(knarr_cli inspect --format json "${tag_ref}" | jq -r '.root')" = "${mdigest}" ] ||
+	ocicfs_cli pull "${tag_ref}" >&2 || fail "ocicfs pull by tag failed"
+	[ "$(ocicfs_cli inspect --format json "${tag_ref}" | jq -r '.root')" = "${mdigest}" ] ||
 		fail "the tag pull is not keyed by the platform manifest"
 	[ "$(ref_record_field "${tag_ref}" '.resolved.digest')" = "${idx}" ] ||
 		fail "the ref record does not keep the index as provenance"
@@ -630,23 +630,23 @@ assert_warm_tag_identity() {
 	output="$(docker run --rm --network=none "${tag_ref}")" || fail "docker run of the tag failed"
 	[ "${output}" = "cfs hello ${nonce}-tag" ] || fail "unexpected container output: ${output}"
 
-	assert_knarr_remove_declines "${tag_ref}"
+	assert_ocicfs_remove_declines "${tag_ref}"
 	docker rmi "${tag_ref}" >/dev/null || fail "docker rmi of the tag failed"
-	knarr_remove_when_released "${tag_ref}"
+	ocicfs_remove_when_released "${tag_ref}"
 	echo "PASS: a tag staged out of band admitted, held, and removed by its manifest identity"
 }
 
-# knarr_fixtures prints the directory of the pinned knarr module's
+# ocicfs_fixtures prints the directory of the pinned ocicfs module's
 # zstd:chunked fixtures: two releases sharing a base layer, written by
 # skopeo, as linux/amd64 single-image OCI layouts. The module lives in the
 # module cache devshell hands the container.
-knarr_fixtures() {
+ocicfs_fixtures() {
 	local dir
-	dir="$(cd "${ROOT_DIR}" && go list -m -f '{{.Dir}}' github.com/foundriesio/knarr)" ||
-		fail "cannot locate the pinned knarr module in the module cache"
+	dir="$(cd "${ROOT_DIR}" && go list -m -f '{{.Dir}}' github.com/foundriesio/ocicfs)" ||
+		fail "cannot locate the pinned ocicfs module in the module cache"
 	dir="${dir}/internal/zstdchunked/testdata"
 	[ -f "${dir}/release-n/index.json" ] && [ -f "${dir}/release-n1/index.json" ] ||
-		fail "the pinned knarr module has no delta fixtures under ${dir}"
+		fail "the pinned ocicfs module has no delta fixtures under ${dir}"
 	printf '%s\n' "${dir}"
 }
 
@@ -725,7 +725,7 @@ assert_delta_fast_path() {
 		echo "== skipped: the delta fixtures are linux/amd64 images" >&2
 		return 0
 	fi
-	fixtures="$(knarr_fixtures)"
+	fixtures="$(ocicfs_fixtures)"
 	n_layout="${fixtures}/release-n"
 	n1_layout="${fixtures}/release-n1"
 	push_layout "${n_layout}" "${repo}" n
@@ -741,13 +741,13 @@ assert_delta_fast_path() {
 	old_object="$(sharded_path "$(cas_dir)" "$(printf 'this file is bigger than sixty-four bytes so it is stored as an object.\nold\n' |
 		sha256sum | cut -d' ' -f1)")"
 
-	knarr_cli pull --delta "${n_ref}" >&2 || fail "delta pull of release N failed"
+	ocicfs_cli pull --delta "${n_ref}" >&2 || fail "delta pull of release N failed"
 	[ -f "${old_object}" ] || fail "release N's app/old is not a store object after its pull"
 	delta_base_ref="${n_ref}"
-	knarr_cli hold --holder delta-base "${n_ref}" >&2 || fail "cannot hold release N as the delta base"
+	ocicfs_cli hold --holder delta-base "${n_ref}" >&2 || fail "cannot hold release N as the delta base"
 
 	log="${work}/delta.log"
-	if ! knarr_cli pull --delta "${delta_ref}" >/dev/null 2>"${log}"; then
+	if ! ocicfs_cli pull --delta "${delta_ref}" >/dev/null 2>"${log}"; then
 		cat "${log}" >&2
 		fail "delta pull of release N+1 failed"
 	fi
@@ -768,20 +768,20 @@ assert_delta_fast_path() {
 
 	# The fresh store must sit on the shared fs-verity filesystem, like every
 	# other store the devcontainer uses.
-	fresh_knarr_root="$(mktemp -d /var/lib/cfs-shared-root/knarr-e2e-plain.XXXXXX)" ||
-		fail "cannot create a fresh knarr root"
-	"${KNARR_BIN}" --root "${fresh_knarr_root}" pull "${delta_ref}" >&2 ||
+	fresh_ocicfs_root="$(mktemp -d /var/lib/cfs-shared-root/ocicfs-e2e-plain.XXXXXX)" ||
+		fail "cannot create a fresh ocicfs root"
+	"${OCICFS_BIN}" --root "${fresh_ocicfs_root}" pull "${delta_ref}" >&2 ||
 		fail "plain pull of release N+1 into a fresh store failed"
-	info="$(knarr_cli inspect --format json "${delta_ref}")" ||
-		fail "the knarr store does not hold the delta-pulled release N+1"
-	plain_info="$("${KNARR_BIN}" --root "${fresh_knarr_root}" inspect --format json "${delta_ref}")" ||
+	info="$(ocicfs_cli inspect --format json "${delta_ref}")" ||
+		fail "the ocicfs store does not hold the delta-pulled release N+1"
+	plain_info="$("${OCICFS_BIN}" --root "${fresh_ocicfs_root}" inspect --format json "${delta_ref}")" ||
 		fail "the fresh store does not hold the plain-pulled release N+1"
 	[ "$(jq -r '.composefs.digest' <<<"${info}")" = "$(jq -r '.composefs.digest' <<<"${plain_info}")" ] ||
 		fail "the delta pull built a different composefs image than the plain pull"
 	[ "$(jq -r '.fsverity' <<<"${info}")" = "$(jq -r '.fsverity' <<<"${plain_info}")" ] ||
 		fail "the delta pull's fs-verity digest differs from the plain pull's"
-	rm -rf "${fresh_knarr_root}" || fail "cannot remove the fresh knarr root"
-	fresh_knarr_root=""
+	rm -rf "${fresh_ocicfs_root}" || fail "cannot remove the fresh ocicfs root"
+	fresh_ocicfs_root=""
 	echo "PASS: the delta pull built the composefs image a plain pull builds"
 
 	config="$(jq -r '.config.digest' <<<"${n1_manifest}")"
@@ -795,18 +795,18 @@ assert_delta_fast_path() {
 	assert_delta_rootfs
 	echo "PASS: the runtime read release N+1's delta-fetched files through the snapshotter"
 
-	knarr_cli release --holder delta-base "${n_ref}" >&2 || fail "cannot release the delta base"
-	knarr_cli remove "${n_ref}" >&2 || fail "cannot remove release N"
+	ocicfs_cli release --holder delta-base "${n_ref}" >&2 || fail "cannot release the delta base"
+	ocicfs_cli remove "${n_ref}" >&2 || fail "cannot remove release N"
 	delta_base_ref=""
-	knarr_cli gc >&2 || fail "knarr gc after removing release N failed"
+	ocicfs_cli gc >&2 || fail "ocicfs gc after removing release N failed"
 	[ ! -e "${old_object}" ] || fail "release N's app/old object survived its removal and collection"
 	[ "$(image_bindings "${n1_digest}")" -eq 1 ] || fail "release N+1 lost its composefs image"
 	assert_delta_rootfs
 	echo "PASS: releasing, removing and collecting the delta base kept release N+1 whole"
 
 	docker rmi "${delta_ref}" >/dev/null || fail "docker rmi of the delta-pulled image failed"
-	knarr_remove_when_released "${delta_ref}"
-	knarr_cli gc >&2 || fail "knarr gc after removing release N+1 failed"
+	ocicfs_remove_when_released "${delta_ref}"
+	ocicfs_cli gc >&2 || fail "ocicfs gc after removing release N+1 failed"
 }
 
 assert_concurrent_shared_mount() {
@@ -837,7 +837,7 @@ assert_mount_recovery() {
 	docker create --name cfs-e2e-recovery "${image_ref}" >/dev/null || fail "create recovery container"
 	umount "${chainfs}" || fail "unmount shared image mount"
 	findmnt -M "${chainfs}" >/dev/null 2>&1 && fail "shared image mount survived explicit unmount"
-	CFS_ALLOW_UNSTAGED_PULLS=0 CFS_ROOT="${WARM_CFS_ROOT}" KNARR_ROOT="${WARM_KNARR_ROOT}" \
+	CFS_ALLOW_UNSTAGED_PULLS=0 CFS_ROOT="${WARM_CFS_ROOT}" OCICFS_ROOT="${WARM_OCICFS_ROOT}" \
 		CFS_FORCE_RESTART=1 "${SCRIPT_DIR}/run-cfs.sh" >&2 ||
 		fail "restart snapshotter"
 	output="$(docker start -a cfs-e2e-recovery)" || fail "start existing container after mount loss"
@@ -880,7 +880,7 @@ hello_objects() {
 assert_tamper_fails_at_open() {
 	local object output tamper_chain
 	object="$(hello_objects "$(verity_view_dir)" "${work}/layout" | sed -n '1p')"
-	[ -n "${object}" ] || fail "cannot find /hello in the knarr object view"
+	[ -n "${object}" ] || fail "cannot find /hello in the ocicfs object view"
 	rm -f "${object}" || fail "unlink /hello object"
 	printf 'tampered\n' >"${object}" || fail "replace /hello object"
 	if output="$(docker run --rm --network=none "${image_ref}" 2>&1)"; then
@@ -961,13 +961,13 @@ assert_cold_pull_lands_composefs() {
 	# the snapshotter's hold and names it by a runtime reference for that
 	# holder, so it resolves by name like any image without being pinned by
 	# the name.
-	info="$(knarr_cli inspect --format json "${cold_ref}")" ||
-		fail "the knarr store does not resolve the cold-pulled image by its reference"
+	info="$(ocicfs_cli inspect --format json "${cold_ref}")" ||
+		fail "the ocicfs store does not resolve the cold-pulled image by its reference"
 	[ "$(jq -r '.root' <<<"${info}")" = "${root}" ] ||
-		fail "the knarr store holds the cold-pulled image under another root"
-	[ "$(knarr_ref_of_digest "${root}")" = "${cold_ref}" ] ||
+		fail "the ocicfs store holds the cold-pulled image under another root"
+	[ "$(ocicfs_ref_of_digest "${root}")" = "${cold_ref}" ] ||
 		fail "the staged image is not listed under the runtime's reference"
-	case "$(knarr_holder_of_digest "${root}")" in
+	case "$(ocicfs_holder_of_digest "${root}")" in
 	cfs-build-*) ;;
 	*) fail "the staged image's reference is not a runtime reference for a cfs build holder" ;;
 	esac
@@ -1051,12 +1051,12 @@ assert_cold_prefix_dedup() {
 	# longer one's unpack then skips the shared chains — their records exist
 	# from the re-pull — and its conversion reads every shared layer out of
 	# the content store, which only works because the re-pull refetched them
-	# rather than being answered from the knarr store.
+	# rather than being answered from the ocicfs store.
 	seed_image "${share_nonce}" "${REGISTRY}/${repo}:${nonce}" 3 "${layout}"
 	share_ref="$(pinned_ref "${REGISTRY}/${repo}" "${layout}")" || fail "cannot pin the shared-base ref"
 	docker pull "${share_ref}" >/dev/null || fail "cold docker pull of the shared-base image failed"
-	knarr_cli inspect --format json "$(manifest_digest "${layout}")" >/dev/null ||
-		fail "the knarr store does not hold the shared-base image"
+	ocicfs_cli inspect --format json "$(manifest_digest "${layout}")" >/dev/null ||
+		fail "the ocicfs store does not hold the shared-base image"
 	docker rmi "${share_ref}" >/dev/null || fail "docker rmi of the shared-base image failed"
 	local share_manifest
 	share_manifest="$(cat "${layout}/blobs/sha256/$(manifest_digest "${layout}" | sed s/sha256://)")"
@@ -1069,8 +1069,8 @@ assert_cold_prefix_dedup() {
 		fail "cannot pin the prefix-sharing ref"
 	docker pull "${share_more_ref}" >/dev/null ||
 		fail "cold docker pull of the prefix-sharing image failed"
-	knarr_cli inspect --format json "$(manifest_digest "${more_layout}")" >/dev/null ||
-		fail "the knarr store does not hold the prefix-sharing image"
+	ocicfs_cli inspect --format json "$(manifest_digest "${more_layout}")" >/dev/null ||
+		fail "the ocicfs store does not hold the prefix-sharing image"
 	[ "$(image_bindings "$(manifest_digest "${more_layout}")")" -eq 1 ] ||
 		fail "the prefix-sharing pull did not build exactly one composefs image"
 
@@ -1110,19 +1110,19 @@ assert_cold_prefix_dedup() {
 # removal releases the snapshotter's hold and collects the store inside the
 # same docker command, so by the time `docker rmi` returns the image is gone
 # from the runtime, from the store's listing and from disk — with no wait,
-# no poll, and no knarr command run by anyone.
+# no poll, and no ocicfs command run by anyone.
 assert_staged_rmi_reclaims() {
 	local root bytes
 	root="$(manifest_digest "${work}/cold-layout")"
-	knarr_lists_digest "${root}" || fail "the knarr store does not list the staged image"
+	ocicfs_lists_digest "${root}" || fail "the ocicfs store does not list the staged image"
 	docker rmi "${cold_ref}" >/dev/null || fail "docker rmi of the converted image failed"
 	if docker image inspect "${cold_ref}" >/dev/null 2>&1; then
 		fail "the runtime still lists the image after docker rmi returned"
 	fi
-	if knarr_lists_digest "${root}"; then
-		fail "the knarr store still lists the image after docker rmi returned"
+	if ocicfs_lists_digest "${root}"; then
+		fail "the ocicfs store still lists the image after docker rmi returned"
 	fi
-	if knarr_cli inspect --format json "${cold_ref}" >/dev/null 2>&1; then
+	if ocicfs_cli inspect --format json "${cold_ref}" >/dev/null 2>&1; then
 		fail "the runtime's reference survived docker rmi"
 	fi
 	no_image_binding "${root}" || fail "the composefs image survived docker rmi"
@@ -1141,13 +1141,13 @@ assert_staged_adoption() {
 	ref="$(pinned_ref "${REGISTRY}/${repo}" "${layout}")" || fail "cannot pin the adopted image ref"
 	docker pull "${ref}" >/dev/null || fail "docker pull of the image to adopt failed"
 	root="$(manifest_digest "${layout}")"
-	knarr_cli hold --holder agent "${root}" >&2 || fail "knarr hold of the staged image failed"
+	ocicfs_cli hold --holder agent "${root}" >&2 || fail "ocicfs hold of the staged image failed"
 	docker rmi "${ref}" >/dev/null || fail "docker rmi of the adopted image failed"
-	knarr_lists_digest "${root}" || fail "the agent-held image was dropped with the runtime's"
+	ocicfs_lists_digest "${root}" || fail "the agent-held image was dropped with the runtime's"
 	[ "$(image_bindings "${root}")" -eq 1 ] || fail "the adopted image lost its composefs image"
-	knarr_cli release --holder agent "${root}" >&2 || fail "knarr release of the adopted image failed"
-	knarr_cli gc >&2 || fail "knarr gc after the release failed"
-	if knarr_lists_digest "${root}"; then
+	ocicfs_cli release --holder agent "${root}" >&2 || fail "ocicfs release of the adopted image failed"
+	ocicfs_cli gc >&2 || fail "ocicfs gc after the release failed"
+	if ocicfs_lists_digest "${root}"; then
 		fail "the image survived the agent's release and collection"
 	fi
 	echo "PASS: an agent's hold kept a staged image past docker rmi, its release let it go"
@@ -1164,13 +1164,13 @@ assert_staged_self_heal() {
 	ref="$(pinned_ref "${REGISTRY}/${repo}" "${layout}")" || fail "cannot pin the self-heal image ref"
 	docker pull "${ref}" >/dev/null || fail "docker pull of the self-heal image failed"
 	root="$(manifest_digest "${layout}")"
-	knarr_cli hold --holder "${stray}" "${root}" >&2 || fail "cannot plant the stray hold"
-	CFS_INGEST_WORKERS=1 CFS_ALLOW_UNSTAGED_PULLS=1 CFS_ROOT="${COLD_CFS_ROOT}" KNARR_ROOT="${COLD_KNARR_ROOT}" \
+	ocicfs_cli hold --holder "${stray}" "${root}" >&2 || fail "cannot plant the stray hold"
+	CFS_INGEST_WORKERS=1 CFS_ALLOW_UNSTAGED_PULLS=1 CFS_ROOT="${COLD_CFS_ROOT}" OCICFS_ROOT="${COLD_OCICFS_ROOT}" \
 		CFS_FORCE_RESTART=1 "${SCRIPT_DIR}/run-cfs.sh" >&2 || fail "restart the snapshotter"
 	grep -q "releasing a hold no snapshot record owns" "${CFS_LOG}" ||
 		fail "the restarted snapshotter did not report releasing the stray hold"
 	docker rmi "${ref}" >/dev/null || fail "docker rmi of the self-heal image failed"
-	if knarr_lists_digest "${root}"; then
+	if ocicfs_lists_digest "${root}"; then
 		fail "the stray hold kept the image past docker rmi"
 	fi
 	echo "PASS: a hold no record owned was released at startup and the image reclaimed"
@@ -1212,13 +1212,13 @@ assert_interrupted_pull_converges() {
 	# what the build stored; a collection run by hand afterwards runs instead
 	# of reporting the store busy, and finds nothing left.
 	wait_until "the abandoned build's leftovers to be collected" 60 0.5 store_settled
-	knarr_cli gc >&2 || fail "knarr gc after the aborted pull did not run"
+	ocicfs_cli gc >&2 || fail "ocicfs gc after the aborted pull did not run"
 
 	offset="$(wc -l <"${CFS_LOG}")"
 	docker pull "${partial_ref}" >/dev/null || fail "re-pull after the interrupted pull failed"
 	report_layer_applies "${partial_ref}" 3 "${offset}"
-	knarr_cli inspect --format json "$(manifest_digest "${layout}")" >/dev/null ||
-		fail "the re-pull did not land in the knarr store"
+	ocicfs_cli inspect --format json "$(manifest_digest "${layout}")" >/dev/null ||
+		fail "the re-pull did not land in the ocicfs store"
 	[ "$(image_bindings "$(manifest_digest "${layout}")")" -eq 1 ] ||
 		fail "the re-pull did not build exactly one composefs image"
 	assert_no_staging_residue
@@ -1227,9 +1227,9 @@ assert_interrupted_pull_converges() {
 
 # assert_cold_mixed_door covers the two doors meeting on one image: the
 # runtime stages a tag pull, holds the platform manifest it stamped and names
-# it by a runtime reference; a knarr pull of the same tag resolves its index
+# it by a runtime reference; a ocicfs pull of the same tag resolves its index
 # down to that same manifest and adopts the image — replacing the runtime's
-# reference with the agent's, not adding a second image — and a knarr remove
+# reference with the agent's, not adding a second image — and a ocicfs remove
 # of the tag declines on the runtime's hold instead of orphaning it.
 assert_cold_mixed_door() {
 	local nonce="$1" repo="cfs/e2e-mixed" layout="${work}/mixed-layout"
@@ -1243,38 +1243,38 @@ assert_cold_mixed_door() {
 	docker pull "${tag_ref}" >/dev/null || fail "docker pull of the index-rooted tag failed"
 	[ "$(image_bindings "${mdigest}")" -eq 1 ] ||
 		fail "the staged pull did not build exactly one composefs image"
-	knarr_lists_digest "${mdigest}" || fail "the staged image is not listed under the stamped manifest"
-	[ "$(knarr_ref_of_digest "${mdigest}")" = "${tag_ref}" ] ||
+	ocicfs_lists_digest "${mdigest}" || fail "the staged image is not listed under the stamped manifest"
+	[ "$(ocicfs_ref_of_digest "${mdigest}")" = "${tag_ref}" ] ||
 		fail "the staged pull did not name the image by the runtime's reference"
-	[ -n "$(knarr_holder_of_digest "${mdigest}")" ] ||
+	[ -n "$(ocicfs_holder_of_digest "${mdigest}")" ] ||
 		fail "the runtime's reference is not a runtime reference"
 
-	knarr_cli pull "${tag_ref}" >&2 || fail "knarr pull of the staged tag failed"
+	ocicfs_cli pull "${tag_ref}" >&2 || fail "ocicfs pull of the staged tag failed"
 	[ "$(image_bindings "${mdigest}")" -eq 1 ] ||
-		fail "the knarr pull built a second composefs image"
-	no_image_binding "${idx}" || fail "the knarr pull built a binding under the index digest"
+		fail "the ocicfs pull built a second composefs image"
+	no_image_binding "${idx}" || fail "the ocicfs pull built a binding under the index digest"
 	[ "$(ref_record_field "${tag_ref}" '.identity.digest')" = "${mdigest}" ] ||
-		fail "the knarr pull re-keyed the image away from the manifest identity"
-	[ "$(knarr_ref_of_digest "${mdigest}")" = "${tag_ref}" ] ||
-		fail "the knarr pull did not name the held image"
-	[ -z "$(knarr_holder_of_digest "${mdigest}")" ] ||
-		fail "the knarr pull left the runtime's reference in place instead of adopting the image"
+		fail "the ocicfs pull re-keyed the image away from the manifest identity"
+	[ "$(ocicfs_ref_of_digest "${mdigest}")" = "${tag_ref}" ] ||
+		fail "the ocicfs pull did not name the held image"
+	[ -z "$(ocicfs_holder_of_digest "${mdigest}")" ] ||
+		fail "the ocicfs pull left the runtime's reference in place instead of adopting the image"
 	[ "$(ref_record_field "${tag_ref}" '.resolved.digest')" = "${idx}" ] ||
-		fail "the knarr pull did not record the index as provenance"
+		fail "the ocicfs pull did not record the index as provenance"
 
-	assert_knarr_remove_declines "${tag_ref}"
+	assert_ocicfs_remove_declines "${tag_ref}"
 	output="$(docker run --rm --network=none "${tag_ref}")" ||
 		fail "docker run after the declined removal failed"
 	[ "${output}" = "cfs hello ${nonce}-mixed" ] || fail "unexpected container output: ${output}"
 
 	docker rmi "${tag_ref}" >/dev/null || fail "docker rmi of the mixed-door image failed"
-	knarr_remove_when_released "${tag_ref}"
-	echo "PASS: a knarr pull of a runtime-staged tag kept one held image and remove declined"
+	ocicfs_remove_when_released "${tag_ref}"
+	echo "PASS: a ocicfs pull of a runtime-staged tag kept one held image and remove declined"
 }
 
 # assert_ingest_workers_converge re-pulls the cold image with the snapshotter
 # at two ingest workers and compares the composefs image it builds with the
-# one built at one worker, and with the one a knarr pull of the same image
+# one built at one worker, and with the one a ocicfs pull of the same image
 # builds from its OCI layout into a fresh store: the worker count and the door
 # an image comes in through change the order objects land in the store, never
 # the image.
@@ -1283,28 +1283,28 @@ assert_ingest_workers_converge() {
 	root="$(manifest_digest "${layout}")" || fail "cannot read the cold manifest digest"
 	[ -n "${cold_composefs}" ] || fail "the one-worker cold pull recorded no composefs digest"
 
-	CFS_INGEST_WORKERS=2 CFS_ALLOW_UNSTAGED_PULLS=1 CFS_ROOT="${COLD_CFS_ROOT}" KNARR_ROOT="${COLD_KNARR_ROOT}" \
+	CFS_INGEST_WORKERS=2 CFS_ALLOW_UNSTAGED_PULLS=1 CFS_ROOT="${COLD_CFS_ROOT}" OCICFS_ROOT="${COLD_OCICFS_ROOT}" \
 		"${SCRIPT_DIR}/run-cfs.sh" >&2 || fail "restart the snapshotter with two ingest workers"
 	offset="$(wc -l <"${CFS_LOG}")"
 	docker pull "${cold_ref}" >/dev/null || fail "re-pull at two ingest workers failed"
 	report_layer_applies "${cold_ref}" 3 "${offset}"
-	composefs="$(knarr_cli inspect --format json "${root}" | jq -r '.composefs.digest')" ||
-		fail "the knarr store does not hold the image re-pulled at two workers"
+	composefs="$(ocicfs_cli inspect --format json "${root}" | jq -r '.composefs.digest')" ||
+		fail "the ocicfs store does not hold the image re-pulled at two workers"
 	[ "${composefs}" = "${cold_composefs}" ] ||
 		fail "two ingest workers built ${composefs}, one worker built ${cold_composefs}"
 
 	# The fresh store must sit on the shared fs-verity filesystem, like every
 	# other store the devcontainer uses.
-	fresh_knarr_root="$(mktemp -d /var/lib/cfs-shared-root/knarr-e2e-fresh.XXXXXX)" ||
-		fail "cannot create a fresh knarr root"
-	"${KNARR_BIN}" --root "${fresh_knarr_root}" pull --from-dir "${layout}" "${cold_ref}" >&2 ||
-		fail "knarr pull of the cold image into a fresh store failed"
-	fresh_composefs="$("${KNARR_BIN}" --root "${fresh_knarr_root}" inspect --format json "${cold_ref}" |
+	fresh_ocicfs_root="$(mktemp -d /var/lib/cfs-shared-root/ocicfs-e2e-fresh.XXXXXX)" ||
+		fail "cannot create a fresh ocicfs root"
+	"${OCICFS_BIN}" --root "${fresh_ocicfs_root}" pull --from-dir "${layout}" "${cold_ref}" >&2 ||
+		fail "ocicfs pull of the cold image into a fresh store failed"
+	fresh_composefs="$("${OCICFS_BIN}" --root "${fresh_ocicfs_root}" inspect --format json "${cold_ref}" |
 		jq -r '.composefs.digest')" || fail "cannot inspect the fresh store's image"
 	[ "${fresh_composefs}" = "${cold_composefs}" ] ||
-		fail "knarr pull built ${fresh_composefs}, the snapshotter built ${cold_composefs}"
+		fail "ocicfs pull built ${fresh_composefs}, the snapshotter built ${cold_composefs}"
 	[ "${root}" = "$(manifest_digest "${layout}")" ] || fail "the cold layout changed underneath the test"
-	echo "PASS: one and two ingest workers and a knarr pull built the same composefs image"
+	echo "PASS: one and two ingest workers and a ocicfs pull built the same composefs image"
 }
 
 warm_phase() {
@@ -1313,10 +1313,10 @@ warm_phase() {
 	drain_runtime_images
 	# The devcontainer boots in staged mode; the warm legs need the
 	# out-of-band posture, pinned explicitly rather than inherited.
-	CFS_ALLOW_UNSTAGED_PULLS=0 CFS_ROOT="${WARM_CFS_ROOT}" KNARR_ROOT="${WARM_KNARR_ROOT}" \
+	CFS_ALLOW_UNSTAGED_PULLS=0 CFS_ROOT="${WARM_CFS_ROOT}" OCICFS_ROOT="${WARM_OCICFS_ROOT}" \
 		"${SCRIPT_DIR}/run-cfs.sh" >&2 ||
 		fail "start the snapshotter in out-of-band mode"
-	forget_knarr_images
+	forget_ocicfs_images
 	assert_handshake_identity "${nonce}"
 	seed_and_stage "${nonce}"
 	assert_real_zero_fetch_run "${nonce}"
@@ -1336,15 +1336,15 @@ cold_phase() {
 	local nonce="$1"
 	echo "== cold phase: the runtime's own pull fills the store =="
 	# A device runs in one mode or the other, never both, so the cold phase
-	# gets its own snapshotter and knarr stores; no record made in one mode is
+	# gets its own snapshotter and ocicfs stores; no record made in one mode is
 	# ever read back in the other.
 	drain_runtime_images
 	# The roots flip before the daemon does: if the cold start dies halfway,
 	# cleanup must already see the cold posture to restore the boot one.
-	knarr_root="${COLD_KNARR_ROOT}"
+	ocicfs_root="${COLD_OCICFS_ROOT}"
 	cfs_root="${COLD_CFS_ROOT}"
 	# One ingest worker first; the last leg switches to two and compares.
-	CFS_INGEST_WORKERS=1 CFS_ALLOW_UNSTAGED_PULLS=1 CFS_ROOT="${COLD_CFS_ROOT}" KNARR_ROOT="${COLD_KNARR_ROOT}" \
+	CFS_INGEST_WORKERS=1 CFS_ALLOW_UNSTAGED_PULLS=1 CFS_ROOT="${COLD_CFS_ROOT}" OCICFS_ROOT="${COLD_OCICFS_ROOT}" \
 		"${SCRIPT_DIR}/run-cfs.sh" >&2 || fail "start the snapshotter in cold-pull mode"
 	# The daemon collects the store once at start, on its own and retried
 	# while busy; run-cfs.sh truncated the log, so the first such entry is
@@ -1352,7 +1352,7 @@ cold_phase() {
 	# collection to be over, since it may reclaim them.
 	wait_until "the snapshotter's startup collection" 120 0.5 \
 		grep -q "cfs snapshotter: collected the store" "${CFS_LOG}"
-	forget_knarr_images
+	forget_ocicfs_images
 
 	assert_cold_pull_lands_composefs "${nonce}"
 	assert_cold_repull_refetches "${nonce}"
@@ -1365,16 +1365,16 @@ cold_phase() {
 	assert_ingest_workers_converge
 
 	drain_runtime_images
-	CFS_ALLOW_UNSTAGED_PULLS=1 CFS_ROOT="${WARM_CFS_ROOT}" KNARR_ROOT="${WARM_KNARR_ROOT}" \
+	CFS_ALLOW_UNSTAGED_PULLS=1 CFS_ROOT="${WARM_CFS_ROOT}" OCICFS_ROOT="${WARM_OCICFS_ROOT}" \
 		"${SCRIPT_DIR}/run-cfs.sh" >&2 || fail "restore the boot snapshotter posture"
-	knarr_root="${WARM_KNARR_ROOT}"
+	ocicfs_root="${WARM_OCICFS_ROOT}"
 	cfs_root="${WARM_CFS_ROOT}"
 }
 
 main() {
-	[ -x "${KNARR_BIN}" ] ||
-		fail "knarr CLI not found at ${KNARR_BIN}; run the e2e from the host as
-./devshell.sh make test-e2e — devshell builds the knarr CLI there and
+	[ -x "${OCICFS_BIN}" ] ||
+		fail "ocicfs CLI not found at ${OCICFS_BIN}; run the e2e from the host as
+./devshell.sh make test-e2e — devshell builds the ocicfs CLI there and
 mounts it into the container (a container started any other way has none)"
 	work="$(mktemp -d)"
 	trap cleanup EXIT

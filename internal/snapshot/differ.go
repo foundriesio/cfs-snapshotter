@@ -19,7 +19,7 @@ import (
 	"github.com/containerd/containerd/v2/pkg/namespaces"
 	"github.com/containerd/errdefs"
 	"github.com/containerd/log"
-	"github.com/foundriesio/knarr/pkg/knarr"
+	"github.com/foundriesio/ocicfs/pkg/ocicfs"
 	"github.com/opencontainers/go-digest"
 	"github.com/opencontainers/image-spec/identity"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
@@ -41,7 +41,7 @@ func stagingMount(key string) []mount.Mount {
 // Compile-time assertion that *snapshotter is the differ the daemon serves.
 var _ diff.Applier = (*snapshotter)(nil)
 
-// Apply feeds one layer of a staged pull into the knarr store. The unpacker
+// Apply feeds one layer of a staged pull into the ocicfs store. The unpacker
 // calls it between Prepare and Commit of each layer, with the layer's
 // descriptor and the mounts Prepare returned; here those mounts are the
 // staging placeholder, whose source names the staging snapshot. Its labels
@@ -267,7 +267,7 @@ type buildKey struct {
 // image's last layer, which is where the build finishes, and the holder the
 // finished image is held under.
 type openBuild struct {
-	build  knarr.Build
+	build  ocicfs.Build
 	leaf   string
 	holder string
 }
@@ -299,7 +299,7 @@ func (s *snapshotter) buildFor(ctx context.Context, ns, key string, layer staged
 	if !ok {
 		holder := buildHolder(ns, key)
 		build, err := s.engine.NewBuild(ctx, layer.imageRef,
-			knarr.WithBlobSource(s.blobs), knarr.WithResolvedRoot(layer.root), knarr.WithHold(holder))
+			ocicfs.WithBlobSource(s.blobs), ocicfs.WithResolvedRoot(layer.root), ocicfs.WithHold(holder))
 		if err != nil {
 			return nil, fmt.Errorf("begin building image %q from its staged layers: %w", layer.imageRef, err)
 		}

@@ -34,7 +34,7 @@ deb="/out/cfs-snapshotter_${DEB_VERSION}_${ARCH}.deb"
 [ "$(dpkg-deb -f "$deb" Architecture)" = "$ARCH" ]
 dpkg-deb -f "$deb" Recommends | grep -q containerd
 dpkg-deb -f "$deb" Recommends | grep -q composefs
-dpkg-deb -f "$deb" Suggests | grep -q knarr
+dpkg-deb -f "$deb" Suggests | grep -q ocicfs
 
 apt-get update
 apt-get install -y --no-install-recommends "$deb"

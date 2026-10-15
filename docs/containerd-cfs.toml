@@ -18,7 +18,7 @@ version = 2
   enable_remote_snapshot_annotations = "true"
 
 # Register the cfs differ, served by the same daemon on the same socket.
-# It ingests the layers of a staged pull straight into the knarr store;
+# It ingests the layers of a staged pull straight into the ocicfs store;
 # without it every staged pull fails at the layer apply.
 [proxy_plugins.cfs-diff]
   type = "diff"

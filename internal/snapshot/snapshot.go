@@ -11,9 +11,9 @@
 // mount is one flat overlay assembled by walking the parent chain: committed
 // ancestors' upper directories stack as lowers, and the walk stops at the
 // first image chain snapshot, whose data plane — the image's read-only EROFS
-// metadata mount, with the knarr object directory stacked below it as a
+// metadata mount, with the ocicfs object directory stacked below it as a
 // data-only lower requiring fs-verity — is the base lower. The snapshot's own
-// upper receives its writes. Image content reaches the knarr store one of two
+// upper receives its writes. Image content reaches the ocicfs store one of two
 // ways: it is put there out of band, in which case every unpack handshake is
 // answered as if the content were already present locally, or the runtime
 // fetches it and the snapshotter, serving containerd's diff API as well,
@@ -49,13 +49,13 @@
 // When it does, the pull completes with zero layer fetches — the caller still
 // downloads the image metadata (index, manifest, config, etc.) — and the
 // mounts the container flow later receives compose the image's EROFS metadata
-// and knarr objects as the base of one flat overlay (see mounts).
+// and ocicfs objects as the base of one flat overlay (see mounts).
 //
 // A snapshotter that stages its pulls instead answers the handshake with a
 // staging snapshot: a metadata record whose one mount is a placeholder no
 // kernel can mount. Only this snapshotter's own differ (see Apply) consumes
 // it, feeding the fetched layer straight from containerd's content store into
-// the knarr store's build of the image; a containerd that routes the layer to
+// the ocicfs store's build of the image; a containerd that routes the layer to
 // another differ fails at the placeholder instead of extracting into nothing.
 // Commit then files the record; the chain's last Apply, finishing the build,
 // pins the image, and its Commit files the labels that name that hold.
@@ -97,7 +97,7 @@ import (
 	"github.com/containerd/containerd/v2/core/snapshots/storage"
 	"github.com/containerd/errdefs"
 	"github.com/containerd/log"
-	"github.com/foundriesio/knarr/pkg/knarr"
+	"github.com/foundriesio/ocicfs/pkg/ocicfs"
 	"github.com/moby/sys/mountinfo"
 	"github.com/opencontainers/go-digest"
 
@@ -121,12 +121,12 @@ import (
 // reference names the image, the digest fixes which image it is.
 //
 // chainMemberLabel marks a snapshot as standing for a layer chain of an image
-// in the knarr store. It is what ends a mount's parent walk: the labeled
+// in the ocicfs store. It is what ends a mount's parent walk: the labeled
 // snapshot's image is the base of the overlay, so nothing below it is
 // consulted.
 //
 // stagingLabel marks a snapshot of a staged pull: a metadata record whose
-// layer reaches the knarr store through the differ rather than through a
+// layer reaches the ocicfs store through the differ rather than through a
 // directory of its own, and whose only mount is the staging placeholder.
 //
 // leafLabel marks a staging record whose layer is the image's last. The
@@ -157,9 +157,9 @@ const (
 	holderLabel               = privateLabelPrefix + "holder"
 )
 
-// recordHolder names the knarr hold a single snapshot record takes. Every image
+// recordHolder names the ocicfs hold a single snapshot record takes. Every image
 // the snapshotter hands containerd a record for is held until containerd
-// forgets that record, so a knarr remove cannot take content away from
+// forgets that record, so a ocicfs remove cannot take content away from
 // underneath a runtime that is counting on it. One name per record, rather than
 // one for the snapshotter, is what keeps two records standing for the same
 // image independent: each takes its own hold, and the image is let go only once
@@ -179,7 +179,7 @@ func recordHolder(name string) string {
 // startup.
 const holderPrefix = "cfs-"
 
-// gcRetryInterval paces the collections retried after the knarr store
+// gcRetryInterval paces the collections retried after the ocicfs store
 // reported itself busy.
 var gcRetryInterval = 30 * time.Second
 
@@ -187,11 +187,11 @@ var gcRetryInterval = 30 * time.Second
 type snapshotter struct {
 	// root is the snapshotter's root directory.
 	root string
-	// objectsDir is the knarr store's backing-object directory.
+	// objectsDir is the ocicfs store's backing-object directory.
 	objectsDir string
 	// ms is the bolt-backed metadata store holding snapshot records.
 	ms *storage.MetaStore
-	// engine provides access to images in the local knarr store.
+	// engine provides access to images in the local ocicfs store.
 	engine engineAPI
 	// blobs reads image blobs out of containerd's content store, the source a
 	// staged chain is built from.
@@ -200,7 +200,7 @@ type snapshotter struct {
 	// in production and is replaced in tests.
 	mounted func(string) (bool, error)
 	// allowUnstagedPulls stages every pull instead of admitting only images
-	// already in the knarr store.
+	// already in the ocicfs store.
 	allowUnstagedPulls bool
 	// mountMu serializes shared chain mount creation and teardown.
 	mountMu sync.Mutex
@@ -269,10 +269,10 @@ var ErrPrerequisites = errors.New("runtime prerequisites not met")
 type Config struct {
 	// Root is the snapshotter's own root directory.
 	Root string
-	// KnarrRoot is the root of the knarr store the images are served from.
-	KnarrRoot string
+	// OcicfsRoot is the root of the ocicfs store the images are served from.
+	OcicfsRoot string
 	// AllowUnstagedPulls selects the machine's work mode. False admits only
-	// images already in the knarr store, put there out of band, and declines
+	// images already in the ocicfs store, put there out of band, and declines
 	// every other pull. True stages every pull — even of an image the store
 	// already holds — and builds it into the store once the chain is
 	// complete, so the runtime fetches and keeps each pulled image's layers
@@ -281,19 +281,19 @@ type Config struct {
 	// ContainerdAddress is the address of containerd's gRPC socket, whose
 	// content store the layers of a staged pull are read back from.
 	ContainerdAddress string
-	// IngestWorkers is the number of layers the knarr store ingests at once
-	// across every staged pull in progress. 0 selects knarr's default.
+	// IngestWorkers is the number of layers the ocicfs store ingests at once
+	// across every staged pull in progress. 0 selects ocicfs's default.
 	IngestWorkers int
 }
 
 // NewSnapshotter returns a Snapshotter configured by cfg, serving composefs
-// images from the knarr store at cfg.KnarrRoot.
+// images from the ocicfs store at cfg.OcicfsRoot.
 func NewSnapshotter(ctx context.Context, cfg Config) (Snapshotter, error) {
-	engine, err := knarr.New(knarr.Config{Root: cfg.KnarrRoot, IngestWorkers: cfg.IngestWorkers})
+	engine, err := ocicfs.New(ocicfs.Config{Root: cfg.OcicfsRoot, IngestWorkers: cfg.IngestWorkers})
 	if err != nil {
-		return nil, fmt.Errorf("create knarr engine: %w", err)
+		return nil, fmt.Errorf("create ocicfs engine: %w", err)
 	}
-	// Staged mode builds every pull into the knarr store, so a host missing
+	// Staged mode builds every pull into the ocicfs store, so a host missing
 	// mkcomposefs or fs-verity fails every pull; refusing to start reports
 	// the misconfiguration at install time instead of at the first image.
 	// Out-of-band mode builds nothing locally and needs neither.
@@ -315,10 +315,10 @@ func newSnapshotter(ctx context.Context, cfg Config, engine engineAPI) (*snapsho
 	}
 	objectsDir, err := engine.ObjectsDir()
 	if err != nil {
-		return nil, fmt.Errorf("cfs snapshotter: resolve knarr object directory: %w", err)
+		return nil, fmt.Errorf("cfs snapshotter: resolve ocicfs object directory: %w", err)
 	}
 	if strings.ContainsAny(objectsDir, ":,") {
-		return nil, fmt.Errorf("cfs snapshotter: knarr object directory must not contain ':' or ',' (it becomes an overlay mount option): %w", errdefs.ErrInvalidArgument)
+		return nil, fmt.Errorf("cfs snapshotter: ocicfs object directory must not contain ':' or ',' (it becomes an overlay mount option): %w", errdefs.ErrInvalidArgument)
 	}
 	if err := os.MkdirAll(root, 0700); err != nil {
 		return nil, fmt.Errorf("cfs snapshotter: create root: %w", err)
@@ -399,7 +399,7 @@ func (s *snapshotter) reconcileHolds(ctx context.Context) error {
 	return nil
 }
 
-// Cleanup collects the knarr store once the runtime has dropped an image.
+// Cleanup collects the ocicfs store once the runtime has dropped an image.
 // containerd calls it at the end of each of its own collection cycles, after
 // the Remove of every record that cycle pruned, and — for an image removal
 // the client asked to be synchronous, as docker's is — waits for it, so the
@@ -428,7 +428,7 @@ func (s *snapshotter) collectSoon() {
 	}
 }
 
-// collect runs one collection of the knarr store if a hold was released, or
+// collect runs one collection of the ocicfs store if a hold was released, or
 // a build failed, since the last one. A store busy with a pull, hold or mount
 // defers the collection to the reclaim goroutine — the removal that made it
 // necessary has already happened, only the reclaiming waits — while any
@@ -444,7 +444,7 @@ func (s *snapshotter) collect() error {
 	releases := s.releases.Load()
 	report, err := s.engine.GC(s.lifetime)
 	switch {
-	case errors.Is(err, knarr.ErrStoreBusy):
+	case errors.Is(err, ocicfs.ErrStoreBusy):
 		s.dirty.Store(true)
 		select {
 		case s.retry <- struct{}{}:
@@ -457,7 +457,7 @@ func (s *snapshotter) collect() error {
 	case err != nil:
 		s.covered.Store(releases)
 		log.L.WithError(err).Error("cfs snapshotter: store collection failed")
-		return fmt.Errorf("collect the knarr store: %w", err)
+		return fmt.Errorf("collect the ocicfs store: %w", err)
 	}
 	s.covered.Store(releases)
 	entry := log.L.WithFields(log.Fields{
@@ -500,7 +500,7 @@ func (s *snapshotter) reclaim() {
 	}
 }
 
-// engineAPI is the subset of knarr.Engine the snapshotter uses: reading the
+// engineAPI is the subset of ocicfs.Engine the snapshotter uses: reading the
 // local store (Inspect, ObjectsDir), mounting an image chain from it
 // (MountChain, Unmount), building an image out of layers the runtime fetches
 // (NewBuild), pinning what it hands containerd for as long as containerd
@@ -514,15 +514,15 @@ func (s *snapshotter) reclaim() {
 // collector, which reclaims only what no reference and no hold wants. The
 // narrow surface is also the seam the tests fake.
 type engineAPI interface {
-	Inspect(ctx context.Context, ref string) (*knarr.ImageInfo, error)
-	NewBuild(ctx context.Context, ref string, opts ...knarr.PullOption) (knarr.Build, error)
+	Inspect(ctx context.Context, ref string) (*ocicfs.ImageInfo, error)
+	NewBuild(ctx context.Context, ref string, opts ...ocicfs.PullOption) (ocicfs.Build, error)
 	Hold(ctx context.Context, ref, holder string) error
 	Release(ctx context.Context, ref, holder string) error
 	Holds(ctx context.Context) (map[digest.Digest][]string, error)
-	MountChain(ctx context.Context, chainID, target string, opts ...knarr.MountOption) error
+	MountChain(ctx context.Context, chainID, target string, opts ...ocicfs.MountOption) error
 	Unmount(ctx context.Context, target string) error
 	ObjectsDir() (string, error)
-	GC(ctx context.Context, opts ...knarr.GCOption) (*knarr.GCReport, error)
+	GC(ctx context.Context, opts ...ocicfs.GCOption) (*ocicfs.GCReport, error)
 }
 
 // Stat returns the info for an active or committed snapshot by key. It is the
@@ -599,7 +599,7 @@ func (s *snapshotter) Update(ctx context.Context, info snapshots.Info, fieldpath
 // it actually costs now rather than from what it cost when it was committed,
 // because neither figure can be rewritten afterwards: a snapshot standing for
 // an image costs that image's composefs blob, and a staged record, whose
-// layer lives in the knarr store, costs nothing. Only a record that is
+// layer lives in the ocicfs store, costs nothing. Only a record that is
 // neither — a container's own layer — reports the usage recorded at commit
 // time. After an unpack the caller queries every member of the image's chain
 // in turn to price the image, so a Usage(chainID)+Stat(chainID) pair per
@@ -653,14 +653,14 @@ func (s *snapshotter) Mounts(ctx context.Context, key string) ([]mount.Mount, er
 // Prepare records a new active snapshot under key, descending from parent,
 // and returns its mounts. Both call shapes from the package contract land
 // here, and the snapshot.ref label decides the work: a handshake Prepare for
-// a layer chain the knarr store holds needs only a metadata record — created
+// a layer chain the ocicfs store holds needs only a metadata record — created
 // and committed virtually in one transaction, no directory ever provisioned —
 // and is answered with ErrAlreadyExists instead of mounts; one for a chain
 // the store does not hold is declined. Where staging is allowed, every
 // handshake instead gets a staging snapshot — a record with the placeholder
 // mount the differ applies the layer through — whether or not the store
 // holds its image. Everything else gets a directory-backed active snapshot
-// and overlay mounts composing the image metadata, the knarr objects, the
+// and overlay mounts composing the image metadata, the ocicfs objects, the
 // uppers of its committed ancestors, and its own upper (see mounts).
 func (s *snapshotter) Prepare(ctx context.Context, key, parent string, opts ...snapshots.Opt) ([]mount.Mount, error) {
 	log.G(ctx).WithFields(log.Fields{"key": key, "parent": parent}).
@@ -724,7 +724,7 @@ func (s *snapshotter) View(ctx context.Context, key, parent string, opts ...snap
 // other snapshots descend from.
 //
 // Committing a staged snapshot files the record of a layer the differ has
-// already fed into the knarr store. containerd calls it inside its own
+// already fed into the ocicfs store. containerd calls it inside its own
 // metadata transaction, so everything it needs is on the record: the chain
 // it stands for is its snapshot.ref label — never the name, which is
 // containerd's own bookkeeping — and whether that chain is the image's last
@@ -783,7 +783,7 @@ func (s *snapshotter) Commit(ctx context.Context, name, key string, opts ...snap
 // snapshot goes before its init layer, and image chains unwind leaf-first
 // once no image references them.
 //
-// A record that pinned an image in the knarr store releases it here, against
+// A record that pinned an image in the ocicfs store releases it here, against
 // the root digest and the holder name the record itself carries rather than any
 // reference that may have moved since. The release names that record's own
 // hold, so removing a record that never took one, or one of several records
@@ -863,7 +863,7 @@ func (s *snapshotter) Remove(ctx context.Context, key string) (err error) {
 	return nil
 }
 
-// releaseHold drops one of the knarr store's holds on root, logging a failure
+// releaseHold drops one of the ocicfs store's holds on root, logging a failure
 // rather than reporting it: every caller has already passed the point where it
 // could undo its own work, so what a failure leaves behind is an image held
 // longer than it need be.
@@ -970,7 +970,7 @@ var errStagePull = errors.New("stage the pull")
 //
 // Admitting the image's last chain also pins the image under this
 // snapshotter. From then on containerd holds a durable record standing for
-// content it will only mount later, and the hold is what stops a knarr remove
+// content it will only mount later, and the hold is what stops a ocicfs remove
 // from taking that content away in between — a pull followed by a remove
 // followed by a run would otherwise fail at the run. The hold is taken before
 // the record exists, because a record with no hold would leave content
@@ -985,7 +985,7 @@ func (s *snapshotter) createAndCommitIntermediateVirtualSnapshot(ctx context.Con
 		return errStagePull
 	}
 	info, err := s.engine.Inspect(ctx, imageRef)
-	if errors.Is(err, knarr.ErrNotFound) {
+	if errors.Is(err, ocicfs.ErrNotFound) {
 		return fmt.Errorf("image %q is not present in the local store: %w", imageRef, errdefs.ErrFailedPrecondition)
 	}
 	if err != nil {
@@ -1077,7 +1077,7 @@ func (s *snapshotter) commitRecord(ctx context.Context, name, key string, privat
 
 // createStagingSnapshot records the active snapshot of a staged layer and
 // returns its placeholder mount. The record is all there is to it: the layer
-// goes into the knarr store through the differ, so no directory is
+// goes into the ocicfs store through the differ, so no directory is
 // provisioned and no ancestor is consulted.
 func (s *snapshotter) createStagingSnapshot(ctx context.Context, key, parent string, opts []snapshots.Opt) ([]mount.Mount, error) {
 	err := s.ms.WithTransaction(ctx, true, func(ctx context.Context) error {
@@ -1300,7 +1300,7 @@ func isChainMember(labels map[string]string, dir string) bool {
 }
 
 // ensureChainMounted mounts an image's read-only EROFS metadata at fsDir if the
-// shared mount is not already present. The knarr store resolves the layer chain
+// shared mount is not already present. The ocicfs store resolves the layer chain
 // to a stored image and mounts it in one call.
 func (s *snapshotter) ensureChainMounted(ctx context.Context, chainID, fsDir string) error {
 	s.mountMu.Lock()
@@ -1316,9 +1316,9 @@ func (s *snapshotter) ensureChainMounted(ctx context.Context, chainID, fsDir str
 	if err := os.MkdirAll(fsDir, 0755); err != nil { //nolint:gosec // G301: rootfs mount target must be world-traversable
 		return fmt.Errorf("create chain mount dir %s: %w", fsDir, err)
 	}
-	if err := s.engine.MountChain(ctx, chainID, fsDir, knarr.WithMetadataOnly()); err != nil {
-		if errors.Is(err, knarr.ErrNotFound) {
-			return fmt.Errorf("image not found in the knarr store; pull it with knarr before running the container (chain %s): %w", chainID, errdefs.ErrFailedPrecondition)
+	if err := s.engine.MountChain(ctx, chainID, fsDir, ocicfs.WithMetadataOnly()); err != nil {
+		if errors.Is(err, ocicfs.ErrNotFound) {
+			return fmt.Errorf("image not found in the ocicfs store; pull it with ocicfs before running the container (chain %s): %w", chainID, errdefs.ErrFailedPrecondition)
 		}
 		return fmt.Errorf("mount image chain %s at %s: %w", chainID, fsDir, err)
 	}

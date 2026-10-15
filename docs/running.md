@@ -9,7 +9,7 @@ hands it the layers of a pull to ingest. containerd — and Docker, which uses
 the same containerd — is pointed at them through two `proxy_plugins` entries.
 
 > **Status:** the snapshotter serves real image content from a local
-> [knarr](https://github.com/foundriesio/knarr) store. A container
+> [ocicfs](https://github.com/foundriesio/ocicfs) store. A container
 > snapshot mounts the image's read-only EROFS metadata — once per image,
 > shared by all its containers — and gets one flat overlay whose data comes
 > from the store's fs-verity-backed objects (`verity=require`). By default
@@ -18,7 +18,7 @@ the same containerd — is pointed at them through two `proxy_plugins` entries.
 > store as it lands, building the composefs image;
 > see [Pulling without staging first](#pulling-without-staging-first). A
 > machine set up the other way (`-allow-unstaged-pulls=false`) never fills
-> the store itself: images enter it out of band via `knarr pull`, pinned by
+> the store itself: images enter it out of band via `ocicfs pull`, pinned by
 > digest, and the snapshotter answers the unpacker's per-layer handshake
 > only when the runtime-stamped image reference resolves to a held image
 > containing the requested chain — an admitted pull routed to cfs downloads
@@ -29,7 +29,7 @@ the same containerd — is pointed at them through two `proxy_plugins` entries.
 
 ```sh
 make build
-sudo ./bin/containerd-cfs-grpc -knarr-root /var/lib/knarr &
+sudo ./bin/containerd-cfs-grpc -ocicfs-root /var/lib/ocicfs &
 ```
 
 The defaults match the config below; see `-help` for the full list.
@@ -38,16 +38,16 @@ The defaults match the config below; see `-help` for the full list.
 | --- | --- | --- |
 | `-address` | `/run/containerd-cfs-grpc/containerd-cfs-grpc.sock` | The snapshotter's own gRPC socket, named again in containerd's `proxy_plugins` entry. |
 | `-root` | `/var/lib/containerd-cfs-grpc` | Where the snapshotter keeps its metadata and each snapshot's directories. |
-| `-knarr-root` | `/var/lib/knarr` | The knarr store images are served from. |
+| `-ocicfs-root` | `/var/lib/ocicfs` | The ocicfs store images are served from. |
 | `-containerd-address` | `/run/containerd/containerd.sock` | containerd's gRPC socket, whose content store the layers of a staged pull are read back from. |
-| `-allow-unstaged-pulls` | `true` | Selects the machine's work mode: stage every pull through containerd's content store and build it into the knarr store, instead of admitting only images already there. `=false` selects the out-of-band mode. |
-| `-ingest-workers` | `0` (knarr's default, 2) | How many layers staged pulls ingest into the knarr store at once, across every pull in progress. Two is the gain on every platform measured; a many-core host with fast storage may take a few percent more from four. |
+| `-allow-unstaged-pulls` | `true` | Selects the machine's work mode: stage every pull through containerd's content store and build it into the ocicfs store, instead of admitting only images already there. `=false` selects the out-of-band mode. |
+| `-ingest-workers` | `0` (ocicfs's default, 2) | How many layers staged pulls ingest into the ocicfs store at once, across every pull in progress. Two is the gain on every platform measured; a many-core host with fast storage may take a few percent more from four. |
 | `-log-level` | `info` | `trace`, `debug`, `info`, `warn`, `error`, `fatal`, `panic`. |
 | `-check` | off | Check the runtime prerequisites and the containerd wiring of both the snapshotter and the differ instead of serving: one verdict line per aspect, the effective ingest worker count, and a non-zero exit on any failure. |
 
 The snapshotter root hosts each container's overlay upper and work
 directories, so it must live on a regular filesystem (ext4, xfs, …) — overlay
-cannot stack on overlay. The knarr store's filesystem must support fs-verity
+cannot stack on overlay. The ocicfs store's filesystem must support fs-verity
 (on ext4 that means `mkfs.ext4 -O verity -b 4096`).
 
 ## 2. Configure containerd
@@ -124,11 +124,11 @@ This flow is the out-of-band mode: it needs the daemon started with
 layers instead; see
 [Pulling without staging first](#pulling-without-staging-first)).
 
-Stage the image in the knarr store first (from a registry or, as in the
+Stage the image in the ocicfs store first (from a registry or, as in the
 devcontainer's tests, from an OCI layout directory):
 
 ```sh
-sudo knarr pull <registry>/<repo>@sha256:<manifest-digest>
+sudo ocicfs pull <registry>/<repo>@sha256:<manifest-digest>
 ```
 
 Then pull and run through cfs, using the same reference you staged:
@@ -143,15 +143,15 @@ docker run --rm <registry>/<repo>@sha256:<manifest-digest>
 ```
 
 A tag reference works the same way when the image was staged by that tag
-(`knarr pull <registry>/<repo>:<tag>` followed by
-`docker pull <registry>/<repo>:<tag>`): knarr resolves the tag to the digest
+(`ocicfs pull <registry>/<repo>:<tag>` followed by
+`docker pull <registry>/<repo>:<tag>`): ocicfs resolves the tag to the digest
 its most recent pull by that tag recorded.
 
 Both pulls complete through cfs with zero layer downloads — only the image
 metadata (index, manifest, config, etc.) is fetched: the snapshotter answers
 the unpacker's per-layer handshake so the layer chain is recorded as already
 present. `ctr snapshots --snapshotter cfs ls` then lists the committed chain
-snapshots, and `docker run` serves the image content from the knarr store.
+snapshots, and `docker run` serves the image content from the ocicfs store.
 Pulling an image the store does not hold fails during the pull at the
 snapshotter's admission gate, and running an image whose layer chain is not
 in the store fails with an error asking you to pull it by digest out of band.
@@ -159,10 +159,10 @@ in the store fails with an error asking you to pull it by digest out of band.
 ## Pulling without staging first
 
 By default the store fills from the runtime's own pull instead of from an
-out-of-band one — no `knarr pull` first:
+out-of-band one — no `ocicfs pull` first:
 
 ```sh
-sudo ./bin/containerd-cfs-grpc -knarr-root /var/lib/knarr &
+sudo ./bin/containerd-cfs-grpc -ocicfs-root /var/lib/ocicfs &
 
 docker pull <registry>/<repo>@sha256:<manifest-digest>
 docker run --rm <registry>/<repo>@sha256:<manifest-digest>
@@ -172,7 +172,7 @@ Nothing else changes: the pull is a plain `docker pull`, with its usual
 per-layer progress, and the container gets the same mounts an out-of-band pull
 would have given it. What differs is where the content comes from. containerd
 fetches the layers it always would and hands each one, as it lands, to the
-snapshotter's differ, which ingests it into the knarr store's build of the
+snapshotter's differ, which ingests it into the ocicfs store's build of the
 image — reading the layer back out of containerd's content store, so nothing
 is fetched twice and nothing is staged on disk in between. The build scans
 layers ahead of the ones containerd has handed over, up to `-ingest-workers`
@@ -188,27 +188,27 @@ on the same single composefs image in the store.
 
 The image is the runtime's: the store keeps it by the snapshotter's hold, for
 as long as the runtime lists it, and names it by a *runtime reference* — the
-reference docker pulled, recorded for that holder. `knarr ls` shows the row
-like any other (with the holder in `--format json`), and `knarr inspect`,
-`knarr mount` and `knarr hold` resolve the name; what the name does not do is
-keep the image, and `knarr remove` of it declines while the runtime's hold
+reference docker pulled, recorded for that holder. `ocicfs ls` shows the row
+like any other (with the holder in `--format json`), and `ocicfs inspect`,
+`ocicfs mount` and `ocicfs hold` resolve the name; what the name does not do is
+keep the image, and `ocicfs remove` of it declines while the runtime's hold
 stands. `docker image rm` is what removes it: containerd forgets the image's
 snapshots, the snapshotter releases its hold and collects the store, and the
 removal waits for that, so by the time the command returns the image and its
-name are gone from `knarr ls` and its objects — those no other image shares —
-are reclaimed from disk. An image `knarr pull` put in the store is an agent's,
+name are gone from `ocicfs ls` and its objects — those no other image shares —
+are reclaimed from disk. An image `ocicfs pull` put in the store is an agent's,
 and a runtime removal never touches it: its reference keeps it, and only the
 hold the runtime took is dropped. An agent that wants a runtime-pulled image
-kept adopts it — `knarr pull` of the name replaces the runtime's reference
+kept adopts it — `ocicfs pull` of the name replaces the runtime's reference
 with the agent's — or holds it; once it releases such a hold, it collects
-with `knarr gc` — reclaiming what an agent let go is the agent's call, not
+with `ocicfs gc` — reclaiming what an agent let go is the agent's call, not
 the snapshotter's. A runtime pull never displaces a reference the agent
 recorded for the same name: the image is then held but not named.
 
 A pull writes every file of every layer, and the files a later layer
 replaced or removed are objects this image no longer references. A finished
 pull does not request a collection for them: those nothing else retains go
-with the next one, whoever asks for it — an agent's `knarr gc` once the new
+with the next one, whoever asks for it — an agent's `ocicfs gc` once the new
 image is running, a `docker rmi` that releases a hold, the daemon's start, or
 a pull that failed — so on a machine that only ever pulls they stay until one
 of those happens, and for an image that writes and later deletes large files
@@ -231,7 +231,7 @@ retried the same way as one that found the store busy at its start.
 `docker images` reports a staged image's size as its composefs metadata, not
 its content.
 
-A `knarr gc` while a staged pull is in progress, or shortly after one was
+A `ocicfs gc` while a staged pull is in progress, or shortly after one was
 interrupted, reports the store busy: the pull's build keeps the store's shared
 lock from its first applied layer until the image is finished, or until
 containerd has removed the abandoned pull's snapshots. That is expected;
@@ -286,9 +286,9 @@ paths stamp it as follows:
 | CRI transfer-service pull | Keep the mandatory `enable_remote_snapshot_annotations = "true"` proxy-plugin export shown above. |
 
 The stamped value is the reference exactly as invoked. In the out-of-band
-mode the snapshotter resolves it against the knarr store: a digest reference
-must be held, and a tag reference resolves to the digest knarr's most recent
-pull by that tag recorded — a tag knarr holds no alias for is declined. A
+mode the snapshotter resolves it against the ocicfs store: a digest reference
+must be held, and a tag reference resolves to the digest ocicfs's most recent
+pull by that tag recorded — a tag ocicfs holds no alias for is declined. A
 staging machine stages the pull without consulting the store, but the
 reference and manifest digest still anchor the conversion. A missing
 annotation is declined in both modes; non-stamping configurations are
@@ -321,7 +321,7 @@ docker stop cfs-hold           # clean shutdown, no SIGKILL wait
 ```
 
 The container's root is one `overlay` mount whose `lowerdir` ends with the
-image's EROFS metadata mount followed by `::<knarr objects>` (a data-only
+image's EROFS metadata mount followed by `::<ocicfs objects>` (a data-only
 layer) and `verity=require`; the shared EROFS mount itself appears in the
 host's mount table under the snapshotter root
 (`.../containerd-cfs-grpc/snapshots/<id>/fs`, fstype `erofs`, on a loop
