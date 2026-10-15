@@ -61,7 +61,7 @@ start_runtime_daemons() {
 		/var/lib/containerd-cfs-grpc \
 		/var/lib/cfs-dev-registry \
 		/var/lib/docker \
-		/var/lib/knarr \
+		/var/lib/ocicfs \
 		"${LOG_DIR}"
 
 	echo "runtime versions:"
@@ -81,18 +81,18 @@ start_runtime_daemons() {
 	wait_for zot curl -fsS "${REGISTRY_URL}/v2/"
 
 	make -C "${ROOT_DIR}" build
-	# One loop-backed ext4 with fs-verity hosts the knarr store and every
+	# One loop-backed ext4 with fs-verity hosts the ocicfs store and every
 	# snapshotter root; loop nodes are scarce in the container's tmpfs /dev.
 	mount_loop_ext4 "${SHARED_ROOT_IMG}" "${SHARED_ROOT}"
 	bind_root "${CFS_ROOT}"
-	bind_root "${KNARR_ROOT}"
+	bind_root "${OCICFS_ROOT}"
 	rm -f "${CFS_SOCKET}"
 	start_daemon containerd-cfs-grpc "${LOG_DIR}/containerd-cfs-grpc.pid" "${LOG_DIR}/containerd-cfs-grpc.log" \
-		"${CONTAINERD_CFS_GRPC_BIN}" -log-level "${CFS_LOG_LEVEL}" -root "${CFS_ROOT}" -knarr-root "${KNARR_ROOT}" \
+		"${CONTAINERD_CFS_GRPC_BIN}" -log-level "${CFS_LOG_LEVEL}" -root "${CFS_ROOT}" -ocicfs-root "${OCICFS_ROOT}" \
 		-allow-unstaged-pulls -ingest-workers 0
 	# The state line run-cfs.sh reconciles against: log level, stores, work
 	# mode, ingest workers (0 is the daemon's default).
-	printf '%s\n' "${CFS_LOG_LEVEL} ${KNARR_ROOT} ${CFS_ROOT} 1 0" >"${CFS_STATE_FILE}"
+	printf '%s\n' "${CFS_LOG_LEVEL} ${OCICFS_ROOT} ${CFS_ROOT} 1 0" >"${CFS_STATE_FILE}"
 	wait_for cfs-snapshotter test -S "${CFS_SOCKET}"
 
 	# Enable the built-in erofs snapshotter only when the kernel supports

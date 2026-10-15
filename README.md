@@ -6,14 +6,14 @@ container rootfs from content-addressed, composefs-backed storage — using
 `mount` syscall instead of unpacking and stacking layers.
 
 > **Status: early development.** The snapshotter serves real image content
-> from a local [knarr](https://github.com/foundriesio/knarr) store: `docker
+> from a local [ocicfs](https://github.com/foundriesio/ocicfs) store: `docker
 > run` mounts the image's EROFS metadata once per image and gives each
 > container one flat overlay whose data comes from the store's
 > fs-verity-backed objects. By default a plain `docker pull` fills the
 > store: containerd fetches the layers as it always would, the snapshotter
 > stages them, and the whole image is built into the store when the last
 > layer is committed. A machine started with `-allow-unstaged-pulls=false`
-> instead admits only images put in the store out of band — `knarr pull`,
+> instead admits only images put in the store out of band — `ocicfs pull`,
 > pinned by digest — and declines every other pull; the pulls it admits
 > download no layers (`ctr` and `docker` still fetch the image metadata:
 > index, manifest, config, etc.). Either way a container gets the same
@@ -68,7 +68,7 @@ SEED_RUNNABLE=1 SEED_KEEP_LAYOUT="${layout}" \
     .devcontainer/scripts/seed-registry.sh 127.0.0.1:5000/cfs/demo:latest
 digest=$(jq -r '.manifests[0].digest' "${layout}/index.json")
 
-knarr pull --from-dir "${layout}" "cfs/demo@${digest}"
+ocicfs pull --from-dir "${layout}" "cfs/demo@${digest}"
 
 docker pull "127.0.0.1:5000/cfs/demo@${digest}"   # zero layer downloads
 docker run --rm "127.0.0.1:5000/cfs/demo@${digest}"
@@ -79,7 +79,7 @@ cfs-log-follow    # follow it live
 ```
 
 The pull downloads no layers — only the image metadata (index, manifest,
-config, etc.) is fetched — and the container runs from the knarr store's
+config, etc.) is fetched — and the container runs from the ocicfs store's
 content. Running an image that is not in the store fails with an error
 telling you to pull it by digest out of band.
 

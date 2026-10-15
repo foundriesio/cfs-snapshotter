@@ -141,18 +141,18 @@ main() {
 		/var/lib/containerd \
 		/var/lib/docker \
 		"${CFS_ROOT}" \
-		"${KNARR_ROOT}" \
+		"${OCICFS_ROOT}" \
 		"${LOG_DIR}"
 
 	git config --global --add safe.directory "${ROOT_DIR}" || true
 	mount_loop_ext4 "${SHARED_ROOT_IMG}" "${SHARED_ROOT}"
 	bind_root "${CFS_ROOT}"
-	bind_root "${KNARR_ROOT}"
+	bind_root "${OCICFS_ROOT}"
 	local old_hash new_hash old_state new_state
 	# The daemon's work mode, its stores and its worker count are part of the
 	# state a restart reconciles: changing any of them makes the running
 	# daemon the wrong one.
-	new_state="${CFS_LOG_LEVEL} ${KNARR_ROOT} ${CFS_ROOT} ${CFS_ALLOW_UNSTAGED_PULLS} ${CFS_INGEST_WORKERS}"
+	new_state="${CFS_LOG_LEVEL} ${OCICFS_ROOT} ${CFS_ROOT} ${CFS_ALLOW_UNSTAGED_PULLS} ${CFS_INGEST_WORKERS}"
 	old_hash="$(file_hash "${CONTAINERD_CFS_GRPC_BIN}")"
 	old_state="$(cat "${CFS_STATE_FILE}" 2>/dev/null || true)"
 	make -C "${ROOT_DIR}" build
@@ -165,7 +165,7 @@ main() {
 		[ "${old_state}" = "${new_state}" ]; then
 		echo "cfs snapshotter binary unchanged; keeping pid $(cat "${CFS_PIDFILE}")"
 	else
-		local args=(-log-level "${CFS_LOG_LEVEL}" -root "${CFS_ROOT}" -knarr-root "${KNARR_ROOT}"
+		local args=(-log-level "${CFS_LOG_LEVEL}" -root "${CFS_ROOT}" -ocicfs-root "${OCICFS_ROOT}"
 			-ingest-workers "${CFS_INGEST_WORKERS}")
 		# Always explicit: the mode is part of the reconciled state, so the
 		# daemon must be started with the value the state line records.
@@ -191,7 +191,7 @@ main() {
 
 	echo "cfs snapshotter is running"
 	echo "log level: ${CFS_LOG_LEVEL}"
-	echo "roots: ${CFS_ROOT} ${KNARR_ROOT}"
+	echo "roots: ${CFS_ROOT} ${OCICFS_ROOT}"
 	echo "allow unstaged pulls: ${CFS_ALLOW_UNSTAGED_PULLS}"
 	echo "ingest workers: ${CFS_INGEST_WORKERS}"
 	echo "logs: ${CFS_LOGFILE}"

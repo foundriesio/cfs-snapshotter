@@ -4,7 +4,7 @@
 # Shared loop-backed ext4 root: constants and mount helpers sourced by
 # entrypoint.sh and run-cfs.sh.
 
-KNARR_ROOT="${KNARR_ROOT:-/var/lib/knarr}"
+OCICFS_ROOT="${OCICFS_ROOT:-/var/lib/ocicfs}"
 SHARED_ROOT=/var/lib/cfs-shared-root
 SHARED_ROOT_IMG=/var/tmp/cfs-shared-root.img
 # Size of the backing image in MiB. It takes effect when the filesystem is
@@ -36,7 +36,7 @@ mount_loop_ext4() {
 }
 
 # bind_root binds a subdirectory of the shared loop-backed ext4 onto a store
-# root, giving the knarr store fs-verity and the overlay upper/work dirs a real
+# root, giving the ocicfs store fs-verity and the overlay upper/work dirs a real
 # filesystem: they cannot live on the container's own overlayfs (overlay cannot
 # stack on overlay). The subdirectory is named after the root's last path
 # element, so two roots never share backing state. A filesystem already mounted

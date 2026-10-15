@@ -31,9 +31,9 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
-  # knarr is an internal module; the public proxy can't serve it, so builds
+  # ocicfs is an internal module; the public proxy can't serve it, so builds
   # resolve it directly over git using a token that can read the repo.
-  GOPRIVATE: github.com/foundriesio/knarr
+  GOPRIVATE: github.com/foundriesio/ocicfs
 
 jobs:
   build:
@@ -69,12 +69,12 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Authenticate to the internal knarr module
-        run: git config --global url."https://x-access-token:${{ secrets.KNARR_TOKEN }}@github.com/foundriesio/".insteadOf "https://github.com/foundriesio/"
+      - name: Authenticate to the internal ocicfs module
+        run: git config --global url."https://x-access-token:${{ secrets.OCICFS_TOKEN }}@github.com/foundriesio/".insteadOf "https://github.com/foundriesio/"
 
-      # The devcontainer has no credentials for the internal knarr module, so
+      # The devcontainer has no credentials for the internal ocicfs module, so
       # pre-fetch it here into the module cache the container bind-mounts and
-      # reuses; the build inside then resolves knarr offline.
+      # reuses; the build inside then resolves ocicfs offline.
       - name: Pre-fetch modules into the shared devcontainer cache
         run: GOMODCACHE=$HOME/.cache/cfs-snapshotter/go-mod go mod download
 

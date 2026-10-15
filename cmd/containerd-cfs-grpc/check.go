@@ -8,7 +8,7 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/foundriesio/knarr/pkg/knarr"
+	"github.com/foundriesio/ocicfs/pkg/ocicfs"
 
 	"github.com/foundriesio/cfs-snapshotter/internal/snapshot"
 )
@@ -34,22 +34,22 @@ func runCheck(ctx context.Context, w io.Writer, cfg snapshot.Config, socketAddre
 	}
 
 	if cfg.AllowUnstagedPulls {
-		engine, err := knarr.New(knarr.Config{Root: cfg.KnarrRoot})
+		engine, err := ocicfs.New(ocicfs.Config{Root: cfg.OcicfsRoot})
 		if err != nil {
 			failed = true
-			line(w, "1. mkcomposefs: FAIL: create knarr engine: %v", err)
-			line(w, "2. fs-verity on the knarr store (%s): FAIL: create knarr engine: %v", cfg.KnarrRoot, err)
+			line(w, "1. mkcomposefs: FAIL: create ocicfs engine: %v", err)
+			line(w, "2. fs-verity on the ocicfs store (%s): FAIL: create ocicfs engine: %v", cfg.OcicfsRoot, err)
 		} else {
 			report("1. mkcomposefs", engine.PreflightTools())
-			report(fmt.Sprintf("2. fs-verity on the knarr store (%s)", cfg.KnarrRoot), engine.PreflightStore())
+			report(fmt.Sprintf("2. fs-verity on the ocicfs store (%s)", cfg.OcicfsRoot), engine.PreflightStore())
 		}
 	} else {
 		line(w, "1. mkcomposefs: skipped (out-of-band mode builds nothing locally)")
-		line(w, "2. fs-verity on the knarr store: skipped (out-of-band mode builds nothing locally)")
+		line(w, "2. fs-verity on the ocicfs store: skipped (out-of-band mode builds nothing locally)")
 	}
 	workers := cfg.IngestWorkers
 	if workers == 0 {
-		workers = knarr.DefaultIngestWorkers
+		workers = ocicfs.DefaultIngestWorkers
 	}
 	line(w, "ingest workers: %d", workers)
 

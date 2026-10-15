@@ -14,7 +14,7 @@ import (
 )
 
 // TestSnapshotterConformance runs containerd's reusable snapshotter
-// conformance suite against a snapshotter backed by a real knarr store. The
+// conformance suite against a snapshotter backed by a real ocicfs store. The
 // suite mounts, so it needs real root and is skipped unless -test.root is
 // given: `make root-test`.
 func TestSnapshotterConformance(t *testing.T) {
@@ -23,11 +23,11 @@ func TestSnapshotterConformance(t *testing.T) {
 }
 
 // newConformanceSnapshotter builds the snapshotter the conformance suite
-// drives, with a knarr store next to the root the suite hands out.
+// drives, with a ocicfs store next to the root the suite hands out.
 func newConformanceSnapshotter(ctx context.Context, root string) (snapshots.Snapshotter, func() error, error) {
 	sn, err := NewSnapshotter(ctx, Config{
-		Root:      root,
-		KnarrRoot: filepath.Join(filepath.Dir(root), "knarr"),
+		Root:       root,
+		OcicfsRoot: filepath.Join(filepath.Dir(root), "ocicfs"),
 	})
 	if err != nil {
 		return nil, nil, err

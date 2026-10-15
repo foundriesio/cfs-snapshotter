@@ -16,7 +16,7 @@ import (
 	"github.com/containerd/containerd/v2/pkg/namespaces"
 	"github.com/containerd/errdefs"
 	"github.com/containerd/errdefs/pkg/errgrpc"
-	"github.com/foundriesio/knarr/pkg/knarr"
+	"github.com/foundriesio/ocicfs/pkg/ocicfs"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -24,7 +24,7 @@ import (
 
 // contentBlobs reads image blobs out of containerd's content store, which is
 // where the layers of a staged pull land as the runtime fetches them. It is
-// the source the knarr store builds an image from, in place of a registry.
+// the source the ocicfs store builds an image from, in place of a registry.
 //
 // The connection is dialed on the first read and shared from then on, so a
 // snapshotter that never converts anything never opens it, and a dial that
@@ -38,8 +38,8 @@ type contentBlobs struct {
 	client contentapi.ContentClient
 }
 
-// Compile-time assertion that *contentBlobs is a knarr blob source.
-var _ knarr.BlobSource = (*contentBlobs)(nil)
+// Compile-time assertion that *contentBlobs is a ocicfs blob source.
+var _ ocicfs.BlobSource = (*contentBlobs)(nil)
 
 // newContentBlobs returns a blob source reading containerd's content store at
 // the given gRPC address.

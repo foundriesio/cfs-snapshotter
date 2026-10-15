@@ -5,7 +5,7 @@
 #
 # Build the cfs-snapshotter .deb inside the cfs-snapshotter-debuild container
 # (Makefile deb target). Expects the source tree mounted read-only at /src, a
-# vendored module tree at /vendor (the knarr dependency is not fetchable from
+# vendored module tree at /vendor (the ocicfs dependency is not fetchable from
 # inside this container, so the build runs fully offline), a writable output
 # directory at /out, and VERSION, REVISION and DEB_VERSION in the environment:
 # the Makefile's git-derived fallbacks would silently stamp a "dev" binary

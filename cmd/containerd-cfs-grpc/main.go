@@ -6,7 +6,7 @@
 // both exposed over one gRPC unix socket. containerd is pointed at them via
 // the [proxy_plugins.cfs] and [proxy_plugins.cfs-diff] entries in its
 // config.toml (see docs/running.md). Image content is served from composefs
-// images in the local knarr store.
+// images in the local ocicfs store.
 package main
 
 import (
@@ -24,7 +24,7 @@ import (
 	snapshotsapi "github.com/containerd/containerd/api/services/snapshots/v1"
 	"github.com/containerd/containerd/v2/contrib/snapshotservice"
 	"github.com/containerd/log"
-	"github.com/foundriesio/knarr/pkg/knarr"
+	"github.com/foundriesio/ocicfs/pkg/ocicfs"
 	"golang.org/x/sys/unix"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -41,10 +41,10 @@ const (
 var (
 	address            = flag.String("address", defaultAddress, "address for the snapshotter's gRPC server")
 	rootDir            = flag.String("root", defaultRootDir, "path to the root directory for this snapshotter")
-	knarrRoot          = flag.String("knarr-root", "/var/lib/knarr", "path to the shared knarr image store root")
+	ocicfsRoot         = flag.String("ocicfs-root", "/var/lib/ocicfs", "path to the shared ocicfs image store root")
 	containerdAddress  = flag.String("containerd-address", "/run/containerd/containerd.sock", "address of containerd's gRPC server")
-	allowUnstagedPulls = flag.Bool("allow-unstaged-pulls", true, "stage every pull through containerd's content store and build it into the knarr store, instead of admitting only images already there")
-	ingestWorkers      = flag.Int("ingest-workers", 0, fmt.Sprintf("number of layers a staged pull ingests into the knarr store at once, across all pulls in progress (0 selects the default of %d)", knarr.DefaultIngestWorkers))
+	allowUnstagedPulls = flag.Bool("allow-unstaged-pulls", true, "stage every pull through containerd's content store and build it into the ocicfs store, instead of admitting only images already there")
+	ingestWorkers      = flag.Int("ingest-workers", 0, fmt.Sprintf("number of layers a staged pull ingests into the ocicfs store at once, across all pulls in progress (0 selects the default of %d)", ocicfs.DefaultIngestWorkers))
 	logLevel           = flag.String("log-level", log.InfoLevel.String(), "logging level [trace, debug, info, warn, error, fatal, panic]")
 	printVersion       = flag.Bool("version", false, "print the version and exit")
 	runChecks          = flag.Bool("check", false, "check the runtime prerequisites and the containerd wiring instead of serving, and exit non-zero on any failure")
@@ -70,7 +70,7 @@ func main() {
 	ctx := log.WithLogger(context.Background(), log.L)
 	cfg := snapshot.Config{
 		Root:               *rootDir,
-		KnarrRoot:          *knarrRoot,
+		OcicfsRoot:         *ocicfsRoot,
 		AllowUnstagedPulls: *allowUnstagedPulls,
 		ContainerdAddress:  *containerdAddress,
 		IngestWorkers:      *ingestWorkers,

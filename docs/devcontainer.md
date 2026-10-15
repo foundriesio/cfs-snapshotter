@@ -12,19 +12,19 @@ snapshotter against a nested, version-pinned runtime stack:
 - Zot, used as a local test registry on `127.0.0.1:5000`.
 - erofs-utils built from source (Debian's package predates the tar mode that
   containerd's built-in erofs snapshotter needs).
-- composefs built from source (`mkcomposefs`, `mount.composefs`), which knarr
+- composefs built from source (`mkcomposefs`, `mount.composefs`), which ocicfs
   shells out to.
-- The knarr CLI for staging images into the store — see the note below.
+- The ocicfs CLI for staging images into the store — see the note below.
 - The locally built `bin/containerd-cfs-grpc`.
 
-The knarr CLI is not baked into the image: the container has no credentials
-for the internal knarr module, so `./devshell.sh` builds it on the host at the
+The ocicfs CLI is not baked into the image: the container has no credentials
+for the internal ocicfs module, so `./devshell.sh` builds it on the host at the
 exact version the snapshotter pins and mounts the binary at
-`/opt/cfs-dev/bin/knarr`. A container opened directly from an editor does not
+`/opt/cfs-dev/bin/ocicfs`. A container opened directly from an editor does not
 get it, and `make test-e2e` (which needs it) will fail there — use
 `./devshell.sh` for the e2e.
 
-The container's Go build and module caches and that knarr binary are kept on
+The container's Go build and module caches and that ocicfs binary are kept on
 the host under `~/.cache/cfs-snapshotter` (`$XDG_CACHE_HOME` when set), so
 they survive container runs and stay off a size-limited `/tmp`. Set
 `CFS_DEV_CACHE` to put them elsewhere. Anything that pre-fetches modules for
@@ -87,13 +87,13 @@ Opening the devcontainer runs the image entrypoint. The entrypoint:
 
 - Starts Zot, `containerd`, and `dockerd`.
 - Mounts one loop-backed, fs-verity-enabled ext4 filesystem and binds
-  subdirectories of it as the knarr store root (`/var/lib/knarr`) and the
-  snapshotter roots: the knarr store needs fs-verity, and the overlay
+  subdirectories of it as the ocicfs store root (`/var/lib/ocicfs`) and the
+  snapshotter roots: the ocicfs store needs fs-verity, and the overlay
   upper/work directories need a real filesystem (they cannot live on the
   container's own overlayfs). Its size in MiB comes from the host's
   `CFS_SHARED_ROOT_SIZE_MB` (default 1024), passed through by `devshell.sh`
   and `devcontainer.json` and applied when the filesystem is first created.
-- Starts `bin/containerd-cfs-grpc` with `-knarr-root /var/lib/knarr`, before
+- Starts `bin/containerd-cfs-grpc` with `-ocicfs-root /var/lib/ocicfs`, before
   `containerd`, so containerd can register the `cfs` proxy snapshotter during
   startup.
 - Waits for `ctr version`, `docker version`, and `docker info`.
@@ -141,7 +141,7 @@ stack started:
 ```
 
 From an already-open devcontainer session (started via `./devshell.sh`, which
-provides the knarr CLI):
+provides the ocicfs CLI):
 
 ```sh
 make test-e2e
@@ -155,15 +155,15 @@ through Docker, in two phases — one per work mode, since a machine runs in one
 or the other and never both.
 
 The warm phase restarts the snapshotter in the out-of-band mode
-(`-allow-unstaged-pulls=false`), admitting only images staged in the knarr
-store with `knarr pull --from-dir` pinned by manifest digest:
+(`-allow-unstaged-pulls=false`), admitting only images staged in the ocicfs
+store with `ocicfs pull --from-dir` pinned by manifest digest:
 
 - Pulls of an image the store does not hold — including one that reuses a held
   image's layers under a different config — are declined at the snapshotter's
   admission gate.
 - `docker pull` completes with zero layer fetches and `docker run` prints the
-  seeded program's output — real image content, served from the knarr store.
-- An admitted image is held in the store: `knarr remove` declines and names
+  seeded program's output — real image content, served from the ocicfs store.
+- An admitted image is held in the store: `ocicfs remove` declines and names
   the holder, the container still runs, and the hold is released once the
   image is removed from the runtime.
 - Concurrent containers share one EROFS image mount and each get their own
@@ -174,8 +174,8 @@ store with `knarr pull --from-dir` pinned by manifest digest:
 - Tampering with a backing object in the store makes the container fail with
   an I/O error — fs-verity rejects the modified content when overlayfs opens
   the file.
-- An image staged by `knarr pull --delta` is served like any other: two
-  zstd:chunked releases sharing a base layer (the pinned knarr module's own
+- An image staged by `ocicfs pull --delta` is served like any other: two
+  zstd:chunked releases sharing a base layer (the pinned ocicfs module's own
   fixtures, pushed to Zot blob by blob) are pulled with the first held as the
   delta base, the second is fetched by ranges only and builds the composefs
   image a plain pull builds, `docker pull` fetches none of its layers, a
@@ -185,15 +185,15 @@ store with `knarr pull --from-dir` pinned by manifest digest:
 
 The cold phase then restarts the snapshotter in the staged mode — the boot
 default — with
-stores of its own (`/var/lib/knarr-cold`,
+stores of its own (`/var/lib/ocicfs-cold`,
 `/var/lib/containerd-cfs-grpc-cold`), and asserts that a plain `docker pull`
 of an image nobody staged:
 
-- lands in the knarr store as exactly one composefs image, present in the CAS
+- lands in the ocicfs store as exactly one composefs image, present in the CAS
   and named in the fs-verity view, with no staging directories on disk and
   the chain's snapshot records kept — and the content its layers wrote that
   the image does not reference (every layer rewrites one file) is left in
-  the store by the pull and reclaimed by the `knarr gc` the test then runs;
+  the store by the pull and reclaimed by the `ocicfs gc` the test then runs;
 - reaches the store a layer at a time through the differ: a known file of the
   first layer is a store object while the last, large layer is still being
   transferred;
@@ -204,28 +204,28 @@ of an image nobody staged:
   store — and converges on the same single store image;
 - is the runtime's alone: the store lists it under the reference docker
   pulled, as a runtime reference for the snapshotter's holder that resolves
-  by name but pins nothing, `knarr gc` would reclaim none of it while the
+  by name but pins nothing, `ocicfs gc` would reclaim none of it while the
   runtime lists it, and
   `docker rmi` reclaims it — from the store's listing and from disk, back to
   the byte count before the pull — before the command returns, with no wait
-  and no knarr command;
+  and no ocicfs command;
 - shares its objects with a second image built on the same layers — the store
   does not grow by a second copy — and removing the shorter of the two from
   the runtime keeps what the longer reads (and the shorter itself, whose
   chain still stands under the longer), keeps the longer mountable, and
   removing both reclaims everything;
 - stays when an agent holds it: `docker rmi` drops only the runtime's hold,
-  and the image goes once the agent releases and runs `knarr gc`;
+  and the image goes once the agent releases and runs `ocicfs gc`;
 - is not pinned for good by a hold of the snapshotter's own that no record
   owns — the daemon releases such a hold when it starts, and the next
   `docker rmi` reclaims the image;
 - leaves nothing behind when the pull is interrupted midway: the active
   snapshot is aborted, the staged records are collected once nothing
-  references them, `knarr gc` runs against the store the abandoned build let
+  references them, `ocicfs gc` runs against the store the abandoned build let
   go of, and a re-pull of the same reference converges on the same one
   composefs image;
 - builds the same composefs image at one and at two ingest workers, and the
-  same one `knarr pull` builds from the image's OCI layout into a fresh store.
+  same one `ocicfs pull` builds from the image's OCI layout into a fresh store.
 
 The cold phase runs the snapshotter with `-ingest-workers 1` and switches to
 `-ingest-workers 2` for the last leg. The e2e prints one line per layer the
@@ -237,7 +237,7 @@ finishes the image.
 ## Conformance Suite
 
 `make root-test` runs containerd's reusable snapshotter conformance suite
-(`core/snapshots/testsuite`) against a cfs snapshotter backed by a real knarr
+(`core/snapshots/testsuite`) against a cfs snapshotter backed by a real ocicfs
 store. It mounts, so it needs root; a plain `make test` skips it.
 
 ```sh
@@ -253,7 +253,7 @@ snapshot has no image in its ancestry; scratch snapshots are not supported
 
 The suite builds its fixtures from the bottom up: each test starts by
 preparing a snapshot with no parent and applying files into it. cfs has no
-answer for that by design — a snapshot's lowest layer is an image in the knarr
+answer for that by design — a snapshot's lowest layer is an image in the ocicfs
 store, and a mount with no image beneath it would be unverified scratch, so
 `Prepare` refuses it. Nothing gets far enough to exercise what the suite is
 really checking (layer semantics, whiteouts, `Rename`, the 128-layer mount),

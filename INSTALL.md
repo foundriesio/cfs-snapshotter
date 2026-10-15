@@ -242,7 +242,7 @@ that appears *after* a healthy start only degrades the status, and
 there fixing containerd and restarting *containerd alone* is enough —
 the status flips back to ok by itself.
 
-The pull's layers are ingested into the knarr store by the snapshotter's
+The pull's layers are ingested into the ocicfs store by the snapshotter's
 differ as containerd fetches them, and the container's root filesystem
 is served from the store as a composefs mount.
 
@@ -253,8 +253,8 @@ Installation works on any Linux; *running* the snapshotter needs:
 - **Kernel: Linux 6.6 or newer** — EROFS, fs-verity, and overlayfs with
   data-only lower layers and verity validation. A vendor kernel carrying
   the same support also works.
-- **fs-verity enabled on the filesystem holding the knarr store**
-  (`-knarr-root`, `/var/lib/knarr` by default). ext4 needs a 4096-byte
+- **fs-verity enabled on the filesystem holding the ocicfs store**
+  (`-ocicfs-root`, `/var/lib/ocicfs` by default). ext4 needs a 4096-byte
   block size and the `verity` feature; btrfs supports fs-verity out of
   the box.
 - **containerd 2.1 or newer** — the transfer service forwards the unpack
@@ -273,9 +273,9 @@ Installation works on any Linux; *running* the snapshotter needs:
   the daemon refuses to start in that mode without it. The .deb declares
   the `composefs` package as a Recommends because it is not yet in the
   Debian-stable or Ubuntu archives.
-- **[knarr](https://github.com/foundriesio/knarr)** — only for the
+- **[ocicfs](https://github.com/foundriesio/ocicfs)** — only for the
   out-of-band mode (`-allow-unstaged-pulls=false`), where images enter the
-  store via `knarr pull` before the runtime asks for them.
+  store via `ocicfs pull` before the runtime asks for them.
 - **Root privileges**: the daemon mounts, uses loop devices, and enables
   fs-verity.
 
