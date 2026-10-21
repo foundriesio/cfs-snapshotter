@@ -15,9 +15,6 @@ concurrency:
 
 env:
   GOLANGCI_LINT_VERSION: v2.12.2
-  # ocicfs is an internal module; the public proxy can't serve it, so builds
-  # resolve it directly over git using a token that can read the repo.
-  GOPRIVATE: github.com/foundriesio/ocicfs
 
 jobs:
   build-test:
@@ -36,8 +33,6 @@ jobs:
       - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
-      - name: Authenticate to the internal ocicfs module
-        run: git config --global url."https://x-access-token:${{ secrets.OCICFS_TOKEN }}@github.com/foundriesio/".insteadOf "https://github.com/foundriesio/"
       - run: make vet
       - run: make test
       # The snapshotter feeds layers to the ocicfs store from several workers,
@@ -53,8 +48,6 @@ jobs:
       - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
-      - name: Authenticate to the internal ocicfs module
-        run: git config --global url."https://x-access-token:${{ secrets.OCICFS_TOKEN }}@github.com/foundriesio/".insteadOf "https://github.com/foundriesio/"
       - name: install golangci-lint
         uses: golangci/golangci-lint-action@v9
         with:
@@ -70,11 +63,8 @@ jobs:
       - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
-      - name: Authenticate to the internal ocicfs module
-        run: git config --global url."https://x-access-token:${{ secrets.OCICFS_TOKEN }}@github.com/foundriesio/".insteadOf "https://github.com/foundriesio/"
-      # The devcontainer has no credentials for the internal ocicfs module, so
-      # pre-fetch it here into the module cache the container bind-mounts and
-      # reuses; the build inside then resolves ocicfs offline.
+      # Pre-fetch into the module cache the container bind-mounts and reuses,
+      # so the build inside resolves its modules without network access.
       - name: Pre-fetch modules into the shared devcontainer cache
         run: GOMODCACHE=$HOME/.cache/cfs-snapshotter/go-mod go mod download
       # Builds the version-pinned devcontainer image and verifies the ocicfs-fed

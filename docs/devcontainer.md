@@ -17,12 +17,11 @@ snapshotter against a nested, version-pinned runtime stack:
 - The ocicfs CLI for staging images into the store — see the note below.
 - The locally built `bin/containerd-cfs-grpc`.
 
-The ocicfs CLI is not baked into the image: the container has no credentials
-for the internal ocicfs module, so `./devshell.sh` builds it on the host at the
-exact version the snapshotter pins and mounts the binary at
-`/opt/cfs-dev/bin/ocicfs`. A container opened directly from an editor does not
-get it, and `make test-e2e` (which needs it) will fail there — use
-`./devshell.sh` for the e2e.
+The ocicfs CLI is not baked into the image: `./devshell.sh` builds it on the
+host at the exact version the snapshotter pins and mounts the binary at
+`/opt/cfs-dev/bin/ocicfs`, so the CLI always matches the pinned module. A
+container opened directly from an editor does not get it, and `make test-e2e`
+(which needs it) will fail there — use `./devshell.sh` for the e2e.
 
 The container's Go build and module caches and that ocicfs binary are kept on
 the host under `~/.cache/cfs-snapshotter` (`$XDG_CACHE_HOME` when set), so

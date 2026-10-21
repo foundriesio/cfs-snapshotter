@@ -82,11 +82,11 @@ run_new_container() {
 		run_flags+=(-t)
 	fi
 
-	# The container has no credentials for the internal ocicfs module, so build the
-	# ocicfs CLI on the host (which does) at the version cfs pins and mount the
-	# binary in, so the container has an ocicfs CLI matching the pinned module.
-	# Portable across setups and CI, unlike bind-mounting a checkout. Best-effort:
-	# a plain shell still opens when the CLI is not needed or cannot be built.
+	# The image does not bake in the ocicfs CLI: build it on the host at the
+	# version cfs pins and mount the binary in, so the container has an ocicfs
+	# CLI matching the pinned module. Portable across setups and CI, unlike
+	# bind-mounting a checkout. Best-effort: a plain shell still opens when the
+	# CLI is not needed or cannot be built.
 	#
 	# This also populates the shared module cache with the pinned ocicfs module, so
 	# the container's own `go build` (same GOMODCACHE, bind-mounted below) finds
@@ -97,7 +97,7 @@ run_new_container() {
 	# a not-yet-pushed pin does not resolve. GOFLAGS is cleared because flags
 	# like -mod are rejected by `go install pkg@version`, and a stray export
 	# would fail the build.
-	local ocicfs_goenv=(GOMODCACHE="${GOMODCACHE_DIR}" GOTOOLCHAIN=auto GOPRIVATE=github.com/foundriesio GOFLAGS=)
+	local ocicfs_goenv=(GOMODCACHE="${GOMODCACHE_DIR}" GOTOOLCHAIN=auto GOFLAGS=)
 	local ocicfs_version
 	if ocicfs_version="$(cd "${ROOT_DIR}" && env "${ocicfs_goenv[@]}" go list -m -f '{{.Version}}' github.com/foundriesio/ocicfs)" &&
 		env "${ocicfs_goenv[@]}" GOBIN="${OCICFS_BIN_DIR}" go install "github.com/foundriesio/ocicfs/cmd/ocicfs@${ocicfs_version}"; then
