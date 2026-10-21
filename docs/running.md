@@ -114,6 +114,18 @@ the containerd image store and select cfs in `/etc/docker/daemon.json`, then
 }
 ```
 
+On Docker 29.9 and later the out-of-band mode also needs Docker's `lazy-pull`
+feature: without it `docker pull` fetches every layer even when the
+snapshotter already holds the image (verified on Docker 29.9.1). Add it to
+the `features` object above:
+
+```json
+  "features": {
+    "containerd-snapshotter": true,
+    "lazy-pull": true
+  },
+```
+
 ## 4. Stage, pull, run
 
 This flow is the out-of-band mode: it needs the daemon started with

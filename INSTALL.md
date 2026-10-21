@@ -207,6 +207,18 @@ containerd image store and select cfs in `/etc/docker/daemon.json`, then
 }
 ```
 
+On Docker 29.9 and later the out-of-band mode also needs Docker's `lazy-pull`
+feature: without it `docker pull` fetches every layer even when the
+snapshotter already holds the image (verified on Docker 29.9.1). Add it to
+the `features` object above:
+
+```json
+  "features": {
+    "containerd-snapshotter": true,
+    "lazy-pull": true
+  },
+```
+
 [docs/running.md](docs/running.md) explains every entry, the daemon's
 flags, and the two work modes.
 
@@ -268,7 +280,8 @@ Installation works on any Linux; *running* the snapshotter needs:
   check yours with `containerd --version`.
 - **Docker Engine 29 or newer, if Docker is used** — Docker reaches the
   snapshotter through its containerd image store, selected by
-  `storage-driver` (tested with Docker 29.3).
+  `storage-driver` (tested with Docker 29.3; 29.9 and later also need the
+  `lazy-pull` feature for the out-of-band mode, see above).
 - **`mkcomposefs`** (from the
   [composefs](https://github.com/composefs/composefs) project) — needed by
   the default staged-pull mode, which builds pulled images into the store;
