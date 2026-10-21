@@ -30,11 +30,6 @@ concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
-env:
-  # ocicfs is an internal module; the public proxy can't serve it, so builds
-  # resolve it directly over git using a token that can read the repo.
-  GOPRIVATE: github.com/foundriesio/ocicfs
-
 jobs:
   build:
     name: build (${{ matrix.arch }})
@@ -69,12 +64,8 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Authenticate to the internal ocicfs module
-        run: git config --global url."https://x-access-token:${{ secrets.OCICFS_TOKEN }}@github.com/foundriesio/".insteadOf "https://github.com/foundriesio/"
-
-      # The devcontainer has no credentials for the internal ocicfs module, so
-      # pre-fetch it here into the module cache the container bind-mounts and
-      # reuses; the build inside then resolves ocicfs offline.
+      # Pre-fetch into the module cache the container bind-mounts and reuses,
+      # so the build inside resolves its modules without network access.
       - name: Pre-fetch modules into the shared devcontainer cache
         run: GOMODCACHE=$HOME/.cache/cfs-snapshotter/go-mod go mod download
 

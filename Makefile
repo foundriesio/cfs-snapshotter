@@ -115,7 +115,7 @@ deb-image:
 deb: deb-image
 	mkdir -p $(DEB_OUT)
 	rm -rf $(DEB_VENDOR)
-	GOPRIVATE=github.com/foundriesio $(GO) mod vendor -o $(DEB_VENDOR)
+	$(GO) mod vendor -o $(DEB_VENDOR)
 	docker run --rm \
 		-v "$(CURDIR)":/src:ro \
 		-v "$(CURDIR)/$(DEB_VENDOR)":/vendor:ro \
