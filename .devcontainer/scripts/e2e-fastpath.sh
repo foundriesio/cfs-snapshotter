@@ -1161,10 +1161,13 @@ assert_rootfs_is_base() {
 # chain member and the container mounts whatever the store holds under the
 # chain: the base, when the agent pulled it, otherwise nothing — the run
 # fails until the agent pulls the base, with no restart and no re-pull. In
-# staged mode the record is a staged one that was never built, and the first
-# container promotes it: the base is built from the content store, or found
-# already in the store, and held by its own record from then on, outliving
-# the derived image and going with its own removal. prepull is whether the
+# staged mode, a base the agent pulled is adopted by the derived pull as it
+# applies the layer at the base's chain: that record holds the stored base
+# and is a chain member from its commit, and nothing is promoted. A base the
+# agent did not pull leaves a staged record that was never built, and the
+# first container promotes it: the base is built from the content store and
+# held by its own record from then on. Either way the base outlives the
+# derived image and goes with its own removal. prepull is whether the
 # agent pulled the base before the runtime did. The derived image enters the
 # store the way its mode admits: pulled by the agent out of band, built by
 # the runtime's own pull in staged mode — and by the agent as well when the
@@ -1198,9 +1201,17 @@ assert_base_after_derived() {
 		pair_agent_refs="${pair_agent_refs} ${base_repo}@${base_root}"
 		stage_image "${base_repo}" "${base_layout}"
 	fi
+	offset="$(wc -l <"${CFS_LOG}")"
 	docker pull "${pair_derived_ref}" >/dev/null || fail "docker pull of the derived image failed"
 	[ "$(image_bindings "${derived_root}")" -eq 1 ] ||
 		fail "the derived image's pull did not leave exactly one composefs image"
+	if [ "${mode}" = staged ] && [ "${prepull}" = 1 ]; then
+		tail -n "+$((offset + 1))" "${CFS_LOG}" | grep -q '"cfs differ: adopted stored image for chain"' ||
+			fail "the derived image's pull did not adopt the stored base at its chain"
+	else
+		! tail -n "+$((offset + 1))" "${CFS_LOG}" | grep -q '"cfs differ: adopted stored image for chain"' ||
+			fail "the derived image's pull adopted a stored image although the base was not stored"
+	fi
 
 	offset="$(wc -l <"${CFS_LOG}")"
 	docker pull "${pair_base_ref}" >/dev/null || fail "docker pull of the base after the derived image failed"
@@ -1235,20 +1246,18 @@ assert_base_after_derived() {
 	[ "${output}" = "cfs hello ${pair_nonce}" ] || fail "unexpected container output: ${output}"
 	assert_rootfs_is_base "${pair_base_ref}" "${layers}" "${pair_nonce}"
 	[ "$(image_bindings "${base_root}")" -eq 1 ] || fail "the base is not exactly one composefs image in the store"
-	if [ "${mode}" = staged ]; then
+	if [ "${mode}" = staged ] && [ "${prepull}" = 0 ]; then
 		tail -n "+$((offset + 1))" "${CFS_LOG}" | grep -q '"cfs snapshotter: promoted recorded chain"' ||
 			fail "the base's first container did not promote its chain record"
-		# The promotion holds the base under its record: an agent's image
-		# gains the hold and cannot be removed, a built one is named by it.
-		if [ "${prepull}" = 1 ]; then
-			assert_ocicfs_remove_declines "${base_repo}@${base_root}"
-		else
-			[ -n "$(ocicfs_holder_of_digest "${base_root}")" ] ||
-				fail "the promoted base is not held by a runtime reference"
-		fi
+		[ -n "$(ocicfs_holder_of_digest "${base_root}")" ] ||
+			fail "the promoted base is not held by a runtime reference"
 	else
 		! tail -n "+$((offset + 1))" "${CFS_LOG}" | grep -q '"cfs snapshotter: promoted recorded chain"' ||
-			fail "an out-of-band daemon promoted a chain record"
+			fail "a chain record was promoted although the base was stored"
+	fi
+	if [ "${mode}" = staged ] && [ "${prepull}" = 1 ]; then
+		# The adopted record holds the agent's base, so it cannot be removed.
+		assert_ocicfs_remove_declines "${base_repo}@${base_root}"
 	fi
 
 	docker rmi "${pair_derived_ref}" >/dev/null || fail "docker rmi of the derived image failed"

@@ -370,17 +370,21 @@ func newSnapshotter(ctx context.Context, cfg Config, engine engineAPI) (*snapsho
 
 // reconcileHolds releases every hold this snapshotter took that no record of
 // its owns any more. The records are the intent: a committed leaf carries the
-// holder its image is held under, and so does the staging record of a leaf
-// applied but not yet committed; a holder of this snapshotter's that no
-// record names was stranded by a crash between the hold and its record, or
-// by a build that finished for a pull the runtime then dropped. Holders that
-// are not this snapshotter's are left alone.
+// root its image is held as and the holder it is held under, and so does the
+// staging record of a leaf applied but not yet committed; a hold of this
+// snapshotter's that no record names by both was stranded by a crash between
+// the hold and its record, or by a build that finished for a pull the runtime
+// then dropped. A record owns one root under its holder, never the holder
+// as such: a pull's own build and a stored image adopted at its first layer
+// hold two roots under one holder name, and dropping either must not keep
+// the other's hold. Holders that are not this snapshotter's are left alone.
 func (s *snapshotter) reconcileHolds(ctx context.Context) error {
-	owned := map[string]struct{}{}
+	type hold struct{ root, holder string }
+	owned := map[hold]struct{}{}
 	err := s.ms.WithTransaction(ctx, false, func(ctx context.Context) error {
 		return storage.WalkInfo(ctx, func(_ context.Context, info snapshots.Info) error {
 			if holder := info.Labels[holderLabel]; holder != "" {
-				owned[holder] = struct{}{}
+				owned[hold{root: info.Labels[rootDigestLabel], holder: holder}] = struct{}{}
 			}
 			return nil
 		})
@@ -397,7 +401,7 @@ func (s *snapshotter) reconcileHolds(ctx context.Context) error {
 			if !strings.HasPrefix(holder, holderPrefix) {
 				continue
 			}
-			if _, ok := owned[holder]; ok {
+			if _, ok := owned[hold{root: root.String(), holder: holder}]; ok {
 				continue
 			}
 			log.G(ctx).WithFields(log.Fields{"digest": root, "holder": holder}).
@@ -526,6 +530,7 @@ func (s *snapshotter) reclaim() {
 // narrow surface is also the seam the tests fake.
 type engineAPI interface {
 	Inspect(ctx context.Context, ref string) (*ocicfs.ImageInfo, error)
+	List(ctx context.Context) ([]ocicfs.Image, error)
 	NewBuild(ctx context.Context, ref string, opts ...ocicfs.PullOption) (ocicfs.Build, error)
 	Hold(ctx context.Context, ref, holder string) error
 	Release(ctx context.Context, ref, holder string) error
@@ -738,14 +743,15 @@ func (s *snapshotter) View(ctx context.Context, key, parent string, opts ...snap
 // already fed into the ocicfs store. containerd calls it inside its own
 // metadata transaction, so everything it needs is on the record: the chain
 // it stands for is its snapshot.ref label — never the name, which is
-// containerd's own bookkeeping — and whether that chain is the image's last
-// is the leaf marker the differ left. Everything but the last layer is filed
-// as it stands; the last one's record becomes an image chain member — from
-// which instant a mount over it composes the image — carrying the image's
-// identity and the holder the build that finished the image holds it under,
-// both left on the staging record by the differ. The hold keeps the image
-// for as long as containerd references the record, which releases it when
-// removed; Commit itself touches the store not at all. A staged Commit needs
+// containerd's own bookkeeping — and whether that chain is an image's last
+// is the leaf marker the differ left: the pull's own image at its last
+// layer, or an image the store already held whole at that chain and the
+// differ adopted. Every other record is filed as it stands; a marked one
+// becomes an image chain member — from which instant a mount over it
+// composes the image — carrying the image's identity and the holder it is
+// held under, both left on the staging record by the differ. The hold keeps
+// the image for as long as containerd references the record, which releases
+// it when removed; Commit itself touches the store not at all. A staged Commit needs
 // no build to be open: after a restart between a layer's Apply and its
 // Commit, the next Apply starts a build that catches up from the content
 // store.
