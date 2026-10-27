@@ -1378,6 +1378,371 @@ func TestApplyFinishClosesSameLeafBuilds(t *testing.T) {
 	}
 }
 
+// stagedStep runs one layer of a labeled staged pull — Prepare, Apply and
+// Commit — the way containerd does, and returns the committed name.
+func stagedStep(t *testing.T, sn *snapshotter, key, parent, imageRef string, root, chain, layer digest.Digest) string {
+	t.Helper()
+	ctx := pullNamespace()
+	labels := snapshots.WithLabels(stagedLabels(imageRef, root, chain))
+	if _, err := sn.Prepare(ctx, key, parent, labels); err != nil {
+		t.Fatalf("Prepare(%s) error = %v", key, err)
+	}
+	if err := applyStaged(ctx, sn, key, layer); err != nil {
+		t.Fatalf("Apply(%s) error = %v", key, err)
+	}
+	name := key[:strings.LastIndex(key, "/")+1] + chain.String()
+	if err := sn.Commit(ctx, name, key, labels); err != nil {
+		t.Fatalf("Commit(%s) error = %v", name, err)
+	}
+	return name
+}
+
+// TestApplyAdoptsStoredBase covers a staged pull of an image derived from a
+// base the store already holds: the layer at the base's whole chain is
+// adopted — its record holds the base under the build holder of its key and
+// carries the leaf markers before the Apply returns, while the derived
+// image's build goes on ingesting it — so its Commit files a chain member, a
+// container over it mounts the base with no promotion, and removing the
+// record releases the base.
+func TestApplyAdoptsStoredBase(t *testing.T) {
+	ctx := pullNamespace()
+	x, y, w := digest.FromString("layer-x"), digest.FromString("layer-y"), digest.FromString("layer-w")
+	engine := fakeEngineForImages()
+	sn := newStagingSnapshotter(t, engine)
+	rootB, chains := stageImageBy(t, sn, "derived", x, y, w)
+	base := testImageInfo("base", chains[0], chains[1])
+	addFakeImage(engine, base)
+	const ref = "registry.example/b:v1"
+
+	first := stagedStep(t, sn, "moby/0/extract", "", ref, rootB, chains[0], x)
+	labels := snapshots.WithLabels(stagedLabels(ref, rootB, chains[1]))
+	if _, err := sn.Prepare(ctx, "moby/1/extract", first, labels); err != nil {
+		t.Fatalf("Prepare(extract) error = %v", err)
+	}
+	if err := applyStaged(ctx, sn, "moby/1/extract", y); err != nil {
+		t.Fatalf("Apply(extract) error = %v", err)
+	}
+	holder := buildHolder("moby", "moby/1/extract")
+	info, err := sn.Stat(ctx, "moby/1/extract")
+	if err != nil {
+		t.Fatalf("Stat(extract) error = %v", err)
+	}
+	if info.Labels[leafLabel] == "" || info.Labels[rootDigestLabel] != base.Root.String() || info.Labels[holderLabel] != holder {
+		t.Fatalf("adopted record labels = %v, want the leaf markers naming %s under %s", info.Labels, base.Root, holder)
+	}
+	if want := []holdCall{{ref: base.Root.String(), holder: holder}}; !slices.Equal(engine.holds, want) {
+		t.Fatalf("engine Hold calls = %+v, want %+v", engine.holds, want)
+	}
+	if want := []string{"build0.ingest(0)", "hold", "build0.ingest(1)"}; !slices.Equal(engine.callLog(), want) {
+		t.Fatalf("engine calls = %v, want %v: the derived build ingests the adopted layer too", engine.callLog(), want)
+	}
+	second := "moby/1/" + chains[1].String()
+	if err := sn.Commit(ctx, second, "moby/1/extract", labels); err != nil {
+		t.Fatalf("Commit(%s) error = %v", second, err)
+	}
+	info, err = sn.Stat(ctx, second)
+	if err != nil {
+		t.Fatalf("Stat(%s) error = %v", second, err)
+	}
+	if info.Labels[chainMemberLabel] == "" || info.Labels[rootDigestLabel] != base.Root.String() || info.Labels[holderLabel] != holder {
+		t.Fatalf("committed record labels = %v, want a chain member holding %s under %s", info.Labels, base.Root, holder)
+	}
+	leaf := stagedStep(t, sn, "moby/2/extract", second, ref, rootB, chains[2], w)
+	if len(engine.builds) != 1 || engine.lists != 2 {
+		t.Fatalf("engine builds = %+v, lists = %d, want the derived build alone and one store scan per layer below the leaf", engine.builds, engine.lists)
+	}
+
+	var calls []mountCall
+	recordMounts(engine, &calls)
+	mounts, err := sn.Prepare(ctx, "moby/9/container-init", second)
+	if err != nil {
+		t.Fatalf("Prepare(container-init) error = %v", err)
+	}
+	if len(calls) != 1 || calls[0].chainID != chains[1].String() {
+		t.Fatalf("MountChain calls = %+v, want the base chain %s", calls, chains[1])
+	}
+	if got := optionValue(t, mounts[0], "lowerdir"); got != calls[0].target+"::"+engine.objectsDir {
+		t.Fatalf("lowerdir = %q, want the base image only", got)
+	}
+	if len(engine.builds) != 1 || imagesOf(sn).listCount() != 0 {
+		t.Fatalf("engine builds = %+v, image listings = %d, want nothing promoted", engine.builds, imagesOf(sn).listCount())
+	}
+
+	if err := sn.Remove(ctx, "moby/9/container-init"); err != nil {
+		t.Fatalf("Remove(container-init) error = %v", err)
+	}
+	if err := sn.Remove(ctx, leaf); err != nil {
+		t.Fatalf("Remove(%s) error = %v", leaf, err)
+	}
+	if err := sn.Remove(ctx, second); err != nil {
+		t.Fatalf("Remove(%s) error = %v", second, err)
+	}
+	want := []holdCall{{ref: rootB.String(), holder: buildHolder("moby", "moby/0/extract")}, {ref: base.Root.String(), holder: holder}}
+	if !slices.Equal(engine.releases, want) {
+		t.Fatalf("engine Release calls = %+v, want %+v", engine.releases, want)
+	}
+}
+
+// TestApplyLeavesUnstoredChainStaged covers the store holding no image
+// ending in a staged layer's chain: the record stays a plain staging record
+// and nothing is held.
+func TestApplyLeavesUnstoredChainStaged(t *testing.T) {
+	ctx := pullNamespace()
+	x, y, w := digest.FromString("layer-x"), digest.FromString("layer-y"), digest.FromString("layer-w")
+	engine := fakeEngineForImages(testImageInfo("other", digest.FromString("other-chain")))
+	sn := newStagingSnapshotter(t, engine)
+	rootB, chains := stageImageBy(t, sn, "derived", x, y, w)
+	const ref = "registry.example/b:v1"
+
+	first := stagedStep(t, sn, "moby/0/extract", "", ref, rootB, chains[0], x)
+	if _, err := sn.Prepare(ctx, "moby/1/extract", first, snapshots.WithLabels(stagedLabels(ref, rootB, chains[1]))); err != nil {
+		t.Fatalf("Prepare(extract) error = %v", err)
+	}
+	if err := applyStaged(ctx, sn, "moby/1/extract", y); err != nil {
+		t.Fatalf("Apply(extract) error = %v", err)
+	}
+	info, err := sn.Stat(ctx, "moby/1/extract")
+	if err != nil {
+		t.Fatalf("Stat(extract) error = %v", err)
+	}
+	if info.Labels[leafLabel] != "" || info.Labels[rootDigestLabel] != "" || info.Labels[holderLabel] != "" {
+		t.Fatalf("record labels = %v, want no leaf markers", info.Labels)
+	}
+	if len(engine.holds) != 0 || engine.lists != 2 {
+		t.Fatalf("engine holds = %+v, lists = %d, want nothing held after one store scan per layer", engine.holds, engine.lists)
+	}
+}
+
+// TestApplyAdoptionRevalidates covers a stored image removed between the
+// store scan and the hold: the hold lands, the second look finds another
+// chain, and the hold is released on an uncancelled context, a collection
+// is asked for, and the record stays a plain staging record while the pull
+// goes on.
+func TestApplyAdoptionRevalidates(t *testing.T) {
+	ctx := pullNamespace()
+	x, y, w := digest.FromString("layer-x"), digest.FromString("layer-y"), digest.FromString("layer-w")
+	engine := fakeEngineForImages()
+	sn := newStagingSnapshotter(t, engine)
+	awaitGCs(t, engine, 1)
+	rootB, chains := stageImageBy(t, sn, "derived", x, y, w)
+	base := testImageInfo("base", chains[0], chains[1])
+	replaced := testImageInfo("base", chains[0], digest.FromString("replaced-chain"))
+	engine.inspectFunc = func(_ context.Context, ref string) (*ocicfs.ImageInfo, error) {
+		if ref != base.Root.String() {
+			return nil, fmt.Errorf("inspect %s: %w", ref, ocicfs.ErrNotFound)
+		}
+		engine.mu.Lock()
+		defer engine.mu.Unlock()
+		if len(engine.holds) > 0 {
+			return replaced, nil
+		}
+		return base, nil
+	}
+	addFakeImage(engine, base)
+	const ref = "registry.example/b:v1"
+
+	first := stagedStep(t, sn, "moby/0/extract", "", ref, rootB, chains[0], x)
+	if _, err := sn.Prepare(ctx, "moby/1/extract", first, snapshots.WithLabels(stagedLabels(ref, rootB, chains[1]))); err != nil {
+		t.Fatalf("Prepare(extract) error = %v", err)
+	}
+	if err := applyStaged(ctx, sn, "moby/1/extract", y); err != nil {
+		t.Fatalf("Apply(extract) error = %v", err)
+	}
+	holder := buildHolder("moby", "moby/1/extract")
+	want := []holdCall{{ref: base.Root.String(), holder: holder}}
+	if !slices.Equal(engine.holds, want) || !slices.Equal(engine.releases, want) {
+		t.Fatalf("engine holds = %+v, releases = %+v, want the vanished image held once and released once", engine.holds, engine.releases)
+	}
+	if engine.releaseCtxErrs[0] != nil {
+		t.Fatalf("Release context error = %v, want none", engine.releaseCtxErrs[0])
+	}
+	awaitGCs(t, engine, 2)
+	info, err := sn.Stat(ctx, "moby/1/extract")
+	if err != nil {
+		t.Fatalf("Stat(extract) error = %v", err)
+	}
+	if info.Labels[leafLabel] != "" || info.Labels[rootDigestLabel] != "" || info.Labels[holderLabel] != "" {
+		t.Fatalf("record labels = %v, want no leaf markers", info.Labels)
+	}
+	if calls := engine.callLog(); calls[len(calls)-1] != "build0.ingest(1)" {
+		t.Fatalf("engine calls = %v, want the derived build to have ingested the layer", calls)
+	}
+}
+
+// TestApplyAdoptionRetiresBaseBuild covers a pull of the base itself in
+// progress when a derived pull adopts the stored base at their shared chain:
+// the base pull's build, which nothing will finish once the chain member is
+// committed, is closed, and the derived pull's build is not.
+func TestApplyAdoptionRetiresBaseBuild(t *testing.T) {
+	ctx := pullNamespace()
+	x, y, w := digest.FromString("layer-x"), digest.FromString("layer-y"), digest.FromString("layer-w")
+	engine := fakeEngineForImages()
+	sn := newStagingSnapshotter(t, engine)
+	awaitGCs(t, engine, 1)
+	rootA, chainsA := stageImageBy(t, sn, "base", x, y)
+	rootB, chains := stageImageBy(t, sn, "derived", x, y, w)
+	addFakeImage(engine, testImageInfo("stored-base", chains[0], chains[1]))
+
+	first := stagedStep(t, sn, "moby/0/extract", "", "registry.example/a:v1", rootA, chainsA[0], x)
+	if _, err := sn.Prepare(ctx, "moby/1/extract", first, snapshots.WithLabels(stagedLabels("registry.example/b:v1", rootB, chains[1]))); err != nil {
+		t.Fatalf("Prepare(extract) error = %v", err)
+	}
+	if err := applyStaged(ctx, sn, "moby/1/extract", y); err != nil {
+		t.Fatalf("Apply(extract) error = %v", err)
+	}
+	want := []string{"build0.ingest(0)", "hold", "build0.close", "build1.ingest(1)"}
+	if !slices.Equal(engine.callLog(), want) {
+		t.Fatalf("engine calls = %v, want %v: the base pull's build closed, the derived pull's ingesting", engine.callLog(), want)
+	}
+	if _, ok := sn.builds[buildKey{namespace: "moby", root: rootB.String()}]; !ok || len(sn.builds) != 1 {
+		t.Fatalf("open builds = %v, want the derived image's alone", sn.builds)
+	}
+	awaitGCs(t, engine, 2)
+}
+
+// TestApplyAdoptionReleasesOnHoldFailure covers a hold that fails after
+// its marker may already be written: the hold is released on an uncancelled
+// context, a collection is asked for, the Apply fails and the record is left
+// as it was.
+func TestApplyAdoptionReleasesOnHoldFailure(t *testing.T) {
+	ctx := pullNamespace()
+	x, y, w := digest.FromString("layer-x"), digest.FromString("layer-y"), digest.FromString("layer-w")
+	engine := fakeEngineForImages()
+	sn := newStagingSnapshotter(t, engine)
+	awaitGCs(t, engine, 1)
+	rootB, chains := stageImageBy(t, sn, "derived", x, y, w)
+	base := testImageInfo("base", chains[0], chains[1])
+	addFakeImage(engine, base)
+	const ref = "registry.example/b:v1"
+
+	first := stagedStep(t, sn, "moby/0/extract", "", ref, rootB, chains[0], x)
+	if _, err := sn.Prepare(ctx, "moby/1/extract", first, snapshots.WithLabels(stagedLabels(ref, rootB, chains[1]))); err != nil {
+		t.Fatalf("Prepare(extract) error = %v", err)
+	}
+	before, err := sn.Stat(ctx, "moby/1/extract")
+	if err != nil {
+		t.Fatalf("Stat(extract) error = %v", err)
+	}
+	holdErr := errors.New("hold marker not synced")
+	engine.holdErr = holdErr
+	if err := applyStaged(ctx, sn, "moby/1/extract", y); !errors.Is(err, holdErr) {
+		t.Fatalf("Apply(extract) error = %v, want %v", err, holdErr)
+	}
+	holder := buildHolder("moby", "moby/1/extract")
+	want := []holdCall{{ref: base.Root.String(), holder: holder}}
+	if !slices.Equal(engine.holds, want) || !slices.Equal(engine.releases, want) {
+		t.Fatalf("engine holds = %+v, releases = %+v, want the failed hold released", engine.holds, engine.releases)
+	}
+	if engine.releaseCtxErrs[0] != nil {
+		t.Fatalf("Release context error = %v, want none", engine.releaseCtxErrs[0])
+	}
+	awaitGCs(t, engine, 2)
+	after, err := sn.Stat(ctx, "moby/1/extract")
+	if err != nil {
+		t.Fatalf("Stat(extract) error = %v", err)
+	}
+	if !maps.Equal(after.Labels, before.Labels) {
+		t.Fatalf("record labels = %v, want unchanged %v", after.Labels, before.Labels)
+	}
+}
+
+// TestApplyAdoptionTriesNextCandidate covers two stored images ending in
+// the chain where the first, by root, vanishes under its hold: it is
+// released and the second is adopted.
+func TestApplyAdoptionTriesNextCandidate(t *testing.T) {
+	ctx := pullNamespace()
+	x, y, w := digest.FromString("layer-x"), digest.FromString("layer-y"), digest.FromString("layer-w")
+	engine := fakeEngineForImages()
+	sn := newStagingSnapshotter(t, engine)
+	awaitGCs(t, engine, 1)
+	rootB, chains := stageImageBy(t, sn, "derived", x, y, w)
+	one := testImageInfo("base-one", chains[0], chains[1])
+	two := testImageInfo("base-two", chains[0], chains[1])
+	addFakeImage(engine, one)
+	addFakeImage(engine, two)
+	roots := []string{one.Root.String(), two.Root.String()}
+	slices.Sort(roots)
+	first, second := roots[0], roots[1]
+	engine.inspectFunc = func(_ context.Context, ref string) (*ocicfs.ImageInfo, error) {
+		info, ok := engine.infos[ref]
+		if !ok {
+			return nil, fmt.Errorf("inspect %s: %w", ref, ocicfs.ErrNotFound)
+		}
+		engine.mu.Lock()
+		defer engine.mu.Unlock()
+		if ref == first && len(engine.holds) > 0 {
+			return nil, fmt.Errorf("inspect %s: %w", ref, ocicfs.ErrNotFound)
+		}
+		return info, nil
+	}
+	const ref = "registry.example/b:v1"
+
+	base := stagedStep(t, sn, "moby/0/extract", "", ref, rootB, chains[0], x)
+	if _, err := sn.Prepare(ctx, "moby/1/extract", base, snapshots.WithLabels(stagedLabels(ref, rootB, chains[1]))); err != nil {
+		t.Fatalf("Prepare(extract) error = %v", err)
+	}
+	if err := applyStaged(ctx, sn, "moby/1/extract", y); err != nil {
+		t.Fatalf("Apply(extract) error = %v", err)
+	}
+	holder := buildHolder("moby", "moby/1/extract")
+	if want := []holdCall{{ref: first, holder: holder}, {ref: second, holder: holder}}; !slices.Equal(engine.holds, want) {
+		t.Fatalf("engine Hold calls = %+v, want %+v", engine.holds, want)
+	}
+	if want := []holdCall{{ref: first, holder: holder}}; !slices.Equal(engine.releases, want) {
+		t.Fatalf("engine Release calls = %+v, want the vanished candidate's hold alone", engine.releases)
+	}
+	info, err := sn.Stat(ctx, "moby/1/extract")
+	if err != nil {
+		t.Fatalf("Stat(extract) error = %v", err)
+	}
+	if info.Labels[leafLabel] == "" || info.Labels[rootDigestLabel] != second || info.Labels[holderLabel] != holder {
+		t.Fatalf("record labels = %v, want the leaf markers naming %s under %s", info.Labels, second, holder)
+	}
+	awaitGCs(t, engine, 2)
+}
+
+// TestReconcileHoldsByRootAndHolder covers a stored base adopted at the
+// first layer of a derived pull: the adopted record and the pull's build
+// hold two roots under one holder name. Removing the derived leaf with its
+// release failing strands the derived image's hold; the restart releases
+// that hold, which no record names by root and holder, and keeps the
+// base's, which the adopted record does.
+func TestReconcileHoldsByRootAndHolder(t *testing.T) {
+	ctx := pullNamespace()
+	x, y := digest.FromString("layer-x"), digest.FromString("layer-y")
+	root := t.TempDir()
+	engine := fakeEngineForImages()
+	engine.objectsDir = t.TempDir()
+	sn := newConfiguredSnapshotter(t, Config{Root: root, AllowUnstagedPulls: true}, engine, notMounted)
+	rootB, chains := stageImageBy(t, sn, "derived", x, y)
+	base := testImageInfo("base", chains[0])
+	addFakeImage(engine, base)
+	const ref = "registry.example/b:v1"
+
+	first := stagedStep(t, sn, "moby/0/extract", "", ref, rootB, chains[0], x)
+	leaf := stagedStep(t, sn, "moby/1/extract", first, ref, rootB, chains[1], y)
+	holder := buildHolder("moby", "moby/0/extract")
+	wantHolds := []holdCall{{ref: base.Root.String(), holder: holder}, {ref: rootB.String(), holder: holder}}
+	if !slices.Equal(engine.holds, wantHolds) {
+		t.Fatalf("engine Hold calls = %+v, want %+v: two roots under one holder", engine.holds, wantHolds)
+	}
+	engine.releaseErr = errors.New("release failed")
+	if err := sn.Remove(ctx, leaf); err != nil {
+		t.Fatalf("Remove(%s) error = %v", leaf, err)
+	}
+	engine.releaseErr = nil
+	engine.held = map[digest.Digest][]string{base.Root: {holder}, rootB: {holder}}
+	if err := sn.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	engine.releases = nil
+	newConfiguredSnapshotter(t, Config{Root: root, AllowUnstagedPulls: true}, engine, notMounted)
+	if want := []holdCall{{ref: rootB.String(), holder: holder}}; !slices.Equal(engine.releases, want) {
+		t.Fatalf("engine Release calls at restart = %+v, want the derived image's stranded hold alone", engine.releases)
+	}
+}
+
 // TestRemoveClosesAbortedPullBuild covers the runtime aborting a pull: the
 // active staging snapshot is removed on the garbage collector's context,
 // which names no namespace, under the namespaced key containerd files backend
@@ -2229,6 +2594,10 @@ type fakeEngine struct {
 	ingestErr     error
 	finishErr     error
 	finishHeldErr error
+	// listErr fails List, which otherwise lists every image in infos;
+	// lists counts the calls.
+	listErr error
+	lists   int
 	// held is what Holds reports; gcErr fails every GC and gcs counts them.
 	// gcGate, when set, holds every GC, already counted, until it is closed.
 	held   map[digest.Digest][]string
@@ -2273,6 +2642,24 @@ func (e *fakeEngine) Inspect(ctx context.Context, ref string) (*ocicfs.ImageInfo
 		return nil, fmt.Errorf("inspect %s: %w", ref, ocicfs.ErrNotFound)
 	}
 	return info, nil
+}
+
+func (e *fakeEngine) List(ctx context.Context) ([]ocicfs.Image, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if e.listErr != nil {
+		return nil, e.listErr
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.lists++
+	images := make([]ocicfs.Image, 0, len(e.infos))
+	for root := range e.infos {
+		images = append(images, ocicfs.Image{Digest: root})
+	}
+	slices.SortFunc(images, func(a, b ocicfs.Image) int { return strings.Compare(a.Digest, b.Digest) })
+	return images, nil
 }
 
 func (e *fakeEngine) NewBuild(ctx context.Context, ref string, opts ...ocicfs.PullOption) (ocicfs.Build, error) {

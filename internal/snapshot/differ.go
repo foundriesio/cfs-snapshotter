@@ -8,6 +8,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"runtime"
 	"slices"
@@ -53,6 +54,11 @@ var _ diff.Applier = (*snapshotter)(nil)
 // the image that layer sits — the descriptor must be that layer's, so a mount
 // left over from another pull can never label the wrong blob.
 //
+// A layer whose chain is the whole chain of an image the ocicfs store
+// already holds is the same rootfs the store has, and its record is first
+// made to stand for that image (see adoptStoredChain), so a base image pulled
+// after an image derived from it runs from the store with nothing built.
+//
 // The layer is ingested by the image's build, started here on its first
 // layer and looked up for the rest; the build reads the layer back out of
 // containerd's content store, where the fetch has just put it. Ingest blocks
@@ -86,6 +92,11 @@ func (s *snapshotter) Apply(ctx context.Context, desc ocispec.Descriptor, mounts
 	}
 	if err := layer.bind(desc); err != nil {
 		return ocispec.Descriptor{}, err
+	}
+	if !layer.leaf {
+		if err := s.adoptStoredChain(ctx, ns, key, layer.chainID); err != nil {
+			return ocispec.Descriptor{}, err
+		}
 	}
 	b, err := s.buildFor(ctx, ns, key, layer)
 	if err != nil {
@@ -137,12 +148,96 @@ func (s *snapshotter) stagingLabels(ctx context.Context, key string) (map[string
 	return info.Labels, nil
 }
 
-// markLeaf records on the staging snapshot under key that its layer is the
-// image's last, which image that is, and the holder the build finishing it
-// holds the image under. The markers are written before the layer is
-// ingested, so they are on the record whenever a Commit arrives — after a
-// daemon restart included — and the record releases the holder when it is
-// removed uncommitted, as an unwound pull's is.
+// adoptStoredChain makes the staging record under key stand for an image
+// the ocicfs store already holds whole at chainID, when it holds one: the
+// record takes a hold on that image under the build holder of its key and
+// carries the leaf markers, so its Commit files a chain member and a
+// container over it mounts the stored image. The pull the record belongs to
+// goes on ingesting the layer into its own image's build regardless. The
+// store is scanned image by image for one whose last chain is chainID; an
+// image that cannot be inspected is passed over, as one unreadable binding
+// must not hide a healthy match. Candidates are tried smallest root first:
+// each is held and then inspected again, since a removal between the scan
+// and the hold deletes the binding while the hold still lands on the root
+// object, and a record standing for such an image could never mount. A
+// candidate that fails that second look, or whose hold finds nothing, is
+// let go and the next one tried; with none left the record stays a plain
+// staging record. A hold that fails any other way is released as well
+// before the failure is reported: its marker may have been written before
+// the failure, and no record names it. A build open in the namespace for
+// an image ending in this chain is closed once the markers are on the
+// record: its pull's last Prepare will meet the committed chain and never
+// apply the layer that would finish it.
+func (s *snapshotter) adoptStoredChain(ctx context.Context, ns, key, chainID string) error {
+	images, err := s.engine.List(ctx)
+	if err != nil {
+		return fmt.Errorf("list the ocicfs store for layer chain %s: %w", chainID, err)
+	}
+	var roots []string
+	seen := map[string]struct{}{}
+	for _, image := range images {
+		if _, ok := seen[image.Digest]; ok {
+			continue
+		}
+		seen[image.Digest] = struct{}{}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		info, err := s.engine.Inspect(ctx, image.Digest)
+		if err != nil {
+			log.G(ctx).WithError(err).WithField("digest", image.Digest).
+				Debug("cfs differ: skipping a stored image that cannot be inspected")
+			continue
+		}
+		if n := len(info.Layers); n > 0 && info.Layers[n-1].ChainID.String() == chainID {
+			roots = append(roots, image.Digest)
+		}
+	}
+	slices.Sort(roots)
+
+	holder := buildHolder(ns, key)
+	for _, root := range roots {
+		if err := s.engine.Hold(ctx, root, holder); err != nil {
+			if errors.Is(err, ocicfs.ErrNotFound) {
+				continue
+			}
+			s.releaseHold(context.WithoutCancel(ctx), root, holder)
+			s.collectSoon()
+			return fmt.Errorf("hold stored image %s for layer chain %s: %w", root, chainID, err)
+		}
+		info, err := s.engine.Inspect(ctx, root)
+		if err != nil || len(info.Layers) == 0 || info.Layers[len(info.Layers)-1].ChainID.String() != chainID {
+			log.G(ctx).WithError(err).WithFields(log.Fields{"digest": root, "chain": chainID}).
+				Debug("cfs differ: a stored image went away while being adopted")
+			s.releaseHold(context.WithoutCancel(ctx), root, holder)
+			s.collectSoon()
+			continue
+		}
+		if err := s.markLeaf(ctx, key, info.Root, holder); err != nil {
+			s.releaseHold(context.WithoutCancel(ctx), root, holder)
+			s.collectSoon()
+			return err
+		}
+		if taken := s.takeBuilds(func(k buildKey, other *openBuild) bool {
+			return k.namespace == ns && other.leaf == chainID
+		}); len(taken) > 0 {
+			closeBuilds(taken)
+			s.collectSoon()
+		}
+		log.G(ctx).WithFields(log.Fields{"key": key, "chain": chainID, "root": root}).
+			Info("cfs differ: adopted stored image for chain")
+		return nil
+	}
+	return nil
+}
+
+// markLeaf records on the staging snapshot under key that its layer is an
+// image's last — the pull's own, or a stored one adopted at the chain —
+// which image that is, and the holder it is held under. The markers are
+// written before the layer is ingested, so they are on the record whenever
+// a Commit arrives — after a daemon restart included — and the record
+// releases the holder when it is removed uncommitted, as an unwound pull's
+// is.
 func (s *snapshotter) markLeaf(ctx context.Context, key string, root digest.Digest, holder string) error {
 	err := s.setLabels(ctx, key, map[string]string{
 		leafLabel:       "true",
