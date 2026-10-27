@@ -11,20 +11,24 @@ import (
 	"sync"
 
 	contentapi "github.com/containerd/containerd/api/services/content/v1"
+	imagesapi "github.com/containerd/containerd/api/services/images/v1"
 	"github.com/containerd/containerd/v2/defaults"
 	"github.com/containerd/containerd/v2/pkg/dialer"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
 	"github.com/containerd/errdefs"
 	"github.com/containerd/errdefs/pkg/errgrpc"
 	"github.com/foundriesio/ocicfs/pkg/ocicfs"
+	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )
 
-// contentBlobs reads image blobs out of containerd's content store, which is
-// where the layers of a staged pull land as the runtime fetches them. It is
-// the source the ocicfs store builds an image from, in place of a registry.
+// contentBlobs reads image blobs and image records out of containerd, whose
+// content store is where the layers of a staged pull land as the runtime
+// fetches them. It is the source the ocicfs store builds an image from, in
+// place of a registry, and the image records are how a layer chain that
+// names no image is traced back to one.
 //
 // The connection is dialed on the first read and shared from then on, so a
 // snapshotter that never converts anything never opens it, and a dial that
@@ -32,10 +36,11 @@ import (
 type contentBlobs struct {
 	// address is containerd's gRPC socket.
 	address string
-	// mu guards the lazily dialed connection and the client over it.
+	// mu guards the lazily dialed connection and the clients over it.
 	mu     sync.Mutex
 	conn   *grpc.ClientConn
 	client contentapi.ContentClient
+	images imagesapi.ImagesClient
 }
 
 // Compile-time assertion that *contentBlobs is an ocicfs blob source.
@@ -83,6 +88,46 @@ func (b *contentBlobs) Open(ctx context.Context, desc ocispec.Descriptor) (io.Re
 	return r, nil
 }
 
+// Has reports whether the content store holds the blob dgst names, in the
+// namespace of the request being served.
+func (b *contentBlobs) Has(ctx context.Context, dgst digest.Digest) (bool, error) {
+	ns, err := namespaces.NamespaceRequired(ctx)
+	if err != nil {
+		return false, fmt.Errorf("resolve the namespace to look blob %s up in: %w", dgst, err)
+	}
+	client, err := b.contentClient()
+	if err != nil {
+		return false, err
+	}
+	_, err = client.Info(namespaces.WithNamespace(ctx, ns), &contentapi.InfoRequest{Digest: dgst.String()})
+	if err == nil {
+		return true, nil
+	}
+	if err = errgrpc.ToNative(err); errdefs.IsNotFound(err) {
+		return false, nil
+	}
+	return false, fmt.Errorf("look blob %s up in namespace %s: %w", dgst, ns, err)
+}
+
+// ListImages returns every image record of the namespace the request being
+// served names: what the runtime has pulled or loaded there, each with the
+// descriptor of its manifest or index.
+func (b *contentBlobs) ListImages(ctx context.Context) ([]*imagesapi.Image, error) {
+	ns, err := namespaces.NamespaceRequired(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("resolve the namespace to list images in: %w", err)
+	}
+	client, err := b.imagesClient()
+	if err != nil {
+		return nil, err
+	}
+	resp, err := client.List(namespaces.WithNamespace(ctx, ns), &imagesapi.ListImagesRequest{})
+	if err != nil {
+		return nil, fmt.Errorf("list images in namespace %s: %w", ns, errgrpc.ToNative(err))
+	}
+	return resp.Images, nil
+}
+
 // Close drops the containerd connection. A second call is a no-op, so tearing
 // the snapshotter down twice does not report the connection as already closed.
 func (b *contentBlobs) Close() error {
@@ -93,7 +138,7 @@ func (b *contentBlobs) Close() error {
 	if conn == nil {
 		return nil
 	}
-	b.conn, b.client = nil, nil
+	b.conn, b.client, b.images = nil, nil, nil
 	return conn.Close()
 }
 
@@ -103,11 +148,33 @@ func (b *contentBlobs) contentClient() (contentapi.ContentClient, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	if b.client != nil {
-		return b.client, nil
+	if b.client == nil {
+		if err := b.dial(); err != nil {
+			return nil, err
+		}
 	}
+	return b.client, nil
+}
+
+// imagesClient returns containerd's images service client, dialing on first
+// use.
+func (b *contentBlobs) imagesClient() (imagesapi.ImagesClient, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if b.images == nil {
+		if err := b.dial(); err != nil {
+			return nil, err
+		}
+	}
+	return b.images, nil
+}
+
+// dial connects to containerd and creates both clients over the connection.
+// The caller holds mu.
+func (b *contentBlobs) dial() error {
 	if b.address == "" {
-		return nil, fmt.Errorf("no containerd address to read staged layers from: %w", errdefs.ErrInvalidArgument)
+		return fmt.Errorf("no containerd address to read staged layers from: %w", errdefs.ErrInvalidArgument)
 	}
 	// The message-size caps match what containerd grants its own clients.
 	conn, err := grpc.NewClient(dialer.DialAddress(b.address),
@@ -117,10 +184,10 @@ func (b *contentBlobs) contentClient() (contentapi.ContentClient, error) {
 			grpc.MaxCallRecvMsgSize(defaults.DefaultMaxRecvMsgSize),
 			grpc.MaxCallSendMsgSize(defaults.DefaultMaxSendMsgSize)))
 	if err != nil {
-		return nil, fmt.Errorf("connect to containerd at %q: %w", b.address, err)
+		return fmt.Errorf("connect to containerd at %q: %w", b.address, err)
 	}
-	b.conn, b.client = conn, contentapi.NewContentClient(conn)
-	return b.client, nil
+	b.conn, b.client, b.images = conn, contentapi.NewContentClient(conn), imagesapi.NewImagesClient(conn)
+	return nil
 }
 
 // blobReader reads one blob off the stream of a content Read call. Close

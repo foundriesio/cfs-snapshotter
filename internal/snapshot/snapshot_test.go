@@ -9,9 +9,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -19,6 +21,9 @@ import (
 	"time"
 
 	contentapi "github.com/containerd/containerd/api/services/content/v1"
+	imagesapi "github.com/containerd/containerd/api/services/images/v1"
+	"github.com/containerd/containerd/api/types"
+	"github.com/containerd/containerd/v2/core/images"
 	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/containerd/containerd/v2/core/snapshots"
 	"github.com/containerd/containerd/v2/core/snapshots/storage"
@@ -31,6 +36,7 @@ import (
 	"golang.org/x/sys/unix"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 )
 
@@ -1820,18 +1826,26 @@ func TestStagingPlaceholderIsUnmountable(t *testing.T) {
 // record whose image is not finished: the record is metadata only, like a
 // chain member, but the walk must not take it for one and mount an image
 // that is not there.
+// TestMountsRefuseStagedAncestor covers a container over a staged record
+// that stands for no image: the runtime's records name no image ending in
+// its chain, so there is nothing to promote it into, and the Prepare fails
+// closed without leaving a record behind.
 func TestMountsRefuseStagedAncestor(t *testing.T) {
 	ctx := pullNamespace()
 	sn := newStagingSnapshotter(t, fakeEngineForImages())
 	root, chains := stageImage(t, sn, digest.FromString("layer-1"), digest.FromString("layer-2"))
+	imagesOf(sn)
 	if _, err := sn.Prepare(ctx, "extract", "", snapshots.WithLabels(stagedLabels("app:v1", root, chains[0]))); err != nil {
 		t.Fatalf("Prepare(extract) error = %v", err)
 	}
 	if err := sn.Commit(ctx, chains[0].String(), "extract"); err != nil {
 		t.Fatalf("Commit() error = %v", err)
 	}
-	if _, err := sn.Prepare(ctx, "container", chains[0].String()); !errdefs.IsInvalidArgument(err) {
-		t.Fatalf("Prepare() over a staged record error = %v, want invalid argument", err)
+	if _, err := sn.Prepare(ctx, "container", chains[0].String()); !errdefs.IsFailedPrecondition(err) {
+		t.Fatalf("Prepare() over a staged record error = %v, want failed precondition", err)
+	}
+	if _, err := sn.Stat(ctx, "container"); !errdefs.IsNotFound(err) {
+		t.Fatalf("Stat(container) error = %v, want not found", err)
 	}
 }
 
@@ -2152,10 +2166,14 @@ type fakeEngine struct {
 	objectsDir     string
 	holdErr        error
 	releaseErr     error
-	// ingestErr and finishErr fail the corresponding call of every build the
-	// engine creates.
-	ingestErr error
-	finishErr error
+	// newBuildErr fails every NewBuild; ingestErr and finishErr fail the
+	// corresponding call of every build the engine creates. finishHeldErr
+	// fails Finish after the build's hold has been recorded, the way a hold
+	// marker written but not synced fails.
+	newBuildErr   error
+	ingestErr     error
+	finishErr     error
+	finishHeldErr error
 	// held is what Holds reports; gcErr fails every GC and gcs counts them.
 	// gcGate, when set, holds every GC, already counted, until it is closed.
 	held   map[digest.Digest][]string
@@ -2170,8 +2188,10 @@ type fakeEngine struct {
 	finishGateOnce sync.Once
 	finishDoneOnce sync.Once
 	// events records, in order, every hold a build's Finish takes and every
-	// Release, so a test can tell which came first.
-	events []string
+	// Release, so a test can tell which came first. releaseCtxErrs records
+	// the state of the context each Release was given.
+	events         []string
+	releaseCtxErrs []error
 
 	// mu guards the call records, which concurrent commits append to.
 	mu sync.Mutex
@@ -2208,6 +2228,9 @@ func (e *fakeEngine) NewBuild(ctx context.Context, ref string, opts ...ocicfs.Pu
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	if e.newBuildErr != nil {
+		return nil, e.newBuildErr
+	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.builds = append(e.builds, buildCall{ref: ref, opts: pullOpts})
@@ -2228,11 +2251,12 @@ func (e *fakeEngine) Hold(_ context.Context, ref, holder string) error {
 	return e.holdErr
 }
 
-func (e *fakeEngine) Release(_ context.Context, ref, holder string) error {
+func (e *fakeEngine) Release(ctx context.Context, ref, holder string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.releases = append(e.releases, holdCall{ref: ref, holder: holder})
 	e.events = append(e.events, "release:"+holder)
+	e.releaseCtxErrs = append(e.releaseCtxErrs, ctx.Err())
 	return e.releaseErr
 }
 
@@ -2376,6 +2400,9 @@ func (b *fakeBuild) Finish(context.Context) (*ocicfs.Image, error) {
 		b.engine.events = append(b.engine.events, "hold:"+b.opts.Hold)
 		b.engine.mu.Unlock()
 	}
+	if b.engine.finishHeldErr != nil {
+		return nil, b.engine.finishHeldErr
+	}
 	if b.engine.finishDone != nil {
 		b.engine.finishDoneOnce.Do(func() { close(b.engine.finishDone) })
 	}
@@ -2406,12 +2433,81 @@ type holdCall struct {
 
 // fakeContent serves canned blobs the way containerd's content service does:
 // one Read call streams a blob in fixed-size messages, and a blob the store
-// does not hold fails the first receive rather than the call. Only the read a
-// conversion makes is implemented; anything else panics on the nil embedded
-// client.
+// does not hold fails the first receive rather than the call; Info reports a
+// blob's presence. Anything else panics on the nil embedded client.
 type fakeContent struct {
 	contentapi.ContentClient
 	blobs map[digest.Digest][]byte
+}
+
+func (f fakeContent) Info(_ context.Context, req *contentapi.InfoRequest, _ ...grpc.CallOption) (*contentapi.InfoResponse, error) {
+	blob, ok := f.blobs[digest.Digest(req.Digest)]
+	if !ok {
+		return nil, status.Errorf(codes.NotFound, "content %s", req.Digest)
+	}
+	return &contentapi.InfoResponse{Info: &contentapi.Info{Digest: req.Digest, Size: int64(len(blob))}}, nil
+}
+
+// fakeImages serves canned image records the way containerd's images service
+// does, recording the namespace header of every List. Anything but List
+// panics on the nil embedded client.
+type fakeImages struct {
+	imagesapi.ImagesClient
+	mu     sync.Mutex
+	images []*imagesapi.Image
+	err    error
+	// lists records the namespace header each List call carried.
+	lists []string
+}
+
+func (f *fakeImages) List(ctx context.Context, _ *imagesapi.ListImagesRequest, _ ...grpc.CallOption) (*imagesapi.ListImagesResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	md, _ := metadata.FromOutgoingContext(ctx)
+	f.lists = append(f.lists, strings.Join(slices.Compact(md.Get("containerd-namespace")), ","))
+	if f.err != nil {
+		return nil, f.err
+	}
+	return &imagesapi.ListImagesResponse{Images: slices.Clone(f.images)}, nil
+}
+
+// add registers an image record under name targeting the given descriptor.
+func (f *fakeImages) add(name, mediaType string, target digest.Digest) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.images = append(f.images, &imagesapi.Image{
+		Name:   name,
+		Target: &types.Descriptor{MediaType: mediaType, Digest: target.String()},
+	})
+}
+
+// listCount reports how many List calls the fake has served.
+func (f *fakeImages) listCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.lists)
+}
+
+// imagesOf returns the fake images service the snapshotter walks image
+// records with, installing an empty one on first use.
+func imagesOf(sn *snapshotter) *fakeImages {
+	fake, ok := sn.blobs.images.(*fakeImages)
+	if !ok {
+		fake = &fakeImages{}
+		sn.blobs.images = fake
+	}
+	return fake
+}
+
+// contentOf returns the fake content store the snapshotter reads blobs from,
+// installing an empty one on first use.
+func contentOf(sn *snapshotter) fakeContent {
+	store, ok := sn.blobs.client.(fakeContent)
+	if !ok {
+		store = fakeContent{blobs: map[digest.Digest][]byte{}}
+		sn.blobs.client = store
+	}
+	return store
 }
 
 // fakeMessageSize is the size of the messages a fake read streams a blob in,
@@ -2476,14 +2572,52 @@ func stageImage(t *testing.T, sn *snapshotter, diffIDs ...digest.Digest) (digest
 // two images built from the same layers get different manifests.
 func stageImageBy(t *testing.T, sn *snapshotter, author string, diffIDs ...digest.Digest) (digest.Digest, []digest.Digest) {
 	t.Helper()
-	config, err := json.Marshal(ocispec.Image{
-		Author: author,
-		RootFS: ocispec.RootFS{Type: "layers", DiffIDs: diffIDs},
-	})
+	return stageImageConfig(t, sn, ocispec.Image{Author: author, Platform: hostPlatform()}, diffIDs...)
+}
+
+// hostPlatform is the platform the fake images declare, which is the one
+// the snapshotter under test runs on.
+func hostPlatform() ocispec.Platform {
+	return ocispec.Platform{OS: runtime.GOOS, Architecture: runtime.GOARCH}
+}
+
+// loadImage puts an image with the given layer diff IDs in the snapshotter's
+// content store the way a runtime's pull or load leaves it — manifest,
+// config and every layer blob — and records it under name in the images
+// service. It returns what stageImage does.
+func loadImage(t *testing.T, sn *snapshotter, name string, diffIDs ...digest.Digest) (digest.Digest, []digest.Digest) {
+	t.Helper()
+	return loadImageBy(t, sn, name, "", diffIDs...)
+}
+
+// loadImageBy is loadImage for an image whose config names an author.
+func loadImageBy(t *testing.T, sn *snapshotter, name, author string, diffIDs ...digest.Digest) (digest.Digest, []digest.Digest) {
+	t.Helper()
+	root, chains := stageImageBy(t, sn, author, diffIDs...)
+	loadLayers(sn, diffIDs...)
+	imagesOf(sn).add(name, ocispec.MediaTypeImageManifest, root)
+	return root, chains
+}
+
+// loadLayers puts the layer blobs of the given diff IDs in the snapshotter's
+// content store; their bytes are never read, only their presence is checked.
+func loadLayers(sn *snapshotter, diffIDs ...digest.Digest) {
+	store := contentOf(sn)
+	for _, diffID := range diffIDs {
+		store.blobs[layerBlob(diffID)] = []byte("layer " + diffID.String())
+	}
+}
+
+// stageImageConfig is stageImageBy for an image with the given config, whose
+// rootfs the layer diff IDs become.
+func stageImageConfig(t *testing.T, sn *snapshotter, config ocispec.Image, diffIDs ...digest.Digest) (digest.Digest, []digest.Digest) {
+	t.Helper()
+	config.RootFS = ocispec.RootFS{Type: "layers", DiffIDs: diffIDs}
+	configBytes, err := json.Marshal(config)
 	if err != nil {
 		t.Fatalf("marshal config: %v", err)
 	}
-	configDigest := digest.FromBytes(config)
+	configDigest := digest.FromBytes(configBytes)
 	layers := make([]ocispec.Descriptor, len(diffIDs))
 	for i, diffID := range diffIDs {
 		layers[i] = ocispec.Descriptor{MediaType: ocispec.MediaTypeImageLayerGzip, Digest: layerBlob(diffID), Size: layerSize}
@@ -2493,7 +2627,7 @@ func stageImageBy(t *testing.T, sn *snapshotter, author string, diffIDs ...diges
 		Config: ocispec.Descriptor{
 			MediaType: ocispec.MediaTypeImageConfig,
 			Digest:    configDigest,
-			Size:      int64(len(config)),
+			Size:      int64(len(configBytes)),
 		},
 		Layers: layers,
 	})
@@ -2501,13 +2635,9 @@ func stageImageBy(t *testing.T, sn *snapshotter, author string, diffIDs ...diges
 		t.Fatalf("marshal manifest: %v", err)
 	}
 	root := digest.FromBytes(manifest)
-	store, ok := sn.blobs.client.(fakeContent)
-	if !ok {
-		store = fakeContent{blobs: map[digest.Digest][]byte{}}
-		sn.blobs.client = store
-	}
+	store := contentOf(sn)
 	store.blobs[root] = manifest
-	store.blobs[configDigest] = config
+	store.blobs[configDigest] = configBytes
 	chains := make([]digest.Digest, len(diffIDs))
 	copy(chains, diffIDs)
 	identity.ChainIDs(chains)
@@ -3118,5 +3248,756 @@ func TestRemoveWaitsForFinishingBuild(t *testing.T) {
 	}
 	if len(sn.finishing) != 0 {
 		t.Fatalf("finishing builds = %d after the removal, want none", len(sn.finishing))
+	}
+}
+
+// pullImage drives the labeled unpack handshake of an image through the
+// snapshotter — Prepare, Apply and Commit per layer, under keys and names
+// shaped as containerd files them, with prefix telling one pull's records
+// from another's — and returns the committed name of each layer's record.
+// Commit is handed the handshake's labels again, as containerd passes a
+// backend the snapshot.ref and containerd.io/snapshot/* labels it was given.
+func pullImage(t *testing.T, sn *snapshotter, prefix, imageRef string, root digest.Digest, chains, layers []digest.Digest) []string {
+	t.Helper()
+	ctx := pullNamespace()
+	names := make([]string, len(chains))
+	parent := ""
+	for i, chain := range chains {
+		key := fmt.Sprintf("%s/%d/extract", prefix, i)
+		labels := snapshots.WithLabels(stagedLabels(imageRef, root, chain))
+		if _, err := sn.Prepare(ctx, key, parent, labels); err != nil {
+			t.Fatalf("Prepare(%s) error = %v", key, err)
+		}
+		if err := applyStaged(ctx, sn, key, layers[i]); err != nil {
+			t.Fatalf("Apply(%s) error = %v", key, err)
+		}
+		names[i] = fmt.Sprintf("%s/%d/%s", prefix, i, chain)
+		if err := sn.Commit(ctx, names[i], key, labels); err != nil {
+			t.Fatalf("Commit(%s) error = %v", names[i], err)
+		}
+		parent = names[i]
+	}
+	return names
+}
+
+// derivedPull is what a promotion test starts from: the image B = (x, y, w)
+// pulled through the labeled path, which leaves the chain (x, y) as a
+// committed staged record that is no chain member. A pull of the base image
+// A = (x, y) then finds that record present, skips every layer, and leaves
+// A unbuilt: the state a container over A meets.
+type derivedPull struct {
+	// x, y and w are the layers' diff IDs.
+	x, y, w digest.Digest
+	// rootB is B's manifest digest; base and leaf are the committed names of
+	// the (x, y) record and of B's last record; baseChain is the chain the
+	// base record stands for; leafHolder is the holder B's build took.
+	rootB      digest.Digest
+	base, leaf string
+	baseChain  digest.Digest
+	leafHolder string
+	// baseLabels are the labels the pull left on the base record.
+	baseLabels map[string]string
+}
+
+func pullDerived(t *testing.T, sn *snapshotter) derivedPull {
+	t.Helper()
+	d := derivedPull{x: digest.FromString("layer-x"), y: digest.FromString("layer-y"), w: digest.FromString("layer-w")}
+	var chains []digest.Digest
+	d.rootB, chains = stageImageBy(t, sn, "derived", d.x, d.y, d.w)
+	names := pullImage(t, sn, "moby", "registry.example/b:v1", d.rootB, chains, []digest.Digest{d.x, d.y, d.w})
+	d.base, d.leaf, d.baseChain = names[1], names[2], chains[1]
+	// The build's holder is named after the staging record that started it.
+	d.leafHolder = buildHolder("moby", "moby/0/extract")
+	info, err := sn.Stat(pullNamespace(), d.base)
+	if err != nil {
+		t.Fatalf("Stat(%s) error = %v", d.base, err)
+	}
+	if info.Kind != snapshots.KindCommitted || info.Labels[stagingLabel] == "" || info.Labels[chainMemberLabel] != "" {
+		t.Fatalf("base record = %+v, want a committed staged record that is no chain member", info)
+	}
+	d.baseLabels = info.Labels
+	return d
+}
+
+// assertUnpromoted checks that the base record of a derived pull is exactly
+// as the pull left it.
+func assertUnpromoted(t *testing.T, sn *snapshotter, d derivedPull) {
+	t.Helper()
+	info, err := sn.Stat(pullNamespace(), d.base)
+	if err != nil {
+		t.Fatalf("Stat(%s) error = %v", d.base, err)
+	}
+	if !maps.Equal(info.Labels, d.baseLabels) {
+		t.Fatalf("base record labels = %v, want unchanged %v", info.Labels, d.baseLabels)
+	}
+}
+
+// awaitCall waits for the engine's call log to contain call.
+func awaitCall(t *testing.T, engine *fakeEngine, call string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for !slices.Contains(engine.callLog(), call) {
+		if time.Now().After(deadline) {
+			t.Fatalf("engine calls = %v, want %s", engine.callLog(), call)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// TestPreparePromotesRecordedChain covers a container over a base image
+// whose pull built nothing: a derived image pulled first left the base's
+// chain as a staged record, so the base's own pull found it and skipped its
+// layers. The container's Prepare promotes the record — the base is built
+// whole from the runtime's content store and held under the record's own
+// holder, the record becomes a chain member naming the base rather than the
+// derived image it was staged for — and mounts it. The base then outlives
+// the derived image's removal and goes with its own record.
+func TestPreparePromotesRecordedChain(t *testing.T) {
+	ctx := pullNamespace()
+	engine := fakeEngineForImages()
+	sn := newStagingSnapshotter(t, engine)
+	d := pullDerived(t, sn)
+	rootA, _ := loadImage(t, sn, "registry.example/a:v1", d.x, d.y)
+	imagesOf(sn).add("registry.example/b:v1", ocispec.MediaTypeImageManifest, d.rootB)
+	var calls []mountCall
+	recordMounts(engine, &calls)
+
+	mounts, err := sn.Prepare(ctx, "moby/9/container-init", d.base)
+	if err != nil {
+		t.Fatalf("Prepare(container-init) error = %v", err)
+	}
+	if len(calls) != 1 || calls[0].chainID != d.baseChain.String() {
+		t.Fatalf("MountChain calls = %+v, want the base chain %s", calls, d.baseChain)
+	}
+	if got := optionValue(t, mounts[0], "lowerdir"); got != calls[0].target+"::"+engine.objectsDir {
+		t.Fatalf("lowerdir = %q, want the promoted base image only", got)
+	}
+	if len(engine.builds) != 2 {
+		t.Fatalf("engine NewBuild calls = %+v, want the derived pull's and the promotion's", engine.builds)
+	}
+	holder := recordHolder(d.base)
+	build := engine.builds[1]
+	if build.ref != "registry.example/a:v1" || build.opts.ResolvedRoot != rootA || build.opts.Hold != holder ||
+		build.opts.BlobSource != ocicfs.BlobSource(sn.blobs) {
+		t.Fatalf("promotion NewBuild(%q, %+v), want the base image rooted at %s held under %s from the content store", build.ref, build.opts, rootA, holder)
+	}
+	if calls := engine.callLog(); calls[len(calls)-1] != "build1.finish" {
+		t.Fatalf("engine calls = %v, want the promotion's build finished whole", calls)
+	}
+	wantHolds := []holdCall{{ref: d.rootB.String(), holder: d.leafHolder}, {ref: rootA.String(), holder: holder}}
+	if !slices.Equal(engine.holds, wantHolds) {
+		t.Fatalf("engine Hold calls = %+v, want %+v", engine.holds, wantHolds)
+	}
+	if len(sn.builds) != 0 || len(sn.finishing) != 0 {
+		t.Fatalf("open builds = %d, finishing = %d after the promotion, want none", len(sn.builds), len(sn.finishing))
+	}
+	info, err := sn.Stat(ctx, d.base)
+	if err != nil {
+		t.Fatalf("Stat(%s) error = %v", d.base, err)
+	}
+	want := map[string]string{
+		intermediateSnapshotLabel: d.baseChain.String(),
+		chainMemberLabel:          "true",
+		rootDigestLabel:           rootA.String(),
+		holderLabel:               holder,
+		imageRefLabel:             "registry.example/a:v1",
+		manifestDigestLabel:       rootA.String(),
+	}
+	if !maps.Equal(info.Labels, want) {
+		t.Fatalf("promoted record labels = %v, want %v", info.Labels, want)
+	}
+
+	// The derived image goes first, as containerd removes leaf-first: only
+	// its own hold is released. The promoted record releases the base's.
+	if err := sn.Remove(ctx, d.leaf); err != nil {
+		t.Fatalf("Remove(%s) error = %v", d.leaf, err)
+	}
+	if want := wantHolds[:1]; !slices.Equal(engine.releases, want) {
+		t.Fatalf("engine Release calls = %+v after the derived leaf's removal, want %+v", engine.releases, want)
+	}
+	if err := sn.Remove(ctx, "moby/9/container-init"); err != nil {
+		t.Fatalf("Remove(container-init) error = %v", err)
+	}
+	if err := sn.Remove(ctx, d.base); err != nil {
+		t.Fatalf("Remove(%s) error = %v", d.base, err)
+	}
+	if !slices.Equal(engine.releases, wantHolds) {
+		t.Fatalf("engine Release calls = %+v after the promoted record's removal, want %+v", engine.releases, wantHolds)
+	}
+}
+
+// TestPreparePromotionOutOfBand covers the promotion on a daemon that builds
+// nothing from runtime content: the record is declined with a message naming
+// the recovery, the runtime's records are not even consulted, and nothing
+// changes.
+func TestPreparePromotionOutOfBand(t *testing.T) {
+	ctx := pullNamespace()
+	root := t.TempDir()
+	engine := fakeEngineForImages()
+	engine.objectsDir = t.TempDir()
+	staged := newConfiguredSnapshotter(t, Config{Root: root, AllowUnstagedPulls: true}, engine, notMounted)
+	d := pullDerived(t, staged)
+	loadImage(t, staged, "registry.example/a:v1", d.x, d.y)
+	if err := staged.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	sn := newConfiguredSnapshotter(t, Config{Root: root}, engine, notMounted)
+	sn.blobs.client, sn.blobs.images = staged.blobs.client, staged.blobs.images
+	_, err := sn.Prepare(ctx, "moby/9/container-init", d.base)
+	if !errdefs.IsFailedPrecondition(err) || !strings.Contains(err.Error(), "pull it with ocicfs") {
+		t.Fatalf("Prepare(container-init) error = %v, want failed precondition naming ocicfs", err)
+	}
+	if len(engine.builds) != 1 {
+		t.Fatalf("engine NewBuild calls = %+v, want the derived pull's alone", engine.builds)
+	}
+	if n := imagesOf(sn).listCount(); n != 0 {
+		t.Fatalf("images listed %d times, want none: the decline consults no record", n)
+	}
+	assertUnpromoted(t, sn, d)
+	if _, err := sn.Stat(ctx, "moby/9/container-init"); !errdefs.IsNotFound(err) {
+		t.Fatalf("Stat(container-init) error = %v, want not found", err)
+	}
+}
+
+// TestPreparePromotionFailsClosed covers a promotion with nothing to promote
+// from — no image ends in the chain, or the one that does lacks a layer blob
+// — and one whose build cannot begin or fails: the Prepare fails, the record
+// is left as it was, a collection is asked for, and a hold the failed build
+// had already written is released, so a retry that picks another image
+// leaves exactly one root held under the record's holder.
+func TestPreparePromotionFailsClosed(t *testing.T) {
+	ctx := pullNamespace()
+	t.Run("no image ends in the chain", func(t *testing.T) {
+		engine := fakeEngineForImages()
+		sn := newStagingSnapshotter(t, engine)
+		d := pullDerived(t, sn)
+		imagesOf(sn).add("registry.example/b:v1", ocispec.MediaTypeImageManifest, d.rootB)
+		loadLayers(sn, d.x, d.y, d.w)
+		if _, err := sn.Prepare(ctx, "moby/9/container-init", d.base); !errdefs.IsFailedPrecondition(err) {
+			t.Fatalf("Prepare(container-init) error = %v, want failed precondition", err)
+		}
+		if len(engine.builds) != 1 || len(engine.holds) != 1 {
+			t.Fatalf("engine builds = %+v, holds = %+v, want the derived pull's alone", engine.builds, engine.holds)
+		}
+		assertUnpromoted(t, sn, d)
+		if _, err := sn.Stat(ctx, "moby/9/container-init"); !errdefs.IsNotFound(err) {
+			t.Fatalf("Stat(container-init) error = %v, want not found", err)
+		}
+	})
+	t.Run("the image lacks a layer blob", func(t *testing.T) {
+		engine := fakeEngineForImages()
+		sn := newStagingSnapshotter(t, engine)
+		d := pullDerived(t, sn)
+		rootA, _ := stageImage(t, sn, d.x, d.y)
+		imagesOf(sn).add("registry.example/a:v1", ocispec.MediaTypeImageManifest, rootA)
+		loadLayers(sn, d.y)
+		if _, err := sn.Prepare(ctx, "moby/9/container-init", d.base); !errdefs.IsFailedPrecondition(err) {
+			t.Fatalf("Prepare(container-init) error = %v, want failed precondition", err)
+		}
+		if len(engine.builds) != 1 || len(engine.holds) != 1 {
+			t.Fatalf("engine builds = %+v, holds = %+v, want the derived pull's alone", engine.builds, engine.holds)
+		}
+		assertUnpromoted(t, sn, d)
+	})
+	t.Run("the build cannot begin", func(t *testing.T) {
+		engine := fakeEngineForImages()
+		sn := newStagingSnapshotter(t, engine)
+		awaitGCs(t, engine, 1)
+		d := pullDerived(t, sn)
+		loadImage(t, sn, "registry.example/a:v1", d.x, d.y)
+		engine.newBuildErr = errors.New("begin failed")
+		if _, err := sn.Prepare(ctx, "moby/9/container-init", d.base); err == nil || !strings.Contains(err.Error(), "begin failed") {
+			t.Fatalf("Prepare(container-init) error = %v, want the build failure", err)
+		}
+		if len(engine.builds) != 1 || len(engine.holds) != 1 || len(engine.releases) != 0 {
+			t.Fatalf("engine builds = %+v, holds = %+v, releases = %+v, want the derived pull's alone", engine.builds, engine.holds, engine.releases)
+		}
+		awaitGCs(t, engine, 2)
+		assertUnpromoted(t, sn, d)
+		if _, err := sn.Stat(ctx, "moby/9/container-init"); !errdefs.IsNotFound(err) {
+			t.Fatalf("Stat(container-init) error = %v, want not found", err)
+		}
+	})
+	t.Run("the build fails", func(t *testing.T) {
+		engine := fakeEngineForImages()
+		sn := newStagingSnapshotter(t, engine)
+		awaitGCs(t, engine, 1)
+		d := pullDerived(t, sn)
+		rootA, _ := loadImage(t, sn, "registry.example/a:v1", d.x, d.y)
+		engine.finishErr = errors.New("finish failed")
+		if _, err := sn.Prepare(ctx, "moby/9/container-init", d.base); err == nil || !strings.Contains(err.Error(), "finish failed") {
+			t.Fatalf("Prepare(container-init) error = %v, want the build failure", err)
+		}
+		holder := recordHolder(d.base)
+		if len(engine.builds) != 2 || len(engine.holds) != 1 {
+			t.Fatalf("engine builds = %+v, holds = %+v, want one failed promotion build and no hold for it", engine.builds, engine.holds)
+		}
+		if want := []holdCall{{ref: rootA.String(), holder: holder}}; !slices.Equal(engine.releases, want) || engine.releaseCtxErrs[0] != nil {
+			t.Fatalf("engine Release calls = %+v (ctx errors %v), want the failed build's holder released %+v on a live context", engine.releases, engine.releaseCtxErrs, want)
+		}
+		awaitGCs(t, engine, 2)
+		assertUnpromoted(t, sn, d)
+		if _, err := sn.Stat(ctx, "moby/9/container-init"); !errdefs.IsNotFound(err) {
+			t.Fatalf("Stat(container-init) error = %v, want not found", err)
+		}
+	})
+	t.Run("the build fails with its hold written", func(t *testing.T) {
+		engine := fakeEngineForImages()
+		sn := newStagingSnapshotter(t, engine)
+		awaitGCs(t, engine, 1)
+		d := pullDerived(t, sn)
+		rootM1, _ := stageImageBy(t, sn, "m1", d.x, d.y)
+		rootM2, _ := stageImageBy(t, sn, "m2", d.x, d.y)
+		if rootM2 > rootM1 {
+			rootM1, rootM2 = rootM2, rootM1
+		}
+		loadLayers(sn, d.x, d.y)
+		imagesOf(sn).add("registry.example/a:m1", ocispec.MediaTypeImageManifest, rootM1)
+		engine.finishHeldErr = errors.New("hold not synced")
+		if _, err := sn.Prepare(ctx, "moby/9/first-init", d.base); err == nil || !strings.Contains(err.Error(), "hold not synced") {
+			t.Fatalf("Prepare(first-init) error = %v, want the build failure", err)
+		}
+		holder := recordHolder(d.base)
+		if want := []holdCall{{ref: rootM1.String(), holder: holder}}; !slices.Equal(engine.releases, want) {
+			t.Fatalf("engine Release calls = %+v, want the failed build's hold released %+v", engine.releases, want)
+		}
+		awaitGCs(t, engine, 2)
+		assertUnpromoted(t, sn, d)
+
+		engine.finishHeldErr = nil
+		imagesOf(sn).add("registry.example/a:m2", ocispec.MediaTypeImageManifest, rootM2)
+		recordMounts(engine, &[]mountCall{})
+		if _, err := sn.Prepare(ctx, "moby/9/second-init", d.base); err != nil {
+			t.Fatalf("Prepare(second-init) error = %v", err)
+		}
+		info, err := sn.Stat(ctx, d.base)
+		if err != nil {
+			t.Fatalf("Stat(%s) error = %v", d.base, err)
+		}
+		if info.Labels[rootDigestLabel] != rootM2.String() {
+			t.Fatalf("promoted record labels = %v, want the retry's root %s", info.Labels, rootM2)
+		}
+		wantHolds := []holdCall{{ref: d.rootB.String(), holder: d.leafHolder}, {ref: rootM1.String(), holder: holder}, {ref: rootM2.String(), holder: holder}}
+		if !slices.Equal(engine.holds, wantHolds) || len(engine.releases) != 1 {
+			t.Fatalf("engine holds = %+v, releases = %+v, want exactly one root left held under %s", engine.holds, engine.releases, holder)
+		}
+	})
+}
+
+// TestPreparePromotionIsSerialized covers a second mount walk reaching the
+// record while the first promotes it. The second holds the record as it
+// read it before the promotion — unpromoted — and waits for the first; once
+// the first has published, the second reads the record again under the
+// lock, finds the member and takes its image, although a manifest it would
+// have preferred was registered meanwhile. The same stale reading after
+// the publication does the same without waiting. A label update the runtime
+// makes on the record during the build survives the publish.
+func TestPreparePromotionIsSerialized(t *testing.T) {
+	ctx := pullNamespace()
+	engine := fakeEngineForImages()
+	sn := newStagingSnapshotter(t, engine)
+	d := pullDerived(t, sn)
+	rootM1, _ := stageImageBy(t, sn, "m1", d.x, d.y)
+	rootM2, _ := stageImageBy(t, sn, "m2", d.x, d.y)
+	if rootM2 > rootM1 {
+		rootM1, rootM2 = rootM2, rootM1
+	}
+	loadLayers(sn, d.x, d.y)
+	imagesOf(sn).add("registry.example/a:m1", ocispec.MediaTypeImageManifest, rootM1)
+	var mounted []mountCall
+	recordMounts(engine, &mounted)
+	engine.finishGate = make(chan struct{})
+	// The record as a walk reads it before the promotion.
+	id, info, err := sn.snapshotInfo(ctx, d.base)
+	if err != nil {
+		t.Fatalf("snapshotInfo(%s) error = %v", d.base, err)
+	}
+	stale := ancestor{id: id, name: d.base, labels: info.Labels}
+
+	type composed struct {
+		lowers []string
+		found  bool
+		err    error
+	}
+	compose := func() <-chan composed {
+		done := make(chan composed, 1)
+		go func() {
+			lowers, found, err := sn.composeLowers(ctx, []ancestor{stale})
+			done <- composed{lowers: lowers, found: found, err: err}
+		}()
+		return done
+	}
+	first := compose()
+	awaitCall(t, engine, "build1.finish")
+	// The first holds the promotion lock inside its build, so the second's
+	// walk, with the same unpromoted reading of the record, queues behind it.
+	if sn.promoteMu.TryLock() {
+		sn.promoteMu.Unlock()
+		t.Fatal("the promotion lock is free while the first promotion builds")
+	}
+	second := compose()
+	imagesOf(sn).add("registry.example/a:m2", ocispec.MediaTypeImageManifest, rootM2)
+	gc := snapshots.Info{Name: d.base, Labels: map[string]string{"containerd.io/gc.root": "keep"}}
+	if _, err := sn.Update(ctx, gc, "labels.containerd.io/gc.root"); err != nil {
+		t.Fatalf("Update(gc label) error = %v", err)
+	}
+	engine.finishGateOnce.Do(func() { close(engine.finishGate) })
+
+	fsDir := filepath.Join(sn.getSnapshotDir(id), "fs")
+	for _, done := range []<-chan composed{first, second} {
+		c := <-done
+		if c.err != nil {
+			t.Fatalf("composeLowers() error = %v", c.err)
+		}
+		if !c.found || !slices.Equal(c.lowers, []string{fsDir}) {
+			t.Fatalf("composeLowers() = %v, %v, want the promoted record's image mount alone", c.lowers, c.found)
+		}
+	}
+	if len(engine.builds) != 2 || len(engine.holds) != 2 {
+		t.Fatalf("engine builds = %+v, holds = %+v, want one promotion build and one hold", engine.builds, engine.holds)
+	}
+	info, err = sn.Stat(ctx, d.base)
+	if err != nil {
+		t.Fatalf("Stat(%s) error = %v", d.base, err)
+	}
+	if info.Labels[rootDigestLabel] != rootM1.String() || info.Labels[holderLabel] != recordHolder(d.base) {
+		t.Fatalf("promoted record labels = %v, want the first promotion's root %s under the record's holder", info.Labels, rootM1)
+	}
+	if info.Labels["containerd.io/gc.root"] != "keep" {
+		t.Fatalf("promoted record labels = %v, want the runtime's gc label kept", info.Labels)
+	}
+
+	// A walk that read the record before the publication and reaches it
+	// only now takes the published image too.
+	if c := <-compose(); c.err != nil || !slices.Equal(c.lowers, []string{fsDir}) {
+		t.Fatalf("composeLowers() after the publication = %v, %v, want the promoted record's image mount", c.lowers, c.err)
+	}
+	if len(engine.builds) != 2 || len(engine.holds) != 2 || len(mounted) != 3 {
+		t.Fatalf("engine builds = %+v, holds = %+v, mounts = %d, want no second build or hold and a mount per walk", engine.builds, engine.holds, len(mounted))
+	}
+	if _, err := sn.Prepare(ctx, "moby/9/container-init", d.base); err != nil {
+		t.Fatalf("Prepare(container-init) over the promoted record error = %v", err)
+	}
+}
+
+// TestPreparePromotionReleasesOnPublishFailure covers a built promotion whose
+// publish fails under a caller that has cancelled meanwhile: the hold the
+// build took is released all the same, on a context the cancellation does not
+// reach, a collection is asked for, and the record is left as it was — so a
+// retry promotes afresh and ends with exactly one root held under the
+// record's holder.
+func TestPreparePromotionReleasesOnPublishFailure(t *testing.T) {
+	engine := fakeEngineForImages()
+	sn := newStagingSnapshotter(t, engine)
+	awaitGCs(t, engine, 1)
+	d := pullDerived(t, sn)
+	rootM1, _ := stageImageBy(t, sn, "m1", d.x, d.y)
+	rootM2, _ := stageImageBy(t, sn, "m2", d.x, d.y)
+	if rootM2 > rootM1 {
+		rootM1, rootM2 = rootM2, rootM1
+	}
+	loadLayers(sn, d.x, d.y)
+	imagesOf(sn).add("registry.example/a:m1", ocispec.MediaTypeImageManifest, rootM1)
+	recordMounts(engine, &[]mountCall{})
+	engine.finishGate = make(chan struct{})
+	sn.updateInfo = func(context.Context, snapshots.Info, ...string) (snapshots.Info, error) {
+		return snapshots.Info{}, errors.New("publish failed")
+	}
+
+	ctx, cancel := context.WithCancel(pullNamespace())
+	done := make(chan error, 1)
+	go func() {
+		_, err := sn.Prepare(ctx, "moby/9/first-init", d.base)
+		done <- err
+	}()
+	awaitCall(t, engine, "build1.finish")
+	cancel()
+	engine.finishGateOnce.Do(func() { close(engine.finishGate) })
+	if err := <-done; err == nil || !strings.Contains(err.Error(), "publish failed") {
+		t.Fatalf("Prepare(first-init) error = %v, want the publish failure", err)
+	}
+	holder := recordHolder(d.base)
+	if want := []holdCall{{ref: rootM1.String(), holder: holder}}; !slices.Equal(engine.releases, want) {
+		t.Fatalf("engine Release calls = %+v, want the promotion's hold released %+v", engine.releases, want)
+	}
+	if engine.releaseCtxErrs[0] != nil {
+		t.Fatalf("the hold was released on a cancelled context: %v", engine.releaseCtxErrs[0])
+	}
+	awaitGCs(t, engine, 2)
+	assertUnpromoted(t, sn, d)
+
+	sn.updateInfo = storage.UpdateInfo
+	imagesOf(sn).add("registry.example/a:m2", ocispec.MediaTypeImageManifest, rootM2)
+	if _, err := sn.Prepare(pullNamespace(), "moby/9/second-init", d.base); err != nil {
+		t.Fatalf("Prepare(second-init) error = %v", err)
+	}
+	info, err := sn.Stat(pullNamespace(), d.base)
+	if err != nil {
+		t.Fatalf("Stat(%s) error = %v", d.base, err)
+	}
+	if info.Labels[rootDigestLabel] != rootM2.String() || info.Labels[holderLabel] != holder {
+		t.Fatalf("promoted record labels = %v, want the retry's root %s under %s", info.Labels, rootM2, holder)
+	}
+	wantHolds := []holdCall{{ref: d.rootB.String(), holder: d.leafHolder}, {ref: rootM1.String(), holder: holder}, {ref: rootM2.String(), holder: holder}}
+	if !slices.Equal(engine.holds, wantHolds) || len(engine.releases) != 1 {
+		t.Fatalf("engine holds = %+v, releases = %+v, want exactly one root left held under %s", engine.holds, engine.releases, holder)
+	}
+}
+
+// TestPreparePromotionPrefersHostPlatform covers a manifest of another
+// platform over the same layers, ordered ahead of the host's: the host's is
+// built.
+func TestPreparePromotionPrefersHostPlatform(t *testing.T) {
+	ctx := pullNamespace()
+	engine := fakeEngineForImages()
+	sn := newStagingSnapshotter(t, engine)
+	d := pullDerived(t, sn)
+	rootHost, _ := loadImage(t, sn, "registry.example/a:host", d.x, d.y)
+	foreign := ocispec.Image{Platform: ocispec.Platform{OS: "plan9", Architecture: "mips"}}
+	var rootForeign digest.Digest
+	for i := 0; rootForeign == "" || rootForeign > rootHost; i++ {
+		foreign.Author = fmt.Sprintf("foreign-%d", i)
+		rootForeign, _ = stageImageConfig(t, sn, foreign, d.x, d.y)
+	}
+	imagesOf(sn).add("registry.example/a:foreign", ocispec.MediaTypeImageManifest, rootForeign)
+	recordMounts(engine, &[]mountCall{})
+
+	if _, err := sn.Prepare(ctx, "moby/9/container-init", d.base); err != nil {
+		t.Fatalf("Prepare(container-init) error = %v", err)
+	}
+	if len(engine.builds) != 2 || engine.builds[1].opts.ResolvedRoot != rootHost {
+		t.Fatalf("engine NewBuild calls = %+v, want the host manifest %s built", engine.builds, rootHost)
+	}
+}
+
+// TestLoadedManifestsWalksImages covers the walk of the runtime's image
+// records: a manifest reached directly and through an index collects every
+// name that leads to it, an index is descended one level for its image
+// manifests, and records, index entries, manifests and configs that are
+// absent, describe no layers, disagree on the layer count or belong to
+// another platform are passed over.
+func TestLoadedManifestsWalksImages(t *testing.T) {
+	ctx := pullNamespace()
+	sn := newStagingSnapshotter(t, fakeEngineForImages())
+	x, y := digest.FromString("layer-x"), digest.FromString("layer-y")
+	rootA, chainsA := stageImage(t, sn, x, y)
+	rootB, chainsB := stageImageBy(t, sn, "b", x)
+	attestation, _ := stageImageConfig(t, sn, ocispec.Image{Platform: hostPlatform()})
+	rootForeign, _ := stageImageConfig(t, sn, ocispec.Image{Platform: ocispec.Platform{OS: "plan9", Architecture: "mips"}}, x)
+	store := contentOf(sn)
+	var manifestB ocispec.Manifest
+	if err := json.Unmarshal(store.blobs[rootB], &manifestB); err != nil {
+		t.Fatalf("unmarshal manifest: %v", err)
+	}
+	configless := manifestB
+	configless.Config.Digest = digest.FromString("absent config")
+	noConfig := putJSON(t, store, configless)
+	mismatched := manifestB
+	mismatched.Layers = append(mismatched.Layers, mismatched.Layers[0])
+	miscounted := putJSON(t, store, mismatched)
+	index := putJSON(t, store, ocispec.Index{Manifests: []ocispec.Descriptor{
+		{MediaType: ocispec.MediaTypeImageManifest, Digest: rootA},
+		{MediaType: ocispec.MediaTypeImageManifest, Digest: digest.FromString("absent variant")},
+		{MediaType: ocispec.MediaTypeImageManifest, Digest: attestation},
+		{MediaType: ocispec.MediaTypeImageIndex, Digest: index2(t, store, rootB)},
+	}})
+	records := imagesOf(sn)
+	records.add("registry.example/a:v1", ocispec.MediaTypeImageIndex, index)
+	records.add("moby-dangling@"+rootA.String(), ocispec.MediaTypeImageManifest, rootA)
+	records.add("registry.example/b:v1", images.MediaTypeDockerSchema2Manifest, rootB)
+	records.add("registry.example/b:v2", ocispec.MediaTypeImageManifest, rootB)
+	records.add("registry.example/absent:v1", ocispec.MediaTypeImageManifest, digest.FromString("absent manifest"))
+	records.add("registry.example/absent:index", ocispec.MediaTypeImageIndex, digest.FromString("absent index"))
+	records.add("registry.example/foreign:v1", ocispec.MediaTypeImageManifest, rootForeign)
+	records.add("registry.example/noconfig:v1", ocispec.MediaTypeImageManifest, noConfig)
+	records.add("registry.example/miscounted:v1", ocispec.MediaTypeImageManifest, miscounted)
+	records.add("registry.example/other:v1", "application/vnd.example.other", rootB)
+
+	manifests, err := sn.loadedManifests(ctx)
+	if err != nil {
+		t.Fatalf("loadedManifests() error = %v", err)
+	}
+	want := []loadedManifest{
+		{root: rootA, names: []string{"registry.example/a:v1", "moby-dangling@" + rootA.String()}, chains: chainsA},
+		{root: rootB, names: []string{"registry.example/b:v1", "registry.example/b:v2"}, chains: chainsB},
+	}
+	slices.SortFunc(want, func(a, b loadedManifest) int { return strings.Compare(a.root.String(), b.root.String()) })
+	if len(manifests) != len(want) {
+		t.Fatalf("loadedManifests() = %+v, want %+v", manifests, want)
+	}
+	for i, m := range manifests {
+		if m.root != want[i].root || !slices.Equal(m.names, want[i].names) || !slices.Equal(m.chains, want[i].chains) {
+			t.Fatalf("loadedManifests()[%d] = %+v, want %+v", i, m, want[i])
+		}
+		if len(m.layers) != len(m.chains) || m.layers[0].Digest != layerBlob(x) {
+			t.Fatalf("loadedManifests()[%d].layers = %+v, want the manifest's layer descriptors", i, m.layers)
+		}
+	}
+	if !slices.Equal(records.lists, []string{"moby"}) {
+		t.Fatalf("images listed in namespaces %v, want once in moby", records.lists)
+	}
+
+	records.err = errors.New("images unavailable")
+	if _, err := sn.loadedManifests(ctx); err == nil {
+		t.Fatal("loadedManifests() succeeded with the images service failing")
+	}
+}
+
+// putJSON puts v in the fake content store and returns its digest.
+func putJSON(t *testing.T, store fakeContent, v any) digest.Digest {
+	t.Helper()
+	data, err := json.Marshal(v)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	dgst := digest.FromBytes(data)
+	store.blobs[dgst] = data
+	return dgst
+}
+
+// index2 puts a one-entry index naming root in the fake content store and
+// returns its digest.
+func index2(t *testing.T, store fakeContent, root digest.Digest) digest.Digest {
+	t.Helper()
+	return putJSON(t, store, ocispec.Index{Manifests: []ocispec.Descriptor{{MediaType: ocispec.MediaTypeImageManifest, Digest: root}}})
+}
+
+// TestBuildableManifestRequiresEveryBlob covers the choice of the manifest
+// to build a chain from: only one whose last chain it is, only one whose
+// every layer blob is present, and the first in digest order of those.
+func TestBuildableManifestRequiresEveryBlob(t *testing.T) {
+	ctx := pullNamespace()
+	sn := newStagingSnapshotter(t, fakeEngineForImages())
+	x, y, w := digest.FromString("layer-x"), digest.FromString("layer-y"), digest.FromString("layer-w")
+	rootA1, chains := stageImageBy(t, sn, "a1", x, y)
+	rootA2, _ := stageImageBy(t, sn, "a2", x, y)
+	rootC, chainsC := stageImageBy(t, sn, "c", x, y, w)
+	if rootA2 < rootA1 {
+		rootA1, rootA2 = rootA2, rootA1
+	}
+	// Alt describes the same layers as A1 and A2, with its first one under
+	// another compressed blob.
+	store := contentOf(sn)
+	var alt ocispec.Manifest
+	if err := json.Unmarshal(store.blobs[rootA1], &alt); err != nil {
+		t.Fatalf("unmarshal manifest: %v", err)
+	}
+	altBlob := digest.FromString("alternate blob of layer-x")
+	alt.Layers[0].Digest = altBlob
+	rootAlt := putJSON(t, store, alt)
+	records := imagesOf(sn)
+	records.add("a1", ocispec.MediaTypeImageManifest, rootA1)
+	records.add("a2", ocispec.MediaTypeImageManifest, rootA2)
+	records.add("alt", ocispec.MediaTypeImageManifest, rootAlt)
+	records.add("c", ocispec.MediaTypeImageManifest, rootC)
+	manifests, err := sn.loadedManifests(ctx)
+	if err != nil {
+		t.Fatalf("loadedManifests() error = %v", err)
+	}
+	full := chains[1].String()
+
+	expect := func(chainID string, wantRoot digest.Digest, wantOK bool) {
+		t.Helper()
+		m, ok, err := sn.buildableManifest(ctx, manifests, chainID)
+		if err != nil {
+			t.Fatalf("buildableManifest(%s) error = %v", chainID, err)
+		}
+		if ok != wantOK || m.root != wantRoot {
+			t.Fatalf("buildableManifest(%s) = %s, %v, want %s, %v", chainID, m.root, ok, wantRoot, wantOK)
+		}
+	}
+	expect(full, "", false)
+	loadLayers(sn, y)
+	expect(full, "", false)
+	// Only the first layer's blob decides between the A manifests and alt
+	// now: whichever of them has its own blob present is buildable, and the
+	// smallest digest among those is chosen even when a smaller one that
+	// lacks its blob sorts ahead of it.
+	if rootAlt < rootA1 {
+		loadLayers(sn, x)
+		expect(full, rootA1, true)
+		store.blobs[altBlob] = []byte("alternate layer")
+		expect(full, rootAlt, true)
+	} else {
+		store.blobs[altBlob] = []byte("alternate layer")
+		expect(full, rootAlt, true)
+		loadLayers(sn, x)
+		expect(full, rootA1, true)
+	}
+	expect(chains[0].String(), "", false)
+	expect(chainsC[2].String(), "", false)
+	loadLayers(sn, w)
+	expect(chainsC[2].String(), rootC, true)
+	delete(store.blobs, layerBlob(x))
+	delete(store.blobs, altBlob)
+	expect(full, "", false)
+}
+
+// TestLoadedImageRef covers the reference a built image is recorded under:
+// the smallest tag-shaped name, or the manifest digest when every name is
+// digest-qualified.
+func TestLoadedImageRef(t *testing.T) {
+	root := digest.FromString("root")
+	tests := []struct {
+		name  string
+		names []string
+		want  string
+	}{
+		{name: "smallest name", names: []string{"registry.example/b:v1", "registry.example/a:v2", "registry.example/a:v1"}, want: "registry.example/a:v1"},
+		{name: "digest-qualified names skipped", names: []string{"moby-dangling@" + root.String(), "registry.example/a@" + root.String(), "registry.example/z:v1"}, want: "registry.example/z:v1"},
+		{name: "only digest-qualified names", names: []string{"moby-dangling@" + root.String(), "registry.example/a@" + root.String()}, want: root.String()},
+		{name: "no names", want: root.String()},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := loadedImageRef(loadedManifest{root: root, names: tt.names}); got != tt.want {
+				t.Fatalf("loadedImageRef() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestHostPlatformConfig covers the platform rule: the host's OS and
+// architecture, with an unstated variant standing for the architecture's
+// default one.
+func TestHostPlatformConfig(t *testing.T) {
+	host := hostPlatform()
+	tests := []struct {
+		name     string
+		platform ocispec.Platform
+		want     bool
+	}{
+		{name: "host", platform: host, want: true},
+		{name: "other os", platform: ocispec.Platform{OS: "plan9", Architecture: host.Architecture}, want: false},
+		{name: "other architecture", platform: ocispec.Platform{OS: host.OS, Architecture: "mips"}, want: false},
+		{name: "unknown variant", platform: ocispec.Platform{OS: host.OS, Architecture: host.Architecture, Variant: "v0"}, want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := hostPlatformConfig(&ocispec.Image{Platform: tt.platform}); got != tt.want {
+				t.Fatalf("hostPlatformConfig(%+v) = %v, want %v", tt.platform, got, tt.want)
+			}
+		})
+	}
+
+	arm64 := ocispec.Platform{OS: "linux", Architecture: "arm64"}
+	arm := ocispec.Platform{OS: "linux", Architecture: "arm"}
+	variants := []struct {
+		name string
+		a, b ocispec.Platform
+		want bool
+	}{
+		{name: "arm64 default variant stated on one side", a: arm64, b: ocispec.Platform{OS: "linux", Architecture: "arm64", Variant: "v8"}, want: true},
+		{name: "arm default variant stated on one side", a: arm, b: ocispec.Platform{OS: "linux", Architecture: "arm", Variant: "v7"}, want: true},
+		{name: "arm older variant", a: arm, b: ocispec.Platform{OS: "linux", Architecture: "arm", Variant: "v6"}, want: false},
+		{name: "amd64 has no default variant", a: ocispec.Platform{OS: "linux", Architecture: "amd64"}, b: ocispec.Platform{OS: "linux", Architecture: "amd64", Variant: "v3"}, want: false},
+	}
+	for _, tt := range variants {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := samePlatform(tt.a, tt.b); got != tt.want {
+				t.Fatalf("samePlatform(%+v, %+v) = %v, want %v", tt.a, tt.b, got, tt.want)
+			}
+		})
 	}
 }
