@@ -2067,6 +2067,61 @@ func TestMountsStopAtNearestImageChain(t *testing.T) {
 	}
 }
 
+// TestMountsBaseRecordedByDerivedPull covers a base image whose chain the
+// store first met as a prefix of a derived image's: the derived pull records
+// every chain as a member, so a container over the base's chain mounts what
+// the store holds under it. Nothing, until the base is pulled out of band:
+// the Prepare fails naming ocicfs and leaves the record as it was; once the
+// base is stored, the same Prepare mounts the base's own image.
+func TestMountsBaseRecordedByDerivedPull(t *testing.T) {
+	ctx := context.Background()
+	chainX := digest.FromString("chain-x")
+	chainXY := digest.FromString("chain-xy")
+	chainXYW := digest.FromString("chain-xyw")
+	derived := testImageInfo("derived", chainX, chainXY, chainXYW)
+	engine := fakeEngineForImages(derived)
+	sn := newSnapshotterForTest(t, engine, notMounted)
+	seedChainRecord(t, ctx, sn, chainX.String(), "", derived.Root.String())
+	seedChainRecord(t, ctx, sn, chainXY.String(), chainX.String(), derived.Root.String())
+	seedChainRecord(t, ctx, sn, chainXYW.String(), chainXY.String(), derived.Root.String())
+	before, err := sn.Stat(ctx, chainXY.String())
+	if err != nil {
+		t.Fatalf("Stat(%s) error = %v", chainXY, err)
+	}
+
+	_, err = sn.Prepare(ctx, "container", chainXY.String())
+	if !errdefs.IsFailedPrecondition(err) || !strings.Contains(err.Error(), "pull it with ocicfs") {
+		t.Fatalf("Prepare() over the unstored base error = %v, want failed precondition naming ocicfs", err)
+	}
+	if _, err := sn.Stat(ctx, "container"); !errdefs.IsNotFound(err) {
+		t.Fatalf("Stat(container) error = %v, want not found", err)
+	}
+	if len(engine.builds) != 0 {
+		t.Fatalf("engine NewBuild calls = %+v, want none", engine.builds)
+	}
+	after, err := sn.Stat(ctx, chainXY.String())
+	if err != nil {
+		t.Fatalf("Stat(%s) error = %v", chainXY, err)
+	}
+	if !maps.Equal(after.Labels, before.Labels) {
+		t.Fatalf("base record labels = %v, want unchanged %v", after.Labels, before.Labels)
+	}
+
+	addFakeImage(engine, testImageInfo("base", chainX, chainXY))
+	var calls []mountCall
+	recordMounts(engine, &calls)
+	mounts, err := sn.Prepare(ctx, "container", chainXY.String())
+	if err != nil {
+		t.Fatalf("Prepare() over the stored base error = %v", err)
+	}
+	if len(calls) != 1 || calls[0].chainID != chainXY.String() {
+		t.Fatalf("MountChain calls = %+v, want the base chain %s", calls, chainXY)
+	}
+	if got := optionValue(t, mounts[0], "lowerdir"); got != calls[0].target+"::"+engine.objectsDir {
+		t.Fatalf("lowerdir = %q, want the base image only", got)
+	}
+}
+
 func TestPrepareWithoutImageAncestorFailsClosed(t *testing.T) {
 	ctx := context.Background()
 	sn := newTestSnapshotter(t)

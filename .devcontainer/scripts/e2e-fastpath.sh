@@ -37,6 +37,14 @@ substitution_ref=""
 cold_ref=""
 share_ref=""
 share_more_ref=""
+# pair_base_ref and pair_derived_ref are the runtime's images of the
+# base-after-derived leg while it runs, pair_agent_refs the references the
+# leg's ocicfs pulls put in the store under pair_store; the leg clears them
+# once it has removed them itself.
+pair_base_ref=""
+pair_derived_ref=""
+pair_agent_refs=""
+pair_store=""
 partial_ref=""
 delta_ref=""
 # delta_base_ref is release N of the delta leg while the leg holds it as the
@@ -58,14 +66,15 @@ cleanup() {
 		wait "${pull_pid}" 2>/dev/null || true
 	fi
 	local name
-	for name in cfs-e2e-1 cfs-e2e-2 cfs-e2e-recovery cfs-e2e-cold cfs-e2e-delta; do
+	for name in cfs-e2e-1 cfs-e2e-2 cfs-e2e-recovery cfs-e2e-cold cfs-e2e-delta cfs-e2e-pair; do
 		if docker container inspect "${name}" >/dev/null 2>&1; then
 			docker rm -f "${name}" >/dev/null 2>&1 || echo "warning: failed to remove ${name}" >&2
 		fi
 	done
 	local ref
 	for ref in "${image_ref}" "${unheld_ref}" "${base_ref}" "${substitution_ref}" \
-		"${cold_ref}" "${share_ref}" "${share_more_ref}" "${partial_ref}" "${delta_ref}"; do
+		"${cold_ref}" "${share_ref}" "${share_more_ref}" "${partial_ref}" "${delta_ref}" \
+		"${pair_base_ref}" "${pair_derived_ref}"; do
 		if [ -n "${ref}" ] && docker image inspect "${ref}" >/dev/null 2>&1; then
 			docker rmi -f "${ref}" >/dev/null 2>&1 || echo "warning: failed to remove ${ref}" >&2
 		fi
@@ -89,6 +98,22 @@ cleanup() {
 		done
 		"${OCICFS_BIN}" --root "${WARM_OCICFS_ROOT}" gc >/dev/null 2>&1 ||
 			echo "warning: failed to collect the warm store" >&2
+	fi
+	# The pair leg's agent references live in whichever store the leg ran
+	# against; the runtime's holds on them go with the images removed above,
+	# some time after, so the removal is retried before the store is collected.
+	if [ -n "${pair_agent_refs}" ]; then
+		local tries
+		for ref in ${pair_agent_refs}; do
+			for tries in $(seq 1 30); do
+				"${OCICFS_BIN}" --root "${pair_store}" inspect "${ref}" >/dev/null 2>&1 || break
+				"${OCICFS_BIN}" --root "${pair_store}" remove "${ref}" >/dev/null 2>&1 && break
+				[ "${tries}" -lt 30 ] || echo "warning: failed to remove ${ref} from ${pair_store}" >&2
+				sleep 1
+			done
+		done
+		"${OCICFS_BIN}" --root "${pair_store}" gc >/dev/null 2>&1 ||
+			echo "warning: failed to collect ${pair_store}" >&2
 	fi
 	# Either phase's failure leaves its own daemon running; put the
 	# devcontainer back in its boot posture (staged mode, default stores),
@@ -1106,6 +1131,145 @@ assert_cold_prefix_dedup() {
 	echo "PASS: removing one of two images sharing a chain kept the other's content, removing both reclaimed it"
 }
 
+# assert_rootfs_is_base reads a container's rootfs the way the runtime serves
+# it — an export goes through the snapshotter's mounts — and checks it is the
+# base image's and not its derived image's: the derived image's extra layer
+# adds layer-<n+1>.txt and rewrites shadow.txt, so a rootfs served from the
+# derived chain shows both.
+assert_rootfs_is_base() {
+	local ref="$1" layers="$2" nonce="$3" tar="${work}/pair-rootfs.tar" listing shadow
+	docker create --network=none --name cfs-e2e-pair "${ref}" /hello >/dev/null ||
+		fail "cannot create a container from the base image"
+	docker export -o "${tar}" cfs-e2e-pair || fail "cannot export the base container's rootfs"
+	docker rm cfs-e2e-pair >/dev/null || fail "cannot remove the exported base container"
+	listing="$(tar -tf "${tar}")" || fail "cannot list the exported base rootfs"
+	grep -Fxq "layer-${layers}.txt" <<<"${listing}" || fail "the base rootfs lacks its own last layer"
+	! grep -Fxq "layer-$((layers + 1)).txt" <<<"${listing}" ||
+		fail "the base rootfs carries the derived image's extra layer"
+	shadow="$(tar -xOf "${tar}" shadow.txt | head -n1)" || fail "cannot read shadow.txt from the base rootfs"
+	[ "${shadow}" = "cfs e2e shadow ${layers} ${nonce}" ] ||
+		fail "shadow.txt reads \"${shadow}\", want the base image's version"
+}
+
+# assert_base_after_derived pulls a base image after an image derived from it
+# — one layer longer, seeded from the same nonce, so the base's whole chain
+# is a prefix of the derived one's — and runs the base. The base's own pull
+# never reaches the snapshotter: containerd finds every chain of the base
+# recorded by the derived pull and reports it unpacked without a handshake,
+# fetching no layer. What the base's first container meets is therefore the
+# derived pull's record of that chain. In out-of-band mode that record is a
+# chain member and the container mounts whatever the store holds under the
+# chain: the base, when the agent pulled it, otherwise nothing — the run
+# fails until the agent pulls the base, with no restart and no re-pull. In
+# staged mode the record is a staged one that was never built, and the first
+# container promotes it: the base is built from the content store, or found
+# already in the store, and held by its own record from then on, outliving
+# the derived image and going with its own removal. prepull is whether the
+# agent pulled the base before the runtime did. The derived image enters the
+# store the way its mode admits: pulled by the agent out of band, built by
+# the runtime's own pull in staged mode — and by the agent as well when the
+# base is, so an agent's pair is one pair.
+assert_base_after_derived() {
+	local nonce="$1" mode="$2" prepull="$3" layers=2
+	local pair_nonce="${nonce}-${mode}-pre${prepull}" flavor="not pre-pulled"
+	local base_repo="cfs/e2e-pair-base" derived_repo="cfs/e2e-pair-derived"
+	local base_layout="${work}/pair-base-${mode}-${prepull}"
+	local derived_layout="${work}/pair-derived-${mode}-${prepull}"
+	local base_root derived_root base_first derived_first offset applies digest output
+	[ "${prepull}" = 0 ] || flavor="pre-pulled"
+
+	seed_image "${pair_nonce}" "${REGISTRY}/${base_repo}:${pair_nonce}" "${layers}" "${base_layout}"
+	seed_image "${pair_nonce}" "${REGISTRY}/${derived_repo}:${pair_nonce}" "$((layers + 1))" "${derived_layout}"
+	pair_base_ref="$(pinned_ref "${REGISTRY}/${base_repo}" "${base_layout}")" || fail "cannot pin the pair's base ref"
+	pair_derived_ref="$(pinned_ref "${REGISTRY}/${derived_repo}" "${derived_layout}")" ||
+		fail "cannot pin the pair's derived ref"
+	base_root="$(manifest_digest "${base_layout}")" || fail "cannot read the base manifest digest"
+	derived_root="$(manifest_digest "${derived_layout}")" || fail "cannot read the derived manifest digest"
+	base_first="$(first_diff_id "${base_layout}")" || fail "cannot read the base diffID"
+	derived_first="$(first_diff_id "${derived_layout}")" || fail "cannot read the derived diffID"
+	[ "${base_first}" = "${derived_first}" ] || fail "the base is not a prefix of the derived image"
+
+	pair_store="${ocicfs_root}"
+	if [ "${mode}" = out-of-band ] || [ "${prepull}" = 1 ]; then
+		pair_agent_refs="${derived_repo}@${derived_root}"
+		stage_image "${derived_repo}" "${derived_layout}"
+	fi
+	if [ "${prepull}" = 1 ]; then
+		pair_agent_refs="${pair_agent_refs} ${base_repo}@${base_root}"
+		stage_image "${base_repo}" "${base_layout}"
+	fi
+	docker pull "${pair_derived_ref}" >/dev/null || fail "docker pull of the derived image failed"
+	[ "$(image_bindings "${derived_root}")" -eq 1 ] ||
+		fail "the derived image's pull did not leave exactly one composefs image"
+
+	offset="$(wc -l <"${CFS_LOG}")"
+	docker pull "${pair_base_ref}" >/dev/null || fail "docker pull of the base after the derived image failed"
+	applies="$(tail -n "+$((offset + 1))" "${CFS_LOG}" | grep -c '"cfs differ: applied staged layer"' || true)"
+	[ "${applies}" -eq 0 ] || fail "the base's pull applied ${applies} layers although its chain was recorded"
+	if [ "${mode}" = out-of-band ]; then
+		while read -r digest; do
+			content_has "${digest}" && fail "a layer was fetched: ${digest}"
+		done < <(jq -r '.layers[].digest' "${derived_layout}/blobs/sha256/${derived_root#sha256:}")
+	fi
+	if [ "${prepull}" = 1 ]; then
+		[ "$(image_bindings "${base_root}")" -eq 1 ] || fail "the base's pull built a second composefs image"
+	else
+		no_image_binding "${base_root}" || fail "the base's pull built it although its chain was recorded"
+		if [ "${mode}" = out-of-band ]; then
+			if output="$(docker run --network=none --name cfs-e2e-pair "${pair_base_ref}" 2>&1)"; then
+				fail "docker run of a base the store does not hold succeeded: ${output}"
+			fi
+			grep -Fq 'pull it with ocicfs before running the container' <<<"${output}" ||
+				fail "docker run of the unheld base did not fail at the chain mount: ${output}"
+			if docker container inspect cfs-e2e-pair >/dev/null 2>&1; then
+				docker rm -f cfs-e2e-pair >/dev/null || fail "cannot remove the failed base container"
+			fi
+			no_image_binding "${base_root}" || fail "the failed run built the base into the store"
+			pair_agent_refs="${pair_agent_refs} ${base_repo}@${base_root}"
+			stage_image "${base_repo}" "${base_layout}"
+		fi
+	fi
+
+	output="$(docker run --rm --network=none "${pair_base_ref}")" ||
+		fail "docker run of the base pulled after the derived image failed"
+	[ "${output}" = "cfs hello ${pair_nonce}" ] || fail "unexpected container output: ${output}"
+	assert_rootfs_is_base "${pair_base_ref}" "${layers}" "${pair_nonce}"
+	[ "$(image_bindings "${base_root}")" -eq 1 ] || fail "the base is not exactly one composefs image in the store"
+	if [ "${mode}" = staged ]; then
+		tail -n "+$((offset + 1))" "${CFS_LOG}" | grep -q '"cfs snapshotter: promoted recorded chain"' ||
+			fail "the base's first container did not promote its chain record"
+		# The promotion holds the base under its record: an agent's image
+		# gains the hold and cannot be removed, a built one is named by it.
+		if [ "${prepull}" = 1 ]; then
+			assert_ocicfs_remove_declines "${base_repo}@${base_root}"
+		else
+			[ -n "$(ocicfs_holder_of_digest "${base_root}")" ] ||
+				fail "the promoted base is not held by a runtime reference"
+		fi
+	else
+		! tail -n "+$((offset + 1))" "${CFS_LOG}" | grep -q '"cfs snapshotter: promoted recorded chain"' ||
+			fail "an out-of-band daemon promoted a chain record"
+	fi
+
+	docker rmi "${pair_derived_ref}" >/dev/null || fail "docker rmi of the derived image failed"
+	[ "$(image_bindings "${base_root}")" -eq 1 ] || fail "the base was reclaimed with the derived image"
+	output="$(docker run --rm --network=none "${pair_base_ref}")" ||
+		fail "docker run of the base after the derived image was removed failed"
+	[ "${output}" = "cfs hello ${pair_nonce}" ] || fail "unexpected container output: ${output}"
+	docker rmi "${pair_base_ref}" >/dev/null || fail "docker rmi of the base failed"
+	if [ "${mode}" = staged ] && [ "${prepull}" = 0 ]; then
+		no_image_binding "${base_root}" || fail "the promoted base survived its removal from the runtime"
+		no_image_binding "${derived_root}" || fail "the derived image survived its removal from the runtime"
+	else
+		ocicfs_remove_when_released "${base_repo}@${base_root}"
+		ocicfs_remove_when_released "${derived_repo}@${derived_root}"
+	fi
+	pair_base_ref=""
+	pair_derived_ref=""
+	pair_agent_refs=""
+	echo "PASS: ${mode} mode, base ${flavor}: a base pulled after its derived image ran as the base"
+}
+
 # assert_staged_rmi_reclaims covers the runtime dropping a staged image: the
 # removal releases the snapshotter's hold and collects the store inside the
 # same docker command, so by the time `docker rmi` returns the image is gone
@@ -1330,6 +1494,8 @@ warm_phase() {
 	assert_warm_hold_released
 	assert_warm_tag_identity "${nonce}"
 	assert_delta_fast_path
+	assert_base_after_derived "${nonce}" out-of-band 1
+	assert_base_after_derived "${nonce}" out-of-band 0
 }
 
 cold_phase() {
@@ -1358,6 +1524,8 @@ cold_phase() {
 	assert_cold_repull_refetches "${nonce}"
 	assert_staged_rmi_reclaims
 	assert_cold_prefix_dedup "${nonce}"
+	assert_base_after_derived "${nonce}" staged 1
+	assert_base_after_derived "${nonce}" staged 0
 	assert_interrupted_pull_converges "${nonce}"
 	assert_cold_mixed_door "${nonce}"
 	assert_staged_adoption "${nonce}"
@@ -1382,8 +1550,8 @@ mounts it into the container (a container started any other way has none)"
 	warm_phase "${nonce}"
 	cold_phase "${nonce}"
 	echo "E2E PASS: handshake identity, real content, recovery, concurrency, teardown," \
-		"tamper enforcement, holds, tag identity, delta fast path, cold conversion, rmi reclaim, dedup," \
-		"interrupted-pull recovery, mixed-door identity, adoption, self-heal, and worker-count identity"
+		"tamper enforcement, holds, tag identity, delta fast path, base after derived, cold conversion," \
+		"rmi reclaim, dedup, interrupted-pull recovery, mixed-door identity, adoption, self-heal, and worker-count identity"
 }
 
 main "$@"
