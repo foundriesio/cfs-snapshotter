@@ -4,15 +4,18 @@
 package snapshot
 
 import (
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"runtime"
 	"slices"
 	"strings"
 	"time"
 
 	"github.com/containerd/containerd/v2/core/diff"
+	"github.com/containerd/containerd/v2/core/images"
 	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/containerd/containerd/v2/core/snapshots"
 	"github.com/containerd/containerd/v2/core/snapshots/storage"
@@ -141,19 +144,29 @@ func (s *snapshotter) stagingLabels(ctx context.Context, key string) (map[string
 // daemon restart included — and the record releases the holder when it is
 // removed uncommitted, as an unwound pull's is.
 func (s *snapshotter) markLeaf(ctx context.Context, key string, root digest.Digest, holder string) error {
-	err := s.ms.WithTransaction(ctx, true, func(ctx context.Context) error {
-		mark := snapshots.Info{Name: key, Labels: map[string]string{
-			leafLabel:       "true",
-			rootDigestLabel: root.String(),
-			holderLabel:     holder,
-		}}
-		_, err := storage.UpdateInfo(ctx, mark, "labels."+leafLabel, "labels."+rootDigestLabel, "labels."+holderLabel)
-		return err
+	err := s.setLabels(ctx, key, map[string]string{
+		leafLabel:       "true",
+		rootDigestLabel: root.String(),
+		holderLabel:     holder,
 	})
 	if err != nil {
 		return fmt.Errorf("mark staging snapshot %q as the image's last layer: %w", key, err)
 	}
 	return nil
+}
+
+// setLabels writes the given labels on the snapshot record under key in one
+// transaction, leaving every other label of the record as it is. An empty
+// value removes the label.
+func (s *snapshotter) setLabels(ctx context.Context, key string, labels map[string]string) error {
+	fieldpaths := make([]string, 0, len(labels))
+	for k := range labels {
+		fieldpaths = append(fieldpaths, "labels."+k)
+	}
+	return s.ms.WithTransaction(ctx, true, func(ctx context.Context) error {
+		_, err := s.updateInfo(ctx, snapshots.Info{Name: key, Labels: labels}, fieldpaths...)
+		return err
+	})
 }
 
 // stagedLayer is where a staged record's layer sits in the image its pull is
@@ -237,6 +250,194 @@ func (l stagedLayer) bind(desc ocispec.Descriptor) error {
 		return fmt.Errorf("layer %s has size %d, image %q declares %d: %w", desc.Digest, desc.Size, l.imageRef, l.desc.Size, errdefs.ErrFailedPrecondition)
 	}
 	return nil
+}
+
+// loadedManifest is one image manifest of the host's platform that the
+// runtime's image records name: which manifest, under which names, and the
+// layers and layer chains it describes.
+type loadedManifest struct {
+	root   digest.Digest
+	names  []string
+	layers []ocispec.Descriptor
+	chains []digest.Digest
+}
+
+// loadedManifests reads every host-platform image manifest the namespace's
+// image records name, out of containerd, ordered by manifest digest. A record
+// targets a manifest directly or through an index, whose image manifests are
+// taken one level down. A manifest whose config describes no layers, or
+// describes another platform, is not an image this host runs, and a record,
+// index entry or config the content store does not hold is a platform the
+// runtime did not import; both are passed over. The names of every record
+// that leads to a manifest are collected on it.
+func (s *snapshotter) loadedManifests(ctx context.Context) ([]loadedManifest, error) {
+	records, err := s.blobs.ListImages(ctx)
+	if err != nil {
+		return nil, err
+	}
+	byRoot := map[digest.Digest]*loadedManifest{}
+	for _, record := range records {
+		target, err := digest.Parse(record.GetTarget().GetDigest())
+		if err != nil {
+			return nil, fmt.Errorf("image record %q: %w", record.GetName(), err)
+		}
+		roots, err := s.manifestsOf(ctx, record.GetTarget().GetMediaType(), target)
+		if err != nil {
+			return nil, fmt.Errorf("resolve image record %q: %w", record.GetName(), err)
+		}
+		for _, root := range roots {
+			m, seen := byRoot[root]
+			if !seen {
+				m, err = s.readLoadedManifest(ctx, root)
+				if err != nil {
+					return nil, fmt.Errorf("read manifest %s of image record %q: %w", root, record.GetName(), err)
+				}
+				byRoot[root] = m
+			}
+			if m != nil {
+				m.names = append(m.names, record.GetName())
+			}
+		}
+	}
+	manifests := make([]loadedManifest, 0, len(byRoot))
+	for _, m := range byRoot {
+		if m != nil {
+			manifests = append(manifests, *m)
+		}
+	}
+	slices.SortFunc(manifests, func(a, b loadedManifest) int { return strings.Compare(a.root.String(), b.root.String()) })
+	return manifests, nil
+}
+
+// manifestsOf returns the image manifests an image record's target names:
+// the target itself when it is a manifest, or the image-manifest entries of
+// the index it is. A target of any other kind, or an index the content store
+// does not hold, names none.
+func (s *snapshotter) manifestsOf(ctx context.Context, mediaType string, target digest.Digest) ([]digest.Digest, error) {
+	if images.IsManifestType(mediaType) {
+		return []digest.Digest{target}, nil
+	}
+	if !images.IsIndexType(mediaType) {
+		return nil, nil
+	}
+	var index ocispec.Index
+	if err := s.decodeBlob(ctx, target, &index); err != nil {
+		if errdefs.IsNotFound(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var roots []digest.Digest
+	for _, desc := range index.Manifests {
+		if images.IsManifestType(desc.MediaType) {
+			roots = append(roots, desc.Digest)
+		}
+	}
+	return roots, nil
+}
+
+// readLoadedManifest reads the manifest root names and its config out of the
+// content store. It returns nil for a manifest or config the store does not
+// hold, a config that declares no layers or a layer count the manifest does
+// not match, or a platform that is not the host's.
+func (s *snapshotter) readLoadedManifest(ctx context.Context, root digest.Digest) (*loadedManifest, error) {
+	var manifest ocispec.Manifest
+	if err := s.decodeBlob(ctx, root, &manifest); err != nil {
+		if errdefs.IsNotFound(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var config ocispec.Image
+	if err := s.decodeBlob(ctx, manifest.Config.Digest, &config); err != nil {
+		if errdefs.IsNotFound(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("read image config %s: %w", manifest.Config.Digest, err)
+	}
+	diffIDs := config.RootFS.DiffIDs
+	if len(diffIDs) == 0 || len(diffIDs) != len(manifest.Layers) || !hostPlatformConfig(&config) {
+		return nil, nil
+	}
+	// ChainIDs rewrites its argument in place.
+	chains := identity.ChainIDs(slices.Clone(diffIDs))
+	return &loadedManifest{root: root, layers: manifest.Layers, chains: chains}, nil
+}
+
+// hostPlatformConfig reports whether an image config describes the platform
+// this snapshotter runs on, which is the only platform the ocicfs store
+// builds an image for.
+func hostPlatformConfig(config *ocispec.Image) bool {
+	return samePlatform(ocispec.Platform{OS: runtime.GOOS, Architecture: runtime.GOARCH}, config.Platform)
+}
+
+// samePlatform compares two platforms by OS, architecture and variant, where
+// an unstated variant stands for the architecture's default one (v8 on
+// arm64, v7 on arm): a config naming the default variant matches a host that
+// names none.
+func samePlatform(a, b ocispec.Platform) bool {
+	if a.OS != b.OS || a.Architecture != b.Architecture {
+		return false
+	}
+	var defaultVariant string
+	switch a.Architecture {
+	case "arm64":
+		defaultVariant = "v8"
+	case "arm":
+		defaultVariant = "v7"
+	}
+	return cmp.Or(a.Variant, defaultVariant) == cmp.Or(b.Variant, defaultVariant)
+}
+
+// buildableManifest picks the manifest an image whose full layer chain is
+// chainID is built from: of the manifests whose last chain it is, the first
+// in digest order whose every layer blob the content store holds. The
+// digest order makes the choice the same on every call, whatever order the
+// records were listed in; a manifest missing a blob could not be built and
+// is passed over for one that can.
+func (s *snapshotter) buildableManifest(ctx context.Context, manifests []loadedManifest, chainID string) (loadedManifest, bool, error) {
+	for _, m := range manifests {
+		if m.chains[len(m.chains)-1].String() != chainID {
+			continue
+		}
+		complete := true
+		for _, layer := range m.layers {
+			present, err := s.blobs.Has(ctx, layer.Digest)
+			if err != nil {
+				return loadedManifest{}, false, err
+			}
+			if !present {
+				complete = false
+				break
+			}
+		}
+		if complete {
+			return m, true, nil
+		}
+	}
+	return loadedManifest{}, false, nil
+}
+
+// loadedImageRef is the reference an image built from a loaded manifest is
+// recorded under in the ocicfs store: the smallest of the names the runtime
+// knows it by that is not digest-qualified, or the manifest digest itself
+// when every name is — a digest the store lists as it stands, where a
+// digest-qualified name would be rewritten into a registry path it never
+// came from.
+func loadedImageRef(m loadedManifest) string {
+	ref := ""
+	for _, name := range m.names {
+		if strings.Contains(name, "@") {
+			continue
+		}
+		if ref == "" || name < ref {
+			ref = name
+		}
+	}
+	if ref == "" {
+		return m.root.String()
+	}
+	return ref
 }
 
 // decodeBlob reads the JSON document dgst names out of containerd's content

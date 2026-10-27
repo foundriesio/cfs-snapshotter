@@ -95,6 +95,7 @@ import (
 	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/containerd/containerd/v2/core/snapshots"
 	"github.com/containerd/containerd/v2/core/snapshots/storage"
+	"github.com/containerd/containerd/v2/pkg/namespaces"
 	"github.com/containerd/errdefs"
 	"github.com/containerd/log"
 	"github.com/foundriesio/ocicfs/pkg/ocicfs"
@@ -199,11 +200,18 @@ type snapshotter struct {
 	// mounted reports whether a path is a mount point; it is mountinfo.Mounted
 	// in production and is replaced in tests.
 	mounted func(string) (bool, error)
+	// updateInfo writes a record's labels inside a transaction; it is
+	// storage.UpdateInfo in production and is replaced in tests.
+	updateInfo func(context.Context, snapshots.Info, ...string) (snapshots.Info, error)
 	// allowUnstagedPulls stages every pull instead of admitting only images
 	// already in the ocicfs store.
 	allowUnstagedPulls bool
 	// mountMu serializes shared chain mount creation and teardown.
 	mountMu sync.Mutex
+	// promoteMu serializes the promotion of recorded chains into chain
+	// members (see promoteStagedRecord): a promotion builds an image, and
+	// two callers reaching one record must publish one image, not two.
+	promoteMu sync.Mutex
 	// builds are the image builds in progress, one per staged pull, each
 	// fed a layer at a time as the differ applies the chain. buildMu guards
 	// the map and the start of a build, and is released before a build is
@@ -338,6 +346,7 @@ func newSnapshotter(ctx context.Context, cfg Config, engine engineAPI) (*snapsho
 		engine:             engine,
 		blobs:              newContentBlobs(cfg.ContainerdAddress),
 		mounted:            mountinfo.Mounted,
+		updateInfo:         storage.UpdateInfo,
 		allowUnstagedPulls: cfg.AllowUnstagedPulls,
 		builds:             make(map[buildKey]*openBuild),
 		finishing:          make(map[string]*openBuild),
@@ -506,8 +515,10 @@ func (s *snapshotter) reclaim() {
 // (NewBuild), pinning what it hands containerd for as long as containerd
 // references it (Hold, Release, and Holds to reconcile them at startup), and
 // reclaiming what nothing pins any more (GC). Building happens in the
-// differ's Apply, a layer at a time as the runtime fetches the chain; a
-// Prepare still never reaches for content over the network.
+// differ's Apply, a layer at a time as the runtime fetches the chain, and in
+// a container's Prepare for a chain the runtime recorded without ever having
+// it built, whole from the runtime's content store; a Prepare still never
+// reaches for content over the network.
 // Publish and Remove are deliberately excluded — the snapshotter publishes
 // nothing and forgets nobody's reference — so snapshotter code cannot
 // casually reach for them: the one thing that deletes image data is the
@@ -1260,17 +1271,32 @@ type ancestor struct {
 // The chain member is mounted by the chainID its snapshot.ref label records,
 // never by its own name: a chain snapshot committed by the caller is named for
 // the caller's own bookkeeping, and only the label names the image content.
+//
+// A committed staged record that is no chain member is the chain of an image
+// the runtime never had the snapshotter build — its chain already existed as
+// a prefix of a longer image's when the runtime unpacked it, so the unpacker
+// skipped every layer. The walk reaching it means a container wants exactly
+// that image, so the record is promoted into a chain member first (see
+// promoteStagedRecord) and then ends the walk like any other.
 func (s *snapshotter) composeLowers(ctx context.Context, ancestors []ancestor) ([]string, bool, error) {
 	lowers := make([]string, 0, len(ancestors))
 	for _, a := range ancestors {
 		dir := s.getSnapshotDir(a.id)
-		if !isChainMember(a.labels, dir) {
+		var chainID string
+		switch {
+		case isChainMember(a.labels, dir):
+			chainID = a.labels[intermediateSnapshotLabel]
+			if chainID == "" {
+				return nil, false, fmt.Errorf("image snapshot %s names no layer chain in its %s label: %w", a.name, intermediateSnapshotLabel, errdefs.ErrFailedPrecondition)
+			}
+		case a.labels[stagingLabel] != "":
+			var err error
+			if chainID, err = s.promoteStagedRecord(ctx, a.name); err != nil {
+				return nil, false, err
+			}
+		default:
 			lowers = append(lowers, filepath.Join(dir, "upper"))
 			continue
-		}
-		chainID := a.labels[intermediateSnapshotLabel]
-		if chainID == "" {
-			return nil, false, fmt.Errorf("image snapshot %s names no layer chain in its %s label: %w", a.name, intermediateSnapshotLabel, errdefs.ErrFailedPrecondition)
 		}
 		fsDir := filepath.Join(dir, "fs")
 		if err := s.ensureChainMounted(ctx, chainID, fsDir); err != nil {
@@ -1279,6 +1305,106 @@ func (s *snapshotter) composeLowers(ctx context.Context, ancestors []ancestor) (
 		return append(lowers, fsDir), true, nil
 	}
 	return lowers, false, nil
+}
+
+// promoteStagedRecord makes the committed staged record under name a chain
+// member standing for the image whose full layer chain the record's
+// snapshot.ref label names, and returns that chain. The image is built whole
+// from the runtime's content store: the namespace's image records are walked
+// for the manifests ending in the chain, and the first in digest order whose
+// every layer blob is present is built and held under the record's own
+// holder, exactly as a pull's last layer would have been. The record then
+// publishes the chain-member marker, the root and holder of its hold and the
+// built image's identity in one write of those labels alone — a write of the
+// whole label set would race the runtime's own label updates on the record
+// — and drops its staging marker. A daemon that builds nothing from runtime
+// content declines instead.
+//
+// Promotions are serialized, and the record is read again under the lock,
+// so a second caller reaching the record while the first builds finds the
+// published member rather than choosing an image of its own. A build that
+// fails leaves the record as it was and what it wrote to the next
+// collection, and the next container over the record tries again. The
+// hold the build takes is released on every failure after the build began,
+// whether the build or the publish failed, because a build can fail with
+// its hold already written; the release runs on a context the caller
+// cannot have cancelled, since a release that does not happen leaves a
+// root held under a holder no record names.
+func (s *snapshotter) promoteStagedRecord(ctx context.Context, name string) (string, error) {
+	s.promoteMu.Lock()
+	defer s.promoteMu.Unlock()
+
+	var labels map[string]string
+	err := s.ms.WithTransaction(ctx, false, func(ctx context.Context) error {
+		_, info, _, err := storage.GetInfo(ctx, name)
+		labels = info.Labels
+		return err
+	})
+	if err != nil {
+		return "", fmt.Errorf("resolve recorded chain snapshot %s: %w", name, err)
+	}
+	chainID := labels[intermediateSnapshotLabel]
+	if chainID == "" {
+		return "", fmt.Errorf("image snapshot %s names no layer chain in its %s label: %w", name, intermediateSnapshotLabel, errdefs.ErrFailedPrecondition)
+	}
+	if labels[chainMemberLabel] != "" {
+		return chainID, nil
+	}
+	if !s.allowUnstagedPulls {
+		return "", fmt.Errorf("image chain %s is recorded but not held by the ocicfs store; this daemon does not build from runtime content: pull it with ocicfs: %w", chainID, errdefs.ErrFailedPrecondition)
+	}
+	ns, err := namespaces.NamespaceRequired(ctx)
+	if err != nil {
+		return "", fmt.Errorf("promote recorded chain %s: %w", chainID, err)
+	}
+	manifests, err := s.loadedManifests(ctx)
+	if err != nil {
+		return "", fmt.Errorf("find an image for recorded chain %s: %w", chainID, err)
+	}
+	m, ok, err := s.buildableManifest(ctx, manifests, chainID)
+	if err != nil {
+		return "", fmt.Errorf("find an image for recorded chain %s: %w", chainID, err)
+	}
+	if !ok {
+		return "", fmt.Errorf("image chain %s is recorded but was never built, and no loaded image with its content provides it; pull it with ocicfs or re-load it: %w", chainID, errdefs.ErrFailedPrecondition)
+	}
+
+	start := time.Now()
+	ref := loadedImageRef(m)
+	holder := recordHolder(name)
+	build, err := s.engine.NewBuild(ctx, ref,
+		ocicfs.WithBlobSource(s.blobs), ocicfs.WithResolvedRoot(m.root), ocicfs.WithHold(holder))
+	if err != nil {
+		s.collectSoon()
+		return "", fmt.Errorf("begin building image %q for recorded chain %s: %w", ref, chainID, err)
+	}
+	if _, err := build.Finish(ctx); err != nil {
+		s.releaseHold(context.WithoutCancel(ctx), m.root.String(), holder)
+		s.collectSoon()
+		return "", fmt.Errorf("build image %q for recorded chain %s: %w", ref, chainID, err)
+	}
+	err = s.setLabels(ctx, name, map[string]string{
+		chainMemberLabel:    "true",
+		rootDigestLabel:     m.root.String(),
+		holderLabel:         holder,
+		imageRefLabel:       ref,
+		manifestDigestLabel: m.root.String(),
+		stagingLabel:        "",
+	})
+	if err != nil {
+		s.releaseHold(context.WithoutCancel(ctx), m.root.String(), holder)
+		s.collectSoon()
+		return "", fmt.Errorf("publish recorded chain %s as a chain member: %w", chainID, err)
+	}
+	log.G(ctx).WithFields(log.Fields{
+		"name":      name,
+		"namespace": ns,
+		"chain":     chainID,
+		"image":     ref,
+		"root":      m.root,
+		"elapsed":   time.Since(start).Seconds(),
+	}).Info("cfs snapshotter: promoted recorded chain")
+	return chainID, nil
 }
 
 // isChainMember reports whether an ancestor snapshot stands for an image layer
