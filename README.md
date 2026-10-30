@@ -17,7 +17,9 @@ container rootfs from content-addressed, composefs-backed storage — using
 > pinned by digest — and declines every other pull; the pulls it admits
 > download no layers (`ctr` and `docker` still fetch the image metadata:
 > index, manifest, config, etc.). Either way a container gets the same
-> mounts.
+> mounts. For offline use, staged mode needs only `docker load`; out-of-band
+> mode needs `ocicfs pull --from-tar` first. See the
+> [offline loading guide](docs/running.md#loading-images-offline-docker-load).
 
 ## Install or build
 
