@@ -3949,7 +3949,7 @@ func TestPreparePromotionOutOfBand(t *testing.T) {
 	sn := newConfiguredSnapshotter(t, Config{Root: root}, engine, notMounted)
 	sn.blobs.client, sn.blobs.images = staged.blobs.client, staged.blobs.images
 	_, err := sn.Prepare(ctx, "moby/9/container-init", d.base)
-	if !errdefs.IsFailedPrecondition(err) || !strings.Contains(err.Error(), "pull it with ocicfs") {
+	if !errdefs.IsFailedPrecondition(err) || !strings.Contains(err.Error(), "use ocicfs pull") {
 		t.Fatalf("Prepare(container-init) error = %v, want failed precondition naming ocicfs", err)
 	}
 	if len(engine.builds) != 1 {

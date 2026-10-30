@@ -90,6 +90,7 @@
 package snapshot
 
 import (
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"errors"
@@ -1360,29 +1361,14 @@ func (s *snapshotter) composeLowers(ctx context.Context, ancestors []ancestor) (
 	return lowers, false, nil
 }
 
-// promoteStagedRecord makes the committed staged record under name a chain
-// member standing for the image whose full layer chain the record's
-// snapshot.ref label names, and returns that chain. The image is built whole
-// from the runtime's content store: the namespace's image records are walked
-// for the manifests ending in the chain, and the first in digest order whose
-// every layer blob is present is built and held under the record's own
-// holder, exactly as a pull's last layer would have been. The record then
-// publishes the chain-member marker, the root and holder of its hold and the
-// built image's identity in one write of those labels alone — a write of the
-// whole label set would race the runtime's own label updates on the record
-// — and drops its staging marker. A daemon that builds nothing from runtime
-// content declines instead.
+// promoteStagedRecord makes a staged chain usable as a container's image.
+// It adopts a stored image ending at the chain or, in staged mode, builds
+// one from complete content in containerd's content store. A stored prefix
+// alone is not enough.
 //
-// Promotions are serialized, and the record is read again under the lock,
-// so a second caller reaching the record while the first builds finds the
-// published member rather than choosing an image of its own. A build that
-// fails leaves the record as it was and what it wrote to the next
-// collection, and the next container over the record tries again. The
-// hold the build takes is released on every failure after the build began,
-// whether the build or the publish failed, because a build can fail with
-// its hold already written; the release runs on a context the caller
-// cannot have cancelled, since a release that does not happen leaves a
-// root held under a holder no record names.
+// Promotions are serialized and recheck the record to avoid duplicate work.
+// Only promotion labels are updated, preserving concurrent label changes.
+// Failure leaves the record retryable and releases any newly taken hold.
 func (s *snapshotter) promoteStagedRecord(ctx context.Context, name string) (string, error) {
 	s.promoteMu.Lock()
 	defer s.promoteMu.Unlock()
@@ -1403,12 +1389,40 @@ func (s *snapshotter) promoteStagedRecord(ctx context.Context, name string) (str
 	if labels[chainMemberLabel] != "" {
 		return chainID, nil
 	}
-	if !s.allowUnstagedPulls {
-		return "", fmt.Errorf("image chain %s is recorded but not held by the ocicfs store; this daemon does not build from runtime content: pull it with ocicfs: %w", chainID, errdefs.ErrFailedPrecondition)
-	}
 	ns, err := namespaces.NamespaceRequired(ctx)
 	if err != nil {
 		return "", fmt.Errorf("promote recorded chain %s: %w", chainID, err)
+	}
+	start := time.Now()
+	holder := recordHolder(name)
+	candidates, _, err := s.storedChain(ctx, chainID)
+	if err != nil {
+		return "", fmt.Errorf("look up recorded chain %s in the ocicfs store: %w", chainID, err)
+	}
+	stored, info, err := s.holdStored(ctx, candidates, chainID, holder)
+	if err != nil {
+		return "", err
+	}
+	if info != nil {
+		// An image the store holds by digest alone is named by its digest:
+		// an empty value would remove the label.
+		ref := cmp.Or(stored.Ref, info.Root.String())
+		if err := s.publishPromotion(ctx, name, chainID, info.Root, holder, ref); err != nil {
+			return "", err
+		}
+		log.G(ctx).WithFields(log.Fields{
+			"name":      name,
+			"namespace": ns,
+			"chain":     chainID,
+			"image":     ref,
+			"root":      info.Root,
+			"source":    "store",
+			"elapsed":   time.Since(start).Seconds(),
+		}).Info("cfs snapshotter: promoted recorded chain")
+		return chainID, nil
+	}
+	if !s.allowUnstagedPulls {
+		return "", fmt.Errorf("image unavailable for layer chain %s: this snapshotter requires it in the ocicfs store; use ocicfs pull <image>: %w", chainID, errdefs.ErrFailedPrecondition)
 	}
 	manifests, err := s.loadedManifests(ctx)
 	if err != nil {
@@ -1419,12 +1433,10 @@ func (s *snapshotter) promoteStagedRecord(ctx context.Context, name string) (str
 		return "", fmt.Errorf("find an image for recorded chain %s: %w", chainID, err)
 	}
 	if !ok {
-		return "", fmt.Errorf("image chain %s is recorded but was never built, and no loaded image with its content provides it; pull it with ocicfs or re-load it: %w", chainID, errdefs.ErrFailedPrecondition)
+		return "", fmt.Errorf("image unavailable for layer chain %s: missing from ocicfs and no complete local image for this host; use ocicfs pull <image> or docker load -i <archive>: %w", chainID, errdefs.ErrFailedPrecondition)
 	}
 
-	start := time.Now()
 	ref := loadedImageRef(m)
-	holder := recordHolder(name)
 	build, err := s.engine.NewBuild(ctx, ref,
 		ocicfs.WithBlobSource(s.blobs), ocicfs.WithResolvedRoot(m.root), ocicfs.WithHold(holder))
 	if err != nil {
@@ -1436,18 +1448,8 @@ func (s *snapshotter) promoteStagedRecord(ctx context.Context, name string) (str
 		s.collectSoon()
 		return "", fmt.Errorf("build image %q for recorded chain %s: %w", ref, chainID, err)
 	}
-	err = s.setLabels(ctx, name, map[string]string{
-		chainMemberLabel:    "true",
-		rootDigestLabel:     m.root.String(),
-		holderLabel:         holder,
-		imageRefLabel:       ref,
-		manifestDigestLabel: m.root.String(),
-		stagingLabel:        "",
-	})
-	if err != nil {
-		s.releaseHold(context.WithoutCancel(ctx), m.root.String(), holder)
-		s.collectSoon()
-		return "", fmt.Errorf("publish recorded chain %s as a chain member: %w", chainID, err)
+	if err := s.publishPromotion(ctx, name, chainID, m.root, holder, ref); err != nil {
+		return "", err
 	}
 	log.G(ctx).WithFields(log.Fields{
 		"name":      name,
@@ -1455,9 +1457,30 @@ func (s *snapshotter) promoteStagedRecord(ctx context.Context, name string) (str
 		"chain":     chainID,
 		"image":     ref,
 		"root":      m.root,
+		"source":    "content",
 		"elapsed":   time.Since(start).Seconds(),
 	}).Info("cfs snapshotter: promoted recorded chain")
 	return chainID, nil
+}
+
+// publishPromotion records the held image on the snapshot and clears its
+// staging marker. If publication fails, it releases the unowned hold even
+// after cancellation and schedules collection.
+func (s *snapshotter) publishPromotion(ctx context.Context, name, chainID string, root digest.Digest, holder, ref string) error {
+	err := s.setLabels(ctx, name, map[string]string{
+		chainMemberLabel:    "true",
+		rootDigestLabel:     root.String(),
+		holderLabel:         holder,
+		imageRefLabel:       ref,
+		manifestDigestLabel: root.String(),
+		stagingLabel:        "",
+	})
+	if err != nil {
+		s.releaseHold(context.WithoutCancel(ctx), root.String(), holder)
+		s.collectSoon()
+		return fmt.Errorf("publish recorded chain %s as a chain member: %w", chainID, err)
+	}
+	return nil
 }
 
 // isChainMember reports whether an ancestor snapshot stands for an image layer

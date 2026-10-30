@@ -539,3 +539,136 @@ func TestApplyHalfLabeledRecordStaysOnPullPath(t *testing.T) {
 		t.Fatalf("holds = %+v, builds = %+v, want nothing", engine.holds, engine.builds)
 	}
 }
+
+// TestPreparePromotionAdoptsLateStoredBase covers a base sideloaded after
+// its derived image was loaded: the load left the base's chain a plain
+// staged record, as a prefix of the derived image, and the first container
+// over it promotes it by adopting the stored base — held under the record's
+// own holder, published as a chain member named by the base's digest — with
+// nothing built and the runtime's content not read, in either mode.
+// Removing the record releases the base.
+func TestPreparePromotionAdoptsLateStoredBase(t *testing.T) {
+	forEachMode(t, func(t *testing.T, sn *snapshotter, engine *fakeEngine) {
+		ctx := pullNamespace()
+		x, y, w := digest.FromString("layer-x"), digest.FromString("layer-y"), digest.FromString("layer-w")
+		derived, chains := storedImageInfo("derived", x, y, w)
+		addFakeImage(engine, derived)
+		names := make([]string, 3)
+		parent := ""
+		for i, diffID := range []digest.Digest{x, y, w} {
+			names[i] = loadStep(t, sn, i, parent, chains[i], diffID)
+			parent = names[i]
+		}
+		base, _ := storedImageInfo("base", x, y)
+		addFakeImage(engine, base)
+
+		var calls []mountCall
+		recordMounts(engine, &calls)
+		if _, err := sn.Prepare(ctx, "moby/9/container-init", names[1]); err != nil {
+			t.Fatalf("Prepare(container-init) error = %v", err)
+		}
+		holder := recordHolder(names[1])
+		if last := engine.holds[len(engine.holds)-1]; last != (holdCall{ref: base.Root.String(), holder: holder}) {
+			t.Fatalf("engine holds = %+v, want the base held under %s last", engine.holds, holder)
+		}
+		info, err := sn.Stat(ctx, names[1])
+		if err != nil {
+			t.Fatalf("Stat(%s) error = %v", names[1], err)
+		}
+		want := map[string]string{
+			chainMemberLabel:    "true",
+			rootDigestLabel:     base.Root.String(),
+			holderLabel:         holder,
+			imageRefLabel:       base.Root.String(),
+			manifestDigestLabel: base.Root.String(),
+		}
+		for k, v := range want {
+			if info.Labels[k] != v {
+				t.Fatalf("promoted record labels = %v, want %s = %s", info.Labels, k, v)
+			}
+		}
+		if info.Labels[stagingLabel] != "" {
+			t.Fatalf("promoted record labels = %v, want the staging marker dropped", info.Labels)
+		}
+		if len(calls) != 1 || calls[0].chainID != chains[1].String() {
+			t.Fatalf("MountChain calls = %+v, want the base chain %s", calls, chains[1])
+		}
+		if len(engine.builds) != 0 || imagesOf(sn).listCount() != 0 {
+			t.Fatalf("builds = %+v, image listings = %d, want nothing built and no runtime content read", engine.builds, imagesOf(sn).listCount())
+		}
+		if err := sn.Remove(ctx, "moby/9/container-init"); err != nil {
+			t.Fatalf("Remove(container-init) error = %v", err)
+		}
+		if err := sn.Remove(ctx, names[2]); err != nil {
+			t.Fatalf("Remove(%s) error = %v", names[2], err)
+		}
+		if err := sn.Remove(ctx, names[1]); err != nil {
+			t.Fatalf("Remove(%s) error = %v", names[1], err)
+		}
+		if !slices.Contains(engine.releases, holdCall{ref: base.Root.String(), holder: holder}) {
+			t.Fatalf("engine releases = %+v, want the promotion's hold released", engine.releases)
+		}
+	})
+}
+
+// TestPreparePromotionPrefersStore covers a staging daemon whose store holds
+// the base a derived pull left unbuilt while the runtime's content could
+// build it too: the stored base is adopted and nothing is built.
+func TestPreparePromotionPrefersStore(t *testing.T) {
+	ctx := pullNamespace()
+	engine := fakeEngineForImages()
+	sn := newStagingSnapshotter(t, engine)
+	d := pullDerived(t, sn)
+	loadImage(t, sn, "registry.example/a:v1", d.x, d.y)
+	base, _ := storedImageInfo("base", d.x, d.y)
+	addFakeImage(engine, base)
+	recordMounts(engine, &[]mountCall{})
+
+	if _, err := sn.Prepare(ctx, "moby/9/container-init", d.base); err != nil {
+		t.Fatalf("Prepare(container-init) error = %v", err)
+	}
+	if len(engine.builds) != 1 || imagesOf(sn).listCount() != 0 {
+		t.Fatalf("builds = %+v, image listings = %d, want the derived pull's build alone and no runtime records read", engine.builds, imagesOf(sn).listCount())
+	}
+	info, err := sn.Stat(ctx, d.base)
+	if err != nil {
+		t.Fatalf("Stat(%s) error = %v", d.base, err)
+	}
+	if info.Labels[chainMemberLabel] == "" || info.Labels[rootDigestLabel] != base.Root.String() {
+		t.Fatalf("promoted record labels = %v, want a chain member holding the stored base", info.Labels)
+	}
+}
+
+// TestPreparePromotionAdoptionReleasesOnPublishFailure covers an adopted base
+// whose publication fails: the hold is released on an uncancelled context, a
+// collection is asked for, the Prepare fails, and the record is left as it
+// was.
+func TestPreparePromotionAdoptionReleasesOnPublishFailure(t *testing.T) {
+	engine := fakeEngineForImages()
+	sn := newStagingSnapshotter(t, engine)
+	awaitGCs(t, engine, 1)
+	d := pullDerived(t, sn)
+	base, _ := storedImageInfo("base", d.x, d.y)
+	addFakeImage(engine, base)
+	recordMounts(engine, &[]mountCall{})
+	sn.updateInfo = func(context.Context, snapshots.Info, ...string) (snapshots.Info, error) {
+		return snapshots.Info{}, errors.New("publish failed")
+	}
+
+	ctx, cancel := context.WithCancel(pullNamespace())
+	defer cancel()
+	if _, err := sn.Prepare(ctx, "moby/9/container-init", d.base); err == nil || !strings.Contains(err.Error(), "publish failed") {
+		t.Fatalf("Prepare(container-init) error = %v, want the publish failure", err)
+	}
+	if want := []holdCall{{ref: base.Root.String(), holder: recordHolder(d.base)}}; !slices.Equal(engine.releases, want) {
+		t.Fatalf("engine releases = %+v, want %+v", engine.releases, want)
+	}
+	if engine.releaseCtxErrs[0] != nil {
+		t.Fatalf("Release context error = %v, want none", engine.releaseCtxErrs[0])
+	}
+	awaitGCs(t, engine, 2)
+	assertUnpromoted(t, sn, d)
+	if len(engine.builds) != 1 {
+		t.Fatalf("builds = %+v, want the derived pull's alone", engine.builds)
+	}
+}
