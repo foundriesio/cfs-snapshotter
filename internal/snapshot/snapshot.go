@@ -60,6 +60,12 @@
 // Commit then files the record; the chain's last Apply, finishing the build,
 // pins the image, and its Commit files the labels that name that hold.
 //
+// Image load (containerd's client-side unpacker, which docker runs for an
+// image it loaded from an archive, and again before running one it never
+// unpacked) walks the same layers the same way, but labels nothing: the
+// extract key is all that names the chain. Its Prepare always gets a staging
+// snapshot, labeled with the chain the key names.
+//
 // Container creation (the docker daemon, via containerd) prepares two
 // snapshots on top of the image's full chain:
 //
@@ -84,6 +90,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"strings"
@@ -675,9 +682,11 @@ func (s *snapshotter) Mounts(ctx context.Context, key string) ([]mount.Mount, er
 // the store does not hold is declined. Where staging is allowed, every
 // handshake instead gets a staging snapshot — a record with the placeholder
 // mount the differ applies the layer through — whether or not the store
-// holds its image. Everything else gets a directory-backed active snapshot
-// and overlay mounts composing the image metadata, the ocicfs objects, the
-// uppers of its committed ancestors, and its own upper (see mounts).
+// holds its image. The unlabeled handshake of a client-side unpack, known by
+// its key alone, gets a staging snapshot in either mode. Everything else gets
+// a directory-backed active snapshot and overlay mounts composing the image
+// metadata, the ocicfs objects, the uppers of its committed ancestors, and
+// its own upper (see mounts).
 func (s *snapshotter) Prepare(ctx context.Context, key, parent string, opts ...snapshots.Opt) ([]mount.Mount, error) {
 	log.G(ctx).WithFields(log.Fields{"key": key, "parent": parent}).
 		WithFields(optFields(opts)).Trace("cfs snapshotter: prepare")
@@ -712,10 +721,37 @@ func (s *snapshotter) Prepare(ctx context.Context, key, parent string, opts ...s
 			append(opts, snapshots.WithLabels(map[string]string{stagingLabel: "true"})))
 	}
 
+	if chainID, ok := unpackChainID(key); ok {
+		// The extract key identifies the chain for an archive layer. It is
+		// staged in either mode, and Apply decides whether the chain can be
+		// used. ErrAlreadyExists here would make the unpacker retry forever
+		// with new keys.
+		return s.createStagingSnapshot(ctx, key, parent,
+			append(opts, snapshots.WithLabels(map[string]string{
+				stagingLabel:              "true",
+				intermediateSnapshotLabel: chainID,
+			})))
+	}
+
 	// Everything else asks for a real writable snapshot whose mounts will
 	// actually be executed, for example docker's init layer or the
 	// container rootfs.
 	return s.createSnapshot(ctx, snapshots.KindActive, key, parent, opts)
+}
+
+// unpackChainID parses the SHA-256 chain ID from an
+// "extract-<unique> <chainID>" key, ignoring any namespace path prefix.
+func unpackChainID(key string) (string, bool) {
+	name := key[strings.LastIndex(key, "/")+1:]
+	unique, chain, ok := strings.Cut(name, " ")
+	if !ok || !strings.HasPrefix(unique, "extract-") {
+		return "", false
+	}
+	d, err := digest.Parse(chain)
+	if err != nil || d.Algorithm() != digest.SHA256 {
+		return "", false
+	}
+	return d.String(), true
 }
 
 // View records a new read-only snapshot under key, descending from parent, and
@@ -1060,10 +1096,10 @@ func (s *snapshotter) createAndCommitIntermediateVirtualSnapshot(ctx context.Con
 	return fmt.Errorf("intermediate virtual snapshot %q: %w", name, errdefs.ErrAlreadyExists)
 }
 
-// commitRecord commits the active snapshot under key as name, recording the
-// disk usage of its directory; a staging record has none and costs nothing.
-// private names this snapshotter's own labels the committed record is to
-// carry; nil carries over whatever the active record already had.
+// commitRecord commits key as name and records its directory usage;
+// staging records use no disk space. private supplies replacement private
+// labels, or nil preserves them. snapshot.ref is always carried over: an
+// unpacker may omit it when Prepare added it on the unpacker's behalf.
 func (s *snapshotter) commitRecord(ctx context.Context, name, key string, private map[string]string, opts []snapshots.Opt) error {
 	return s.ms.WithTransaction(ctx, true, func(ctx context.Context) error {
 		id, info, _, err := storage.GetInfo(ctx, key)
@@ -1081,6 +1117,13 @@ func (s *snapshotter) commitRecord(ctx context.Context, name, key string, privat
 		own := private
 		if own == nil {
 			own = privateLabels(info.Labels)
+		}
+		if chainID := info.Labels[intermediateSnapshotLabel]; chainID != "" {
+			own = maps.Clone(own)
+			if own == nil {
+				own = map[string]string{}
+			}
+			own[intermediateSnapshotLabel] = chainID
 		}
 		if len(own) > 0 {
 			opts = append(opts, snapshots.WithLabels(own))
