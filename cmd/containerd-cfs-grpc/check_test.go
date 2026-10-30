@@ -67,7 +67,7 @@ func TestRunCheckPassesOutOfBand(t *testing.T) {
 		"4. containerd version 2.1+: ok",
 		"5. containerd proxy_plugins wiring: ok (proxy plugin cfs)",
 		"6. enable_remote_snapshot_annotations export: ok",
-		"7. containerd diff proxy_plugins wiring: skipped (out-of-band mode applies no layers)",
+		"7. containerd diff proxy_plugins wiring: ok (proxy plugin cfs-diff)",
 		"check passed")
 }
 
@@ -96,7 +96,7 @@ func TestRunCheckFailsOnOldContainerd(t *testing.T) {
 		"4. containerd version 2.1+: FAIL: 1.7.24~ds1 is older than 2.1",
 		"5. containerd proxy_plugins wiring: ok (proxy plugin cfs)",
 		"6. enable_remote_snapshot_annotations export: ok",
-		"7. containerd diff proxy_plugins wiring: skipped (out-of-band mode applies no layers)",
+		"7. containerd diff proxy_plugins wiring: ok (proxy plugin cfs-diff)",
 		"check failed")
 }
 
@@ -147,7 +147,7 @@ func TestRunCheckFailsOnMissingAnnotationsExport(t *testing.T) {
 	wantLines(t, out.String(),
 		"5. containerd proxy_plugins wiring: ok (proxy plugin cfs)",
 		"6. enable_remote_snapshot_annotations export: FAIL: missing enable_remote_snapshot_annotations",
-		"7. containerd diff proxy_plugins wiring: skipped (out-of-band mode applies no layers)",
+		"7. containerd diff proxy_plugins wiring: ok (proxy plugin cfs-diff)",
 		"check failed")
 }
 
@@ -174,10 +174,10 @@ func TestRunCheckReportsAllStagedPrerequisites(t *testing.T) {
 	}
 }
 
-// TestRunCheckSkipsDifferOutOfBand covers that the mode which applies no
-// layers does not require the differ the staged mode needs: the same wiring
-// that fails the check in staged mode passes here.
-func TestRunCheckSkipsDifferOutOfBand(t *testing.T) {
+// TestRunCheckWarnsOnMissingDifferOutOfBand covers that out-of-band mode
+// applies loaded layers only from the store, so missing differ wiring that
+// fails the check in staged mode is only a warning here.
+func TestRunCheckWarnsOnMissingDifferOutOfBand(t *testing.T) {
 	address := fakeContainerd(t, "v2.2.3",
 		[]*introspectionapi.Plugin{wiredPlugin(map[string]string{"enable_remote_snapshot_annotations": "true"})})
 	var out bytes.Buffer
@@ -188,6 +188,6 @@ func TestRunCheckSkipsDifferOutOfBand(t *testing.T) {
 	}
 	wantLines(t, out.String(),
 		"6. enable_remote_snapshot_annotations export: ok",
-		"7. containerd diff proxy_plugins wiring: skipped (out-of-band mode applies no layers)",
+		"7. containerd diff proxy_plugins wiring: WARN: no proxy_plugins entry of type \"diff\" points at",
 		"check passed")
 }

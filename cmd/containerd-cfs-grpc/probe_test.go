@@ -319,9 +319,10 @@ func TestProbeReportsMissingDifferEntry(t *testing.T) {
 	}
 }
 
-// TestProbeIgnoresMissingDifferOutOfBand covers the other work mode: it
-// applies no layers, so the same wiring is healthy without a differ.
-func TestProbeIgnoresMissingDifferOutOfBand(t *testing.T) {
+// TestProbeDegradesOnMissingDifferOutOfBand covers the other work mode: it
+// applies layers for docker load only, so the same wiring degrades the
+// status with a warning naming docker load, and does not fail the start.
+func TestProbeDegradesOnMissingDifferOutOfBand(t *testing.T) {
 	entries, status, err := runProbe(t, "v2.2.3",
 		[]*introspectionapi.Plugin{wiredPlugin(map[string]string{"enable_remote_snapshot_annotations": "true"})},
 		testSocket, false)
@@ -330,10 +331,11 @@ func TestProbeIgnoresMissingDifferOutOfBand(t *testing.T) {
 			t.Fatalf("unexpected error entry: %v", e.Message)
 		}
 	}
-	if want := "STATUS=ok: wired to containerd v2.2.3 (proxy plugin cfs)"; status != want {
+	entryContaining(t, entries, logrus.WarnLevel, "docker load")
+	if want := "STATUS=degraded: containerd has no diff proxy_plugins entry for this snapshotter's socket; docker load will fail"; status != want {
 		t.Fatalf("status = %q, want %q", status, want)
 	}
 	if err != nil {
-		t.Fatalf("probe returned %v, want nil: out-of-band mode needs no differ", err)
+		t.Fatalf("probe returned %v, want nil: out-of-band mode starts without a differ", err)
 	}
 }

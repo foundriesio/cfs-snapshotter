@@ -50,10 +50,9 @@ const (
 //     daemon's socket: without one containerd cannot reach this snapshotter;
 //   - that entry exports enable_remote_snapshot_annotations = "true": without
 //     it pulls arrive without image identity and are declined;
-//   - a proxy differ entry points at the same socket, which staged mode needs
-//     to be handed its layers: without one they go to containerd's own
-//     differ, which fails on the staging placeholder. Out-of-band mode
-//     applies no layers, so it is not checked there.
+//   - a proxy differ entry points at this daemon's socket, so staged pulls
+//     and archive loads reach the correct differ. Missing wiring fails
+//     startup in staged mode; out of band it only degrades status.
 //
 // Each round's verdict is pushed to systemd as the unit's status line, where
 // systemctl status shows it next to "active (running)"; findings are logged
@@ -191,6 +190,8 @@ func (r probeResult) status(staged bool) string {
 		return "degraded: proxy_plugins." + r.entryID + " lacks enable_remote_snapshot_annotations; pulls will be declined"
 	case staged && !r.differWired:
 		return "degraded: containerd has no diff proxy_plugins entry for this snapshotter's socket; staged pulls will fail"
+	case !r.differWired:
+		return "degraded: containerd has no diff proxy_plugins entry for this snapshotter's socket; docker load will fail"
 	default:
 		return "ok: wired to containerd " + r.version + " (proxy plugin " + r.entryID + ")"
 	}
@@ -218,6 +219,9 @@ func (r probeResult) logVerdict(ctx context.Context, socketAddress string, stage
 	case staged && !r.differWired:
 		log.G(ctx).WithField("socket", socketAddress).
 			Error("containerd probe: no proxy differ in containerd's config points at this daemon's socket, so the layers of a staged pull go to containerd's own differ and fail on the staging placeholder; add the [proxy_plugins] diff entry (shipped as containerd-cfs.toml) and restart containerd")
+	case !r.differWired:
+		log.G(ctx).WithField("socket", socketAddress).
+			Warn("containerd probe: no proxy differ in containerd's config points at this daemon's socket, so the layers of a docker load go to containerd's own differ and fail on the staging placeholder; add the [proxy_plugins] diff entry (shipped as containerd-cfs.toml) and restart containerd")
 	case !r.tooOld:
 		log.G(ctx).WithFields(log.Fields{"plugin": r.entryID, "version": r.version}).
 			Info("containerd probe: containerd is wired to this snapshotter")

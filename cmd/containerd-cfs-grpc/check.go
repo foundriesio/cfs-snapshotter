@@ -106,19 +106,16 @@ func runCheck(ctx context.Context, w io.Writer, cfg snapshot.Config, socketAddre
 	return 0
 }
 
-// reportDiffer writes the verdict on the diff proxy wiring: containerd must
-// route a staged pull's layers to this daemon's differ, or every such pull
-// fails at the staging placeholder. Whether containerd tries this differ
-// first, or names it for the transfer service's unpack, is not visible
-// through introspection; the placeholder is what enforces it. Out-of-band
-// mode applies no layers, so the entry is not checked there.
+// reportDiffer checks that the proxy differ is registered. Missing wiring
+// fails staged mode but only warns out of band, though archive loads still
+// need it. Introspection cannot verify differ order or unpack selection.
 func reportDiffer(w io.Writer, r probeResult, socketAddress string, staged bool) {
-	if !staged {
-		line(w, "7. containerd diff proxy_plugins wiring: skipped (out-of-band mode applies no layers)")
-		return
-	}
 	if !r.differWired {
-		line(w, "7. containerd diff proxy_plugins wiring: FAIL: no proxy_plugins entry of type \"diff\" points at %s; staged pulls fail at the layer apply", socketAddress)
+		if staged {
+			line(w, "7. containerd diff proxy_plugins wiring: FAIL: no proxy_plugins entry of type \"diff\" points at %s; staged pulls fail at the layer apply", socketAddress)
+		} else {
+			line(w, "7. containerd diff proxy_plugins wiring: WARN: no proxy_plugins entry of type \"diff\" points at %s; docker load fails at the layer apply", socketAddress)
+		}
 		return
 	}
 	line(w, "7. containerd diff proxy_plugins wiring: ok (proxy plugin %s)", r.differID)
