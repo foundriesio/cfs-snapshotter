@@ -150,8 +150,9 @@ sudo ctr plugins ls | grep cfs
 No `cfs` row means containerd did not read the block — recheck the
 `imports` placement above, or `sudo containerd config dump | grep -A3
 proxy_plugins` to see what it actually merged. A `cfs` row without a
-`cfs-diff` row means an older version of the block is in place: every
-staged pull then fails at the layer apply until the differ is wired in.
+`cfs-diff` row means an older version of the block is in place: staged
+pulls, and `docker load` in either mode, fail to unpack until the differ is
+wired in.
 
 The package never edits `/etc/containerd/config.toml` itself: the file
 belongs to containerd, and the `unpack_config` list below *replaces*
@@ -244,7 +245,8 @@ the status flips back to ok by itself.
 
 The pull's layers are ingested into the ocicfs store by the snapshotter's
 differ as containerd fetches them, and the container's root filesystem
-is served from the store as a composefs mount.
+is served from the store as a composefs mount. For offline use, see
+[Loading images offline](docs/running.md#loading-images-offline-docker-load).
 
 ## Runtime requirements
 

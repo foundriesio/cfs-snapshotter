@@ -92,15 +92,12 @@ The `enable_remote_snapshot_annotations = "true"` export is required. Without
 it, transfer-service pulls do not stamp the image identity used by the cfs
 admission gate and are declined.
 
-The `cfs-diff` entry is required for staged pulls, and it must be the differ
-containerd actually uses for the cfs snapshotter's layers: first in the diff
-service's order, which is the path Docker takes, and named by `differ` on the
-cfs `unpack_config` entry, which is the path `ctr` and CRI take. A staging
-snapshot's only mount is a placeholder no kernel can mount, so a layer routed
-to any other differ fails at once (`mount: no such device`) instead of being
-extracted somewhere the store never sees. `containerd-cfs-grpc -check` reports
-whether the differ is registered; the order and the `differ` selection are not
-visible through introspection, which is what the placeholder is for.
+The `cfs-diff` entry is required for staged pulls and for `docker load` in
+either mode. Put it first in the diff service's order for Docker, and select
+it with `differ` in the cfs `unpack_config` entry for `ctr` and CRI. Other
+differs cannot mount the staging placeholder and fail with
+`mount: no such device`. `containerd-cfs-grpc -check` checks registration,
+but cannot verify the order or the `differ` selection.
 
 ## 3. Configure Docker
 
@@ -274,6 +271,73 @@ The two work modes are exclusive, and the flag defaults to on:
 Pick one per machine and keep it: a store filled one way and then served the
 other has records made against a posture that no longer holds.
 
+## Loading images offline (`docker load`)
+
+In either mode, sideload the archive into ocicfs with a trusted digest, then
+load it into Docker:
+
+```sh
+ocicfs pull --from-tar app.tar "registry.example/app@$digest"
+docker load -i app.tar
+docker run --rm --network=none registry.example/app:1.0
+```
+
+`--from-tar` needs an ocicfs build newer than v0.3.0. Take `$digest` from
+the agent's trusted release metadata; the pull fails unless the archive holds
+it. In **staged mode**, `docker load -i app.tar` alone also works: an image
+missing from ocicfs is built from the copy `docker load` puts in containerd.
+
+For a multi-platform archive, add `--platform <os>/<arch>` for the host to
+each `docker load`, including the check below: for example, `linux/amd64` or
+`linux/arm64/v8`. Otherwise Docker also unpacks other platforms the host can
+run (linux/386 on amd64) and the snapshotter declines them; amd64+arm64
+archives are unaffected.
+
+**Check the output.** `docker load` exits 0 even when it cannot unpack the
+image:
+
+```sh
+out="$(docker load -i app.tar 2>&1)" || exit 1
+if grep -q 'Error unpacking image' <<<"$out"; then echo "$out" >&2; exit 1; fi
+```
+
+Out of band a missing image is declined; sideload it and run the image, no
+second `docker load` needed. In staged mode, a load that only partly
+provides an image, such as an incomplete image sharing a chain with a
+complete one, succeeds and fails at its first container start instead.
+
+**Images built in staged mode.** The last layer's unpack builds the whole
+image, so `docker load` takes longer (seconds for a small image). Nothing
+pins what is built. `docker rmi` reclaims it from ocicfs. A sideloaded
+image stays in ocicfs after `docker rmi` until the agent runs
+`ocicfs remove`.
+
+**Load base images before derived images.** A base loaded after a derived
+image unpacks nothing, and one loaded into a store holding only the derived
+image is answered as part of it; either way it is adopted or built at its
+first container start, where its build time and failures surface. Out of
+band, the base must already be in ocicfs; staged mode can rebuild it from
+containerd's copy.
+
+**Prepare the archive.** Save one tagged image per uncompressed archive with
+`docker save -o app.tar <name>:<tag>` on a daemon that uses the containerd
+image store, or use `ocicfs copy -o app.tar <name>:<tag>` without a daemon.
+A legacy overlay2 daemon rewrites the manifest when it saves, so its
+archive matches no published digest. Pin the manifest digest that
+`index.json` lists; after `docker save --platform` that is the platform's
+manifest, not the multi-platform index:
+
+```sh
+tar -xOf app.tar index.json | jq -r '.manifests[0].digest'
+```
+
+Docker keeps the imported layer blobs alongside the files in ocicfs, so allow
+space for both.
+
+The pin covers the rootfs only; entrypoint, environment and user come from
+the archive unchecked — see
+[Image-reference stamping and admission](#image-reference-stamping-and-admission).
+
 ## Image-reference stamping and admission
 
 The handshake uses `containerd.io/snapshot/cri.image-ref`. Supported runtime
@@ -299,12 +363,11 @@ runtime does not stamp at all is still declined, in either mode. If an unsupport
 still limits it to rootfs content belonging to the named held image, but the
 snapshotter cannot establish the unheld config's identity.
 
-This pull-time gate is not a runtime allowlist. Starting an image already cached
-or pre-loaded in the runtime can bypass the pull handshake, and container-create
-carries only the content chain, not the image reference. Runtime policy must
-prevent an unheld cached config from using an otherwise held rootfs. Rootfs
-digest and fs-verity enforcement remain active independently of this admission
-gate.
+Pull admission is not a runtime allowlist. Cached images and `docker load`
+can bypass image-reference checks: container creation supplies only the
+layer chain, which out of band must be in ocicfs. Runtime policy must
+control which image configs may use those files. Rootfs digest and
+fs-verity checks still apply.
 
 ## Inspecting a running container (devcontainer)
 
