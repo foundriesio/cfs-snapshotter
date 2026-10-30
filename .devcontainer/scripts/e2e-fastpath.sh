@@ -51,6 +51,18 @@ delta_ref=""
 # delta base, so a failure inside the leg does not leave the hold behind.
 delta_base_ref=""
 pull_pid=""
+# The load legs' archives, written by docker save while the registry is up,
+# and the tags they carry; registry_down is set while those legs keep the
+# registry stopped, so cleanup can start it again.
+load_base_tar=""
+load_derived_tar=""
+load_base_tag=""
+load_derived_tag=""
+load_nonce=""
+# load_pulled_ref is the digest reference the sideload-then-pull leg has the
+# runtime pull, while the runtime may hold it.
+load_pulled_ref=""
+registry_down=""
 # cold_composefs is the digest of the composefs image the cold pull built at
 # one ingest worker, which the two-worker re-pull and an ocicfs pull of the same
 # image must build again byte for byte.
@@ -65,6 +77,9 @@ cleanup() {
 		kill "${pull_pid}" 2>/dev/null || echo "warning: failed to stop the background pull" >&2
 		wait "${pull_pid}" 2>/dev/null || true
 	fi
+	if [ -n "${registry_down}" ]; then
+		start_registry || echo "warning: failed to restart the registry" >&2
+	fi
 	local name
 	for name in cfs-e2e-1 cfs-e2e-2 cfs-e2e-recovery cfs-e2e-cold cfs-e2e-delta cfs-e2e-pair; do
 		if docker container inspect "${name}" >/dev/null 2>&1; then
@@ -74,7 +89,7 @@ cleanup() {
 	local ref
 	for ref in "${image_ref}" "${unheld_ref}" "${base_ref}" "${substitution_ref}" \
 		"${cold_ref}" "${share_ref}" "${share_more_ref}" "${partial_ref}" "${delta_ref}" \
-		"${pair_base_ref}" "${pair_derived_ref}"; do
+		"${pair_base_ref}" "${pair_derived_ref}" "${load_base_tag}" "${load_derived_tag}" "${load_pulled_ref}"; do
 		if [ -n "${ref}" ] && docker image inspect "${ref}" >/dev/null 2>&1; then
 			docker rmi -f "${ref}" >/dev/null 2>&1 || echo "warning: failed to remove ${ref}" >&2
 		fi
@@ -1482,6 +1497,332 @@ assert_ingest_workers_converge() {
 	echo "PASS: one and two ingest workers and an ocicfs pull built the same composefs image"
 }
 
+# stop_registry and start_registry take the devcontainer's registry down and
+# bring it back the way the entrypoint starts it, so the load legs prove the
+# runtime reaches nothing over the network.
+stop_registry() {
+	local pid
+	pid="$(cat /var/log/cfs-devcontainer/zot.pid)" || fail "cannot read the registry's pid"
+	kill "${pid}" || fail "cannot stop the registry"
+	registry_down=1
+	wait_until "the registry to stop" 30 0.5 registry_unreachable
+}
+
+start_registry() {
+	setsid nohup zot serve /etc/zot/config.json >>/var/log/cfs-devcontainer/zot.log 2>&1 &
+	echo "$!" >/var/log/cfs-devcontainer/zot.pid
+	local tries
+	for tries in $(seq 1 60); do
+		if curl -fsS "http://${REGISTRY}/v2/" >/dev/null 2>&1; then
+			registry_down=""
+			return 0
+		fi
+		sleep 0.5
+	done
+	return 1
+}
+
+registry_unreachable() {
+	! curl -fsS -m 2 "http://${REGISTRY}/v2/" >/dev/null 2>&1
+}
+
+# prepare_load_archives writes the archives the load legs load: a base image
+# and an image derived from it — one layer longer, seeded from one nonce — each
+# pulled by the runtime and saved by its tag with docker save, so the archive
+# names the image. The runtime and the store forget both images afterwards.
+prepare_load_archives() {
+	local nonce="$1" base_layout="${work}/load-base-layout" derived_layout="${work}/load-derived-layout"
+	load_nonce="${nonce}-load"
+	load_base_tag="${REGISTRY}/cfs/e2e-load-base:${load_nonce}"
+	load_derived_tag="${REGISTRY}/cfs/e2e-load-derived:${load_nonce}"
+	load_base_tar="${work}/load-base.tar"
+	load_derived_tar="${work}/load-derived.tar"
+	seed_image "${load_nonce}" "${load_base_tag}" 2 "${base_layout}"
+	seed_image "${load_nonce}" "${load_derived_tag}" 3 "${derived_layout}"
+	[ "$(first_diff_id "${base_layout}")" = "$(first_diff_id "${derived_layout}")" ] ||
+		fail "the load base is not a prefix of the derived image"
+	docker pull "${load_base_tag}" >/dev/null || fail "docker pull of the load base failed"
+	docker pull "${load_derived_tag}" >/dev/null || fail "docker pull of the load derived image failed"
+	docker save -o "${load_base_tar}" "${load_base_tag}" || fail "docker save of the load base failed"
+	docker save -o "${load_derived_tar}" "${load_derived_tag}" || fail "docker save of the load derived image failed"
+	[ "$(archive_root "${load_base_tar}")" = "$(manifest_digest "${base_layout}")" ] ||
+		fail "the base archive does not hold the pulled manifest"
+	[ "$(archive_root "${load_derived_tar}")" = "$(manifest_digest "${derived_layout}")" ] ||
+		fail "the derived archive does not hold the pulled manifest"
+	drain_runtime_images
+	forget_ocicfs_images
+}
+
+# archive_root prints the digest of the one image a docker save archive holds.
+archive_root() {
+	tar -xOf "$1" index.json | jq -r '.manifests[0].digest'
+}
+
+# archive_agent_ref prints the reference ocicfs pull --from-tar records for an
+# archive given no reference: the name docker save wrote, pinned to the
+# archive's image.
+archive_agent_ref() {
+	local tag="$1" archive="$2"
+	printf '%s@%s\n' "${tag%:*}" "$(archive_root "${archive}")"
+}
+
+# sideload puts an archive's image in the store the way an agent does,
+# offline, and checks the reference it records.
+sideload() {
+	local tag="$1" archive="$2" ref got
+	ref="$(archive_agent_ref "${tag}" "${archive}")"
+	got="$(ocicfs_cli pull --from-tar "${archive}" --format json | jq -r '.ref')" ||
+		fail "ocicfs pull --from-tar of ${archive} failed"
+	[ "${got}" = "${ref}" ] || fail "ocicfs pull --from-tar recorded ${got}, want ${ref}"
+	pair_agent_refs="${pair_agent_refs:+${pair_agent_refs} }${ref}"
+}
+
+# check_load runs docker load, which exits 0 even when it cannot unpack the
+# image it loaded, and fails on either.
+check_load() {
+	local archive="$1" output
+	if ! output="$(docker load -i "${archive}" 2>&1)"; then
+		echo "${output}" >&2
+		return 1
+	fi
+	echo "${output}" >&2
+	! grep -q 'Error unpacking image' <<<"${output}"
+}
+
+# loaded_applies prints the layers the differ resolved for a load since a log
+# offset, one "<leaf> <source>" line per layer. A line the daemon has not
+# finished writing is skipped.
+loaded_applies() {
+	local offset="$1"
+	tail -n "+$((offset + 1))" "${CFS_LOG}" |
+		jq -rR 'fromjson? | select(.msg == "cfs differ: applied loaded layer") | "\(.leaf) \(.source)"'
+}
+
+# assert_load_declined covers docker load of an image the store does not
+# hold on a daemon that builds nothing from runtime content: the load reports
+# the unpack failure naming the sideload, a run of the loaded image fails the
+# same way, and nothing is built.
+assert_load_declined() {
+	local output root
+	root="$(archive_root "${load_derived_tar}")"
+	output="$(docker load -i "${load_derived_tar}" 2>&1)" || fail "docker load exited non-zero: ${output}"
+	grep -q 'Error unpacking image' <<<"${output}" ||
+		fail "docker load of an image the store lacks unpacked it: ${output}"
+	grep -Fq 'ocicfs pull --from-tar' <<<"${output}" ||
+		fail "docker load did not say to sideload the image: ${output}"
+	if output="$(docker run --rm --network=none "${load_derived_tag}" 2>&1)"; then
+		fail "docker run of an image the store lacks succeeded: ${output}"
+	fi
+	no_image_binding "${root}" || fail "the declined load built the image"
+	docker rmi "${load_derived_tag}" >/dev/null || fail "docker rmi of the declined image failed"
+	wait_until "the declined load's records to go" 60 0.5 no_cfs_snapshots
+	echo "PASS: out-of-band mode: docker load of an image the store lacks was declined, naming the sideload"
+}
+
+# assert_load_built covers docker load alone on a staging daemon: nothing is
+# sideloaded, so the unpack finds no chain in the store and builds the image
+# from the copy the load put in containerd's content store — the layers below
+# the last answered from the manifest, the last building the image — and the
+# image runs with no network. The runtime's hold is the image's only one, so
+# docker rmi reclaims it from the store before returning.
+assert_load_built() {
+	local root offset applies output
+	root="$(archive_root "${load_derived_tar}")"
+	offset="$(wc -l <"${CFS_LOG}")"
+	check_load "${load_derived_tar}" || fail "docker load of an image the store lacks failed"
+	applies="$(loaded_applies "${offset}")"
+	[ "${applies}" = "$(printf 'false content\nfalse content\ntrue content')" ] ||
+		fail "the load resolved its layers as \"${applies}\", want two answered and the last built from the runtime's content"
+	! tail -n "+$((offset + 1))" "${CFS_LOG}" | grep -q '"cfs differ: applied staged layer"' ||
+		fail "the load went through the pull path"
+	output="$(docker run --rm --network=none "${load_derived_tag}")" ||
+		fail "docker run of the loaded image failed"
+	[ "${output}" = "cfs hello ${load_nonce}" ] || fail "unexpected container output: ${output}"
+	[ "$(image_bindings "${root}")" -eq 1 ] || fail "the store does not hold exactly one composefs image"
+	docker rmi "${load_derived_tag}" >/dev/null || fail "docker rmi of the loaded image failed"
+	if ocicfs_lists_digest "${root}"; then
+		fail "the ocicfs store still lists the loaded image after docker rmi returned"
+	fi
+	no_image_binding "${root}" || fail "the composefs image survived docker rmi"
+	wait_until "the loaded image's records to go" 60 0.5 no_cfs_snapshots
+	echo "PASS: staged mode: an image loaded with docker load alone was built from its content, ran offline and was reclaimed by docker rmi"
+}
+
+# assert_load_from_store covers the offline recipe: the agent sideloads the
+# archive, then docker loads it. Every layer is resolved from the store —
+# the ones below the last answered, the last adopting the stored image — the
+# image runs with no network, the agent cannot remove it while the runtime
+# holds it, and it is the agent's to remove once the runtime lets go.
+assert_load_from_store() {
+	local mode="$1" root ref offset applies output
+	root="$(archive_root "${load_derived_tar}")"
+	ref="$(archive_agent_ref "${load_derived_tag}" "${load_derived_tar}")"
+	sideload "${load_derived_tag}" "${load_derived_tar}"
+	offset="$(wc -l <"${CFS_LOG}")"
+	check_load "${load_derived_tar}" || fail "docker load of the sideloaded image failed"
+	applies="$(loaded_applies "${offset}")"
+	[ "${applies}" = "$(printf 'false store\nfalse store\ntrue store')" ] ||
+		fail "the load resolved its layers as \"${applies}\", want two answered and the last adopted from the store"
+	! tail -n "+$((offset + 1))" "${CFS_LOG}" | grep -q '"cfs differ: applied staged layer"' ||
+		fail "the load built a layer although the store held the image"
+	output="$(docker run --rm --network=none "${load_derived_tag}")" ||
+		fail "docker run of the loaded image failed"
+	[ "${output}" = "cfs hello ${load_nonce}" ] || fail "unexpected container output: ${output}"
+	[ "$(image_bindings "${root}")" -eq 1 ] || fail "the store does not hold exactly one composefs image"
+	[ -z "$(ocicfs_holder_of_digest "${root}")" ] || fail "the load recorded a runtime reference"
+	assert_ocicfs_remove_declines "${ref}"
+	docker rmi "${load_derived_tag}" >/dev/null || fail "docker rmi of the loaded image failed"
+	ocicfs_remove_when_released "${ref}"
+	pair_agent_refs=""
+	wait_until "the loaded image's records to go" 60 0.5 no_cfs_snapshots
+	echo "PASS: ${mode} mode: a sideloaded image loaded with docker load ran offline from the store"
+}
+
+# assert_load_base_after_derived loads a base image after an image derived
+# from it. The base's load finds every chain of the base recorded by the
+# derived image's and unpacks nothing, so the base's first container meets
+# the derived load's record of the base's chain. With both sideloaded before
+# the loads (store=both) that record adopted the stored base and the base
+# runs from it as it is; with the base sideloaded only between the loads
+# (store=late) the record answered as a prefix of the derived image, and the
+# base's first container promotes it by adopting the stored base. With
+# nothing sideloaded (store=none, staged mode only) the derived load built
+# the derived image from its content and answered the base's chain as a
+# layer of it, and the base's first container promotes the record by
+# building the base from the content its load left. Every way the base runs
+# as the base, offline, and outlives the derived image.
+assert_load_base_after_derived() {
+	local mode="$1" store="$2" offset output ref base_root derived_root
+	base_root="$(archive_root "${load_base_tar}")"
+	derived_root="$(archive_root "${load_derived_tar}")"
+	if [ "${store}" != none ]; then
+		sideload "${load_derived_tag}" "${load_derived_tar}"
+	fi
+	if [ "${store}" = both ]; then
+		sideload "${load_base_tag}" "${load_base_tar}"
+	fi
+	offset="$(wc -l <"${CFS_LOG}")"
+	check_load "${load_derived_tar}" || fail "docker load of the derived image failed"
+	case "${store}" in
+	both)
+		[ "$(loaded_applies "${offset}")" = "$(printf 'false store\ntrue store\ntrue store')" ] ||
+			fail "the derived load did not adopt the stored base at its chain: $(loaded_applies "${offset}")"
+		;;
+	late)
+		[ "$(loaded_applies "${offset}")" = "$(printf 'false store\nfalse store\ntrue store')" ] ||
+			fail "the derived load did not answer the base's chain as a prefix: $(loaded_applies "${offset}")"
+		sideload "${load_base_tag}" "${load_base_tar}"
+		;;
+	none)
+		[ "$(loaded_applies "${offset}")" = "$(printf 'false content\nfalse content\ntrue content')" ] ||
+			fail "the derived load did not build the derived image from its content: $(loaded_applies "${offset}")"
+		;;
+	esac
+	offset="$(wc -l <"${CFS_LOG}")"
+	check_load "${load_base_tar}" || fail "docker load of the base after the derived image failed"
+	[ -z "$(loaded_applies "${offset}")" ] || fail "the base's load applied layers although its chain was recorded"
+
+	output="$(docker run --rm --network=none "${load_base_tag}")" ||
+		fail "docker run of the base loaded after the derived image failed"
+	[ "${output}" = "cfs hello ${load_nonce}" ] || fail "unexpected container output: ${output}"
+	assert_rootfs_is_base "${load_base_tag}" 2 "${load_nonce}"
+	case "${store}" in
+	late)
+		tail -n "+$((offset + 1))" "${CFS_LOG}" | grep '"cfs snapshotter: promoted recorded chain"' |
+			grep -q '"source":"store"' ||
+			fail "the base's first container did not promote its chain from the store"
+		;;
+	none)
+		tail -n "+$((offset + 1))" "${CFS_LOG}" | grep '"cfs snapshotter: promoted recorded chain"' |
+			grep -q '"source":"content"' ||
+			fail "the base's first container did not promote its chain from the runtime's content"
+		;;
+	both)
+		! tail -n "+$((offset + 1))" "${CFS_LOG}" | grep -q '"cfs snapshotter: promoted recorded chain"' ||
+			fail "a chain record was promoted although the derived load adopted the base"
+		;;
+	esac
+	! tail -n "+$((offset + 1))" "${CFS_LOG}" | grep -q '"cfs differ: applied staged layer"' ||
+		fail "a layer of the pair went through the pull path"
+
+	docker rmi "${load_derived_tag}" >/dev/null || fail "docker rmi of the derived image failed"
+	output="$(docker run --rm --network=none "${load_base_tag}")" ||
+		fail "docker run of the base after the derived image was removed failed"
+	[ "${output}" = "cfs hello ${load_nonce}" ] || fail "unexpected container output: ${output}"
+	docker rmi "${load_base_tag}" >/dev/null || fail "docker rmi of the base failed"
+	for ref in ${pair_agent_refs}; do
+		ocicfs_remove_when_released "${ref}"
+	done
+	pair_agent_refs=""
+	wait_until "the pair's records to go" 60 0.5 no_cfs_snapshots
+	if [ "${store}" = none ]; then
+		no_image_binding "${base_root}" || fail "the base built by its promotion survived docker rmi"
+		no_image_binding "${derived_root}" || fail "the derived image built by its load survived docker rmi"
+	fi
+	echo "PASS: ${mode} mode, base sideloaded ${store}: a base loaded after its derived image ran as the base offline"
+}
+
+# assert_sideload_then_pull covers the out-of-band alternative to docker
+# load: the agent sideloads the archive, and the runtime pulls the image by
+# the digest the sideload recorded while the registry is reachable, fetching
+# its metadata and no layer, so containerd keeps no copy of the archive's
+# layers. A pull by the archive's tag before that is declined, since the
+# sideload records no tag. With the registry stopped afterwards, the image
+# runs offline.
+assert_sideload_then_pull() {
+	local root ref manifest output
+	root="$(archive_root "${load_derived_tar}")"
+	ref="$(archive_agent_ref "${load_derived_tag}" "${load_derived_tar}")"
+	manifest="$(tar -xOf "${load_derived_tar}" "blobs/sha256/${root#sha256:}")" ||
+		fail "cannot read the archive's manifest"
+	sideload "${load_derived_tag}" "${load_derived_tar}"
+	# The tag goes first: once the digest pull has unpacked the image, a tag
+	# pull finds every chain present and never reaches the snapshotter.
+	if output="$(docker pull "${load_derived_tag}" 2>&1)"; then
+		fail "docker pull by a tag the sideload did not record succeeded: ${output}"
+	fi
+	layers_absent "${manifest}" || fail "the declined tag pull fetched a layer"
+	load_pulled_ref="${ref}"
+	docker pull "${ref}" >/dev/null || fail "docker pull by the sideloaded digest failed"
+	layers_absent "${manifest}" || fail "docker pull after the sideload fetched a layer"
+	stop_registry
+	output="$(docker run --rm --network=none "${ref}")" || fail "docker run of the pulled image failed offline"
+	[ "${output}" = "cfs hello ${load_nonce}" ] || fail "unexpected container output: ${output}"
+	start_registry || fail "cannot restart the registry"
+	docker rmi "${ref}" >/dev/null || fail "docker rmi of the pulled image failed"
+	load_pulled_ref=""
+	ocicfs_remove_when_released "${ref}"
+	pair_agent_refs=""
+	wait_until "the pulled image's records to go" 60 0.5 no_cfs_snapshots
+	wait_until "the store to collect the pulled image" 60 0.5 collect_store
+	no_image_binding "${root}" || fail "the pulled image survived its removal and a collection"
+	echo "PASS: out-of-band mode: a sideloaded image pulled by digest fetched no layer and ran offline"
+}
+
+# assert_load_offline runs the load legs with the registry stopped, against
+# the stores of the phase in progress.
+assert_load_offline() {
+	local mode="$1"
+	drain_runtime_images
+	pair_store="${ocicfs_root}"
+	if [ "${mode}" = out-of-band ]; then
+		assert_sideload_then_pull
+	fi
+	stop_registry
+	if [ "${mode}" = out-of-band ]; then
+		assert_load_declined
+	else
+		assert_load_built
+	fi
+	assert_load_from_store "${mode}"
+	if [ "${mode}" = staged ]; then
+		assert_load_base_after_derived "${mode}" none
+	fi
+	assert_load_base_after_derived "${mode}" late
+	assert_load_base_after_derived "${mode}" both
+	start_registry || fail "cannot restart the registry"
+}
+
 warm_phase() {
 	local nonce="$1" chainfs
 	echo "== warm phase: images enter the store out of band =="
@@ -1507,6 +1848,7 @@ warm_phase() {
 	assert_delta_fast_path
 	assert_base_after_derived "${nonce}" out-of-band 1
 	assert_base_after_derived "${nonce}" out-of-band 0
+	assert_load_offline out-of-band
 }
 
 cold_phase() {
@@ -1542,6 +1884,7 @@ cold_phase() {
 	assert_staged_adoption "${nonce}"
 	assert_staged_self_heal "${nonce}"
 	assert_ingest_workers_converge
+	assert_load_offline staged
 
 	drain_runtime_images
 	CFS_ALLOW_UNSTAGED_PULLS=1 CFS_ROOT="${WARM_CFS_ROOT}" OCICFS_ROOT="${WARM_OCICFS_ROOT}" \
@@ -1558,11 +1901,13 @@ mounts it into the container (a container started any other way has none)"
 	work="$(mktemp -d)"
 	trap cleanup EXIT
 	local nonce="${RANDOM}${RANDOM}"
+	prepare_load_archives "${nonce}"
 	warm_phase "${nonce}"
 	cold_phase "${nonce}"
 	echo "E2E PASS: handshake identity, real content, recovery, concurrency, teardown," \
 		"tamper enforcement, holds, tag identity, delta fast path, base after derived, cold conversion," \
-		"rmi reclaim, dedup, interrupted-pull recovery, mixed-door identity, adoption, self-heal, and worker-count identity"
+		"rmi reclaim, dedup, interrupted-pull recovery, mixed-door identity, adoption, self-heal, worker-count identity," \
+		"and offline docker load"
 }
 
 main "$@"
