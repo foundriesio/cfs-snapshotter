@@ -82,6 +82,10 @@ func (s *snapshotter) Apply(ctx context.Context, desc ocispec.Descriptor, mounts
 	if err != nil {
 		return ocispec.Descriptor{}, fmt.Errorf("apply staged layer to %q: %w", key, err)
 	}
+	// Only a daemon that stages its pulls builds from runtime content.
+	if !s.allowUnstagedPulls {
+		return ocispec.Descriptor{}, fmt.Errorf("staged layer %q: this snapshotter uses only images in the ocicfs store; run ocicfs pull <image>: %w", key, errdefs.ErrFailedPrecondition)
+	}
 	labels, err := s.stagingLabels(ctx, key)
 	if err != nil {
 		return ocispec.Descriptor{}, err

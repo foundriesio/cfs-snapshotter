@@ -725,6 +725,41 @@ func TestCommitCarriesPrivateLabels(t *testing.T) {
 	}
 }
 
+// TestCommitCarriesChainLabel covers that the chain a staged record stands
+// for survives a Commit that does not pass it again, the way a caller
+// commits a record whose Prepare this snapshotter labeled: a leaf and a
+// record below it both keep their snapshot.ref label.
+func TestCommitCarriesChainLabel(t *testing.T) {
+	ctx := pullNamespace()
+	sn := newStagingSnapshotter(t, fakeEngineForImages())
+	x, y := digest.FromString("layer-x"), digest.FromString("layer-y")
+	root, chains := stageImage(t, sn, x, y)
+	const ref = "registry.example/a:v1"
+
+	parent := ""
+	for i, chain := range chains {
+		key := fmt.Sprintf("moby/%d/extract", i)
+		if _, err := sn.Prepare(ctx, key, parent, snapshots.WithLabels(stagedLabels(ref, root, chain))); err != nil {
+			t.Fatalf("Prepare(%s) error = %v", key, err)
+		}
+		if err := applyStaged(ctx, sn, key, []digest.Digest{x, y}[i]); err != nil {
+			t.Fatalf("Apply(%s) error = %v", key, err)
+		}
+		name := fmt.Sprintf("moby/%d/%s", i, chain)
+		if err := sn.Commit(ctx, name, key); err != nil {
+			t.Fatalf("Commit(%s) error = %v", name, err)
+		}
+		info, err := sn.Stat(ctx, name)
+		if err != nil {
+			t.Fatalf("Stat(%s) error = %v", name, err)
+		}
+		if info.Labels[intermediateSnapshotLabel] != chain.String() {
+			t.Fatalf("committed record %s labels = %v, want %s = %s", name, info.Labels, intermediateSnapshotLabel, chain)
+		}
+		parent = name
+	}
+}
+
 // TestApplyDrivesBuild covers the conversion a cold pull drives: the chain
 // each record stands for is read from its snapshot.ref label rather than from
 // the name containerd files it under, every Apply feeds its layer to one build
@@ -866,6 +901,33 @@ func TestApplyRequiresStagingRecord(t *testing.T) {
 	}
 	if len(engine.builds) != 0 {
 		t.Fatalf("engine builds = %+v, want none", engine.builds)
+	}
+}
+
+// TestApplyDeclinesLabeledUnpackOutOfBand covers an unpack handshake whose
+// key names the chain and whose labels name a pulled image, on a daemon that
+// builds nothing from runtime content: the Apply is declined with a failed
+// precondition before any of the runtime's content is read, and nothing is
+// built.
+func TestApplyDeclinesLabeledUnpackOutOfBand(t *testing.T) {
+	ctx := pullNamespace()
+	x := digest.FromString("layer-1")
+	engine := fakeEngineForImages()
+	sn := newSnapshotterForTest(t, engine, notMounted)
+	root, chains := stageImage(t, sn, x)
+	loadLayers(sn, x)
+	key := loadKey(0, chains[0])
+	labels := map[string]string{imageRefLabel: "app:v1", manifestDigestLabel: root.String()}
+	if _, err := sn.Prepare(ctx, key, "", snapshots.WithLabels(labels)); err != nil {
+		t.Fatalf("Prepare(%s) error = %v", key, err)
+	}
+	// Any read of the runtime's content panics on the nil client.
+	sn.blobs.client = struct{ contentapi.ContentClient }{}
+	if err := applyStaged(ctx, sn, key, x); !errdefs.IsFailedPrecondition(err) || !strings.Contains(err.Error(), "run ocicfs pull <image>") {
+		t.Fatalf("Apply(%s) error = %v, want a failed precondition naming ocicfs pull", key, err)
+	}
+	if len(engine.builds) != 0 || imagesOf(sn).listCount() != 0 {
+		t.Fatalf("engine builds = %+v, image listings = %d; want none", engine.builds, imagesOf(sn).listCount())
 	}
 }
 
