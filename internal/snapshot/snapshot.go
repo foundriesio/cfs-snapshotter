@@ -64,7 +64,11 @@
 // image it loaded from an archive, and again before running one it never
 // unpacked) walks the same layers the same way, but labels nothing: the
 // extract key is all that names the chain. Its Prepare always gets a staging
-// snapshot, labeled with the chain the key names.
+// snapshot, labeled with the chain the key names, and its Apply finds the
+// chain in the ocicfs store, where the image was sideloaded before the load:
+// a chain below the image's last is answered with its layer's diff ID and
+// nothing more, and the image's whole chain is adopted from the store, as a
+// pull adopts a stored base. A chain the store does not hold is declined.
 //
 // Container creation (the docker daemon, via containerd) prepares two
 // snapshots on top of the image's full chain:

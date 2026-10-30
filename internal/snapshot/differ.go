@@ -68,9 +68,11 @@ var _ diff.Applier = (*snapshotter)(nil)
 // build's holder, and is marked as such on its record first — along with the
 // image's identity and that holder — so the Commit that follows, inside
 // containerd's transaction, files the record without touching the store.
-// Mounts of any other shape belong to another snapshotter's pull and are
-// declined, so a diff service that tries this differ first falls through to
-// the next.
+// A record that names no image is a layer of a client-side unpack, the one
+// docker runs for an image it loaded from an archive; it is resolved against
+// the ocicfs store alone (see applyLoadedLayer). Mounts of any other shape
+// belong to another snapshotter's pull and are declined, so a diff service
+// that tries this differ first falls through to the next.
 func (s *snapshotter) Apply(ctx context.Context, desc ocispec.Descriptor, mounts []mount.Mount, _ ...diff.ApplyOpt) (ocispec.Descriptor, error) {
 	if len(mounts) != 1 || mounts[0].Type != stagingMountType {
 		return ocispec.Descriptor{}, fmt.Errorf("cfs differ applies staged layers only: %w", errdefs.ErrNotImplemented)
@@ -82,13 +84,16 @@ func (s *snapshotter) Apply(ctx context.Context, desc ocispec.Descriptor, mounts
 	if err != nil {
 		return ocispec.Descriptor{}, fmt.Errorf("apply staged layer to %q: %w", key, err)
 	}
-	// Only a daemon that stages its pulls builds from runtime content.
-	if !s.allowUnstagedPulls {
-		return ocispec.Descriptor{}, fmt.Errorf("staged layer %q: this snapshotter uses only images in the ocicfs store; run ocicfs pull <image>: %w", key, errdefs.ErrFailedPrecondition)
-	}
 	labels, err := s.stagingLabels(ctx, key)
 	if err != nil {
 		return ocispec.Descriptor{}, err
+	}
+	if labels[imageRefLabel] == "" && labels[manifestDigestLabel] == "" {
+		return s.applyLoadedLayer(ctx, ns, key, labels[intermediateSnapshotLabel], start)
+	}
+	// Only a daemon that stages its pulls builds from runtime content.
+	if !s.allowUnstagedPulls {
+		return ocispec.Descriptor{}, fmt.Errorf("image unavailable for layer chain %s: this snapshotter requires it in the ocicfs store; run ocicfs pull <image>: %w", labels[intermediateSnapshotLabel], errdefs.ErrFailedPrecondition)
 	}
 	layer, err := s.resolveStagedLayer(ctx, labels)
 	if err != nil {
@@ -98,7 +103,7 @@ func (s *snapshotter) Apply(ctx context.Context, desc ocispec.Descriptor, mounts
 		return ocispec.Descriptor{}, err
 	}
 	if !layer.leaf {
-		if err := s.adoptStoredChain(ctx, ns, key, layer.chainID); err != nil {
+		if _, _, err := s.adoptStoredChain(ctx, ns, key, layer.chainID); err != nil {
 			return ocispec.Descriptor{}, err
 		}
 	}
@@ -152,32 +157,43 @@ func (s *snapshotter) stagingLabels(ctx context.Context, key string) (map[string
 	return info.Labels, nil
 }
 
-// adoptStoredChain makes the staging record under key stand for an image
-// the ocicfs store already holds whole at chainID, when it holds one: the
-// record takes a hold on that image under the build holder of its key and
-// carries the leaf markers, so its Commit files a chain member and a
-// container over it mounts the stored image. The pull the record belongs to
-// goes on ingesting the layer into its own image's build regardless. The
-// store is scanned image by image for one whose last chain is chainID; an
-// image that cannot be inspected is passed over, as one unreadable binding
-// must not hide a healthy match. Candidates are tried smallest root first:
-// each is held and then inspected again, since a removal between the scan
-// and the hold deletes the binding while the hold still lands on the root
-// object, and a record standing for such an image could never mount. A
-// candidate that fails that second look, or whose hold finds nothing, is
-// let go and the next one tried; with none left the record stays a plain
-// staging record. A hold that fails any other way is released as well
-// before the failure is reported: its marker may have been written before
-// the failure, and no record names it. A build open in the namespace for
-// an image ending in this chain is closed once the markers are on the
-// record: its pull's last Prepare will meet the committed chain and never
-// apply the layer that would finish it.
-func (s *snapshotter) adoptStoredChain(ctx context.Context, ns, key, chainID string) error {
+// adoptStoredChain holds a stored image ending at chainID and marks the
+// snapshot as its leaf, retiring builds that end at the same chain.
+// It returns the final layer's diff ID and adopted=true. Without a full
+// match, it returns a stored prefix's diff ID, if any, and adopted=false.
+func (s *snapshotter) adoptStoredChain(ctx context.Context, ns, key, chainID string) (diffID digest.Digest, adopted bool, err error) {
+	candidates, prefixDiffID, err := s.storedChain(ctx, chainID)
+	if err != nil {
+		return "", false, err
+	}
+	holder := buildHolder(ns, key)
+	_, info, err := s.holdStored(ctx, candidates, chainID, holder)
+	if err != nil || info == nil {
+		return prefixDiffID, false, err
+	}
+	if err := s.markLeaf(ctx, key, info.Root, holder); err != nil {
+		s.releaseHold(context.WithoutCancel(ctx), info.Root.String(), holder)
+		s.collectSoon()
+		return "", false, err
+	}
+	s.retireBuildsEndingAt(ns, chainID)
+	log.G(ctx).WithFields(log.Fields{"key": key, "chain": chainID, "root": info.Root}).
+		Info("cfs differ: adopted stored image for chain")
+	return info.Layers[len(info.Layers)-1].DiffID, true, nil
+}
+
+// storedChain returns images ending at chainID, sorted by digest, and a
+// diff ID if the chain also prefixes a stored image. Unreadable images
+// are skipped so they cannot hide a usable match.
+func (s *snapshotter) storedChain(ctx context.Context, chainID string) ([]ocicfs.Image, digest.Digest, error) {
 	images, err := s.engine.List(ctx)
 	if err != nil {
-		return fmt.Errorf("list the ocicfs store for layer chain %s: %w", chainID, err)
+		return nil, "", fmt.Errorf("list the ocicfs store for layer chain %s: %w", chainID, err)
 	}
-	var roots []string
+	var (
+		candidates   []ocicfs.Image
+		prefixDiffID digest.Digest
+	)
 	seen := map[string]struct{}{}
 	for _, image := range images {
 		if _, ok := seen[image.Digest]; ok {
@@ -185,7 +201,7 @@ func (s *snapshotter) adoptStoredChain(ctx context.Context, ns, key, chainID str
 		}
 		seen[image.Digest] = struct{}{}
 		if err := ctx.Err(); err != nil {
-			return err
+			return nil, "", err
 		}
 		info, err := s.engine.Inspect(ctx, image.Digest)
 		if err != nil {
@@ -193,21 +209,34 @@ func (s *snapshotter) adoptStoredChain(ctx context.Context, ns, key, chainID str
 				Debug("cfs differ: skipping a stored image that cannot be inspected")
 			continue
 		}
-		if n := len(info.Layers); n > 0 && info.Layers[n-1].ChainID.String() == chainID {
-			roots = append(roots, image.Digest)
+		i := slices.IndexFunc(info.Layers, func(l ocicfs.LayerInfo) bool { return l.ChainID.String() == chainID })
+		switch {
+		case i < 0:
+		case i == len(info.Layers)-1:
+			candidates = append(candidates, image)
+		case prefixDiffID == "":
+			prefixDiffID = info.Layers[i].DiffID
 		}
 	}
-	slices.Sort(roots)
+	slices.SortFunc(candidates, func(a, b ocicfs.Image) int { return strings.Compare(a.Digest, b.Digest) })
+	return candidates, prefixDiffID, nil
+}
 
-	holder := buildHolder(ns, key)
-	for _, root := range roots {
+// holdStored holds the first usable candidate and rechecks its chain.
+// Removal can delete an image binding while leaving its root holdable,
+// so a successful hold alone does not make the image safe to adopt.
+// Stale candidates are released and skipped; a hold that fails otherwise
+// is released and its error returned.
+func (s *snapshotter) holdStored(ctx context.Context, candidates []ocicfs.Image, chainID, holder string) (*ocicfs.Image, *ocicfs.ImageInfo, error) {
+	for i := range candidates {
+		root := candidates[i].Digest
 		if err := s.engine.Hold(ctx, root, holder); err != nil {
 			if errors.Is(err, ocicfs.ErrNotFound) {
 				continue
 			}
 			s.releaseHold(context.WithoutCancel(ctx), root, holder)
 			s.collectSoon()
-			return fmt.Errorf("hold stored image %s for layer chain %s: %w", root, chainID, err)
+			return nil, nil, fmt.Errorf("hold stored image %s for layer chain %s: %w", root, chainID, err)
 		}
 		info, err := s.engine.Inspect(ctx, root)
 		if err != nil || len(info.Layers) == 0 || info.Layers[len(info.Layers)-1].ChainID.String() != chainID {
@@ -217,22 +246,55 @@ func (s *snapshotter) adoptStoredChain(ctx context.Context, ns, key, chainID str
 			s.collectSoon()
 			continue
 		}
-		if err := s.markLeaf(ctx, key, info.Root, holder); err != nil {
-			s.releaseHold(context.WithoutCancel(ctx), root, holder)
-			s.collectSoon()
-			return err
-		}
-		if taken := s.takeBuilds(func(k buildKey, other *openBuild) bool {
-			return k.namespace == ns && other.leaf == chainID
-		}); len(taken) > 0 {
-			closeBuilds(taken)
-			s.collectSoon()
-		}
-		log.G(ctx).WithFields(log.Fields{"key": key, "chain": chainID, "root": root}).
-			Info("cfs differ: adopted stored image for chain")
-		return nil
+		return &candidates[i], info, nil
 	}
-	return nil
+	return nil, nil, nil
+}
+
+// retireBuildsEndingAt closes builds in this namespace ending at chainID.
+// Once that chain is committed, unpack skips their final layer, leaving
+// the builds unfinished and blocking collection.
+func (s *snapshotter) retireBuildsEndingAt(ns, chainID string) {
+	if taken := s.takeBuilds(func(k buildKey, other *openBuild) bool {
+		return k.namespace == ns && other.leaf == chainID
+	}); len(taken) > 0 {
+		closeBuilds(taken)
+		s.collectSoon()
+	}
+}
+
+// applyLoadedLayer applies a layer of a client-side unpack, whose record
+// names its chain and no image: the image was sideloaded into the ocicfs
+// store, and the store is all the layer is resolved against. A chain that is
+// a stored image's whole chain adopts that image (see adoptStoredChain); one
+// a stored image continues beyond is a prefix, answered with its diff ID and
+// recorded as nothing more. Either answer closes the builds of pulls that
+// end in the chain, which the record committed at it strands. A chain the
+// store does not hold is declined: the archive's content is not built from.
+// The descriptor is not matched against the stored layer, since the chain
+// fixes the uncompressed content whatever compression the archive used.
+func (s *snapshotter) applyLoadedLayer(ctx context.Context, ns, key, chainID string, start time.Time) (ocispec.Descriptor, error) {
+	if chainID == "" {
+		return ocispec.Descriptor{}, fmt.Errorf("staged snapshot names no layer chain in its %s label: %w", intermediateSnapshotLabel, errdefs.ErrFailedPrecondition)
+	}
+	diffID, adopted, err := s.adoptStoredChain(ctx, ns, key, chainID)
+	if err != nil {
+		return ocispec.Descriptor{}, err
+	}
+	if diffID == "" {
+		return ocispec.Descriptor{}, fmt.Errorf("image chain %s is not in the ocicfs store, and an unpack that names no image is not built from runtime content; sideload the image with ocicfs pull --from-tar, and %s: %w", chainID, platformHint(), errdefs.ErrFailedPrecondition)
+	}
+	if !adopted {
+		s.retireBuildsEndingAt(ns, chainID)
+	}
+	log.G(ctx).WithFields(log.Fields{
+		"key":     key,
+		"chain":   chainID,
+		"leaf":    adopted,
+		"source":  "store",
+		"elapsed": time.Since(start).Seconds(),
+	}).Info("cfs differ: applied loaded layer")
+	return ocispec.Descriptor{MediaType: ocispec.MediaTypeImageLayer, Digest: diffID}, nil
 }
 
 // markLeaf records on the staging snapshot under key that its layer is an
@@ -478,14 +540,32 @@ func samePlatform(a, b ocispec.Platform) bool {
 	if a.OS != b.OS || a.Architecture != b.Architecture {
 		return false
 	}
-	var defaultVariant string
-	switch a.Architecture {
+	variant := defaultVariant(a.Architecture)
+	return cmp.Or(a.Variant, variant) == cmp.Or(b.Variant, variant)
+}
+
+// defaultVariant returns the assumed variant when omitted:
+// v8 for arm64, v7 for arm, and "" otherwise.
+func defaultVariant(architecture string) string {
+	switch architecture {
 	case "arm64":
-		defaultVariant = "v8"
+		return "v8"
 	case "arm":
-		defaultVariant = "v7"
+		return "v7"
 	}
-	return cmp.Or(a.Variant, defaultVariant) == cmp.Or(b.Variant, defaultVariant)
+	return ""
+}
+
+// platformHint is the advice a declined loaded layer ends with. docker load
+// of an archive holding images of several platforms unpacks every one the
+// host can run, not only the host's own, and the others are declined: the
+// load names the host's platform to unpack that one alone.
+func platformHint() string {
+	platform := runtime.GOOS + "/" + runtime.GOARCH
+	if variant := defaultVariant(runtime.GOARCH); variant != "" {
+		platform += "/" + variant
+	}
+	return "if the archive holds images of several platforms, load it with docker load --platform " + platform
 }
 
 // buildableManifest picks the manifest an image whose full layer chain is
