@@ -3076,12 +3076,12 @@ func stageImage(t *testing.T, sn *snapshotter, diffIDs ...digest.Digest) (digest
 // two images built from the same layers get different manifests.
 func stageImageBy(t *testing.T, sn *snapshotter, author string, diffIDs ...digest.Digest) (digest.Digest, []digest.Digest) {
 	t.Helper()
-	return stageImageConfig(t, sn, ocispec.Image{Author: author, Platform: hostPlatform()}, diffIDs...)
+	return stageImageConfig(t, sn, ocispec.Image{Author: author, Platform: hostImagePlatform()}, diffIDs...)
 }
 
-// hostPlatform is the platform the fake images declare, which is the one
+// hostImagePlatform is the platform the fake images declare, which is the one
 // the snapshotter under test runs on.
-func hostPlatform() ocispec.Platform {
+func hostImagePlatform() ocispec.Platform {
 	return ocispec.Platform{OS: runtime.GOOS, Architecture: runtime.GOARCH}
 }
 
@@ -4287,7 +4287,7 @@ func TestLoadedManifestsWalksImages(t *testing.T) {
 	x, y := digest.FromString("layer-x"), digest.FromString("layer-y")
 	rootA, chainsA := stageImage(t, sn, x, y)
 	rootB, chainsB := stageImageBy(t, sn, "b", x)
-	attestation, _ := stageImageConfig(t, sn, ocispec.Image{Platform: hostPlatform()})
+	attestation, _ := stageImageConfig(t, sn, ocispec.Image{Platform: hostImagePlatform()})
 	rootForeign, _ := stageImageConfig(t, sn, ocispec.Image{Platform: ocispec.Platform{OS: "plan9", Architecture: "mips"}}, x)
 	store := contentOf(sn)
 	var manifestB ocispec.Manifest
@@ -4323,15 +4323,15 @@ func TestLoadedManifestsWalksImages(t *testing.T) {
 		t.Fatalf("loadedManifests() error = %v", err)
 	}
 	want := []loadedManifest{
-		{root: rootA, names: []string{"registry.example/a:v1", "moby-dangling@" + rootA.String()}, chains: chainsA},
-		{root: rootB, names: []string{"registry.example/b:v1", "registry.example/b:v2"}, chains: chainsB},
+		{root: rootA, names: []string{"registry.example/a:v1", "moby-dangling@" + rootA.String()}, diffIDs: []digest.Digest{x, y}, chains: chainsA},
+		{root: rootB, names: []string{"registry.example/b:v1", "registry.example/b:v2"}, diffIDs: []digest.Digest{x}, chains: chainsB},
 	}
 	slices.SortFunc(want, func(a, b loadedManifest) int { return strings.Compare(a.root.String(), b.root.String()) })
 	if len(manifests) != len(want) {
 		t.Fatalf("loadedManifests() = %+v, want %+v", manifests, want)
 	}
 	for i, m := range manifests {
-		if m.root != want[i].root || !slices.Equal(m.names, want[i].names) || !slices.Equal(m.chains, want[i].chains) {
+		if m.root != want[i].root || !slices.Equal(m.names, want[i].names) || !slices.Equal(m.diffIDs, want[i].diffIDs) || !slices.Equal(m.chains, want[i].chains) {
 			t.Fatalf("loadedManifests()[%d] = %+v, want %+v", i, m, want[i])
 		}
 		if len(m.layers) != len(m.chains) || m.layers[0].Digest != layerBlob(x) {
@@ -4438,6 +4438,44 @@ func TestBuildableManifestRequiresEveryBlob(t *testing.T) {
 	expect(full, "", false)
 }
 
+// TestLoadedChain covers locating a chain among loaded manifests: a
+// manifest ending in it wins over one that continues beyond it, whichever
+// sorts first, a chain only inside manifests is answered from the first,
+// and a chain none contains is not found.
+func TestLoadedChain(t *testing.T) {
+	x, y, w := digest.FromString("layer-x"), digest.FromString("layer-y"), digest.FromString("layer-w")
+	manifest := func(root string, diffIDs ...digest.Digest) loadedManifest {
+		return loadedManifest{root: digest.FromString(root), diffIDs: diffIDs, chains: identity.ChainIDs(slices.Clone(diffIDs))}
+	}
+	derived := manifest("derived", x, y, w)
+	base := manifest("base", x, y)
+	other := manifest("other", y)
+	chains := derived.chains
+	tests := []struct {
+		name       string
+		manifests  []loadedManifest
+		chainID    digest.Digest
+		wantDiffID digest.Digest
+		wantLast   bool
+		wantOK     bool
+	}{
+		{name: "whole chain", manifests: []loadedManifest{derived}, chainID: chains[2], wantDiffID: w, wantLast: true, wantOK: true},
+		{name: "inside an image", manifests: []loadedManifest{derived}, chainID: chains[1], wantDiffID: y, wantOK: true},
+		{name: "ending wins over inside", manifests: []loadedManifest{derived, base}, chainID: chains[1], wantDiffID: y, wantLast: true, wantOK: true},
+		{name: "first layer", manifests: []loadedManifest{other, derived}, chainID: chains[0], wantDiffID: x, wantOK: true},
+		{name: "same diff ID on another chain", manifests: []loadedManifest{derived}, chainID: other.chains[0]},
+		{name: "no manifests", chainID: chains[0]},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			diffID, last, ok := loadedChain(tt.manifests, tt.chainID.String())
+			if diffID != tt.wantDiffID || last != tt.wantLast || ok != tt.wantOK {
+				t.Fatalf("loadedChain(%s) = %s, %v, %v, want %s, %v, %v", tt.chainID, diffID, last, ok, tt.wantDiffID, tt.wantLast, tt.wantOK)
+			}
+		})
+	}
+}
+
 // TestLoadedImageRef covers the reference a built image is recorded under:
 // the smallest tag-shaped name, or the manifest digest when every name is
 // digest-qualified.
@@ -4466,7 +4504,7 @@ func TestLoadedImageRef(t *testing.T) {
 // architecture, with an unstated variant standing for the architecture's
 // default one.
 func TestHostPlatformConfig(t *testing.T) {
-	host := hostPlatform()
+	host := hostImagePlatform()
 	tests := []struct {
 		name     string
 		platform ocispec.Platform

@@ -60,15 +60,11 @@
 // Commit then files the record; the chain's last Apply, finishing the build,
 // pins the image, and its Commit files the labels that name that hold.
 //
-// Image load (containerd's client-side unpacker, which docker runs for an
-// image it loaded from an archive, and again before running one it never
-// unpacked) walks the same layers the same way, but labels nothing: the
-// extract key is all that names the chain. Its Prepare always gets a staging
-// snapshot, labeled with the chain the key names, and its Apply finds the
-// chain in the ocicfs store, where the image was sideloaded before the load:
-// a chain below the image's last is answered with its layer's diff ID and
-// nothing more, and the image's whole chain is adopted from the store, as a
-// pull adopts a stored base. A chain the store does not hold is declined.
+// Archive loads identify each layer chain through an extract key. Prepare
+// creates a staging snapshot in either mode; Apply reuses stored chains
+// and, in staged mode, builds missing images from the content store.
+// Prefix matches leave staging records. If later used as a container's
+// image, such a record must first adopt or build an image ending there.
 //
 // Container creation (the docker daemon, via containerd) prepares two
 // snapshots on top of the image's full chain:
@@ -1436,17 +1432,9 @@ func (s *snapshotter) promoteStagedRecord(ctx context.Context, name string) (str
 		return "", fmt.Errorf("image unavailable for layer chain %s: missing from ocicfs and no complete local image for this host; use ocicfs pull <image> or docker load -i <archive>: %w", chainID, errdefs.ErrFailedPrecondition)
 	}
 
-	ref := loadedImageRef(m)
-	build, err := s.engine.NewBuild(ctx, ref,
-		ocicfs.WithBlobSource(s.blobs), ocicfs.WithResolvedRoot(m.root), ocicfs.WithHold(holder))
+	ref, err := s.buildLoadedImage(ctx, m, holder)
 	if err != nil {
-		s.collectSoon()
-		return "", fmt.Errorf("begin building image %q for recorded chain %s: %w", ref, chainID, err)
-	}
-	if _, err := build.Finish(ctx); err != nil {
-		s.releaseHold(context.WithoutCancel(ctx), m.root.String(), holder)
-		s.collectSoon()
-		return "", fmt.Errorf("build image %q for recorded chain %s: %w", ref, chainID, err)
+		return "", fmt.Errorf("promote recorded chain %s: %w", chainID, err)
 	}
 	if err := s.publishPromotion(ctx, name, chainID, m.root, holder, ref); err != nil {
 		return "", err
