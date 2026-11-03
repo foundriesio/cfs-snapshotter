@@ -930,7 +930,9 @@ report_layer_applies() {
 	local ref="$1" layers="$2" offset="$3" entries applies count line layer seconds
 	entries="$(tail -n "+$((offset + 1))" "${CFS_LOG}" | grep '^{')" ||
 		fail "the snapshotter logged nothing for the pull of ${ref}"
-	applies="$(jq -c 'select(.msg == "cfs differ: applied staged layer")' <<<"${entries}")"
+	# The daemon may still be writing its last line; a line that is not yet
+	# whole JSON is skipped.
+	applies="$(jq -cR 'fromjson? | select(.msg == "cfs differ: applied staged layer")' <<<"${entries}")"
 	count="$(grep -c '^{' <<<"${applies}")" || true
 	[ "${count}" -eq "${layers}" ] ||
 		fail "the snapshotter logged ${count} layer applies for the pull of ${ref}, want ${layers}"
