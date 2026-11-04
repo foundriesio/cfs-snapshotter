@@ -282,7 +282,7 @@ docker load -i app.tar
 docker run --rm --network=none registry.example/app:1.0
 ```
 
-`--from-tar` needs an ocicfs build newer than v0.3.0. Take `$digest` from
+`--from-tar` needs ocicfs v0.4.0 or newer. Take `$digest` from
 the agent's trusted release metadata; the pull fails unless the archive holds
 it. In **staged mode**, `docker load -i app.tar` alone also works: an image
 missing from ocicfs is built from the copy `docker load` puts in containerd.
