@@ -33,7 +33,7 @@ func runCheck(ctx context.Context, w io.Writer, cfg snapshot.Config, socketAddre
 		line(w, "%s: ok", name)
 	}
 
-	if cfg.AllowUnstagedPulls {
+	if cfg.AdmitAny {
 		engine, err := ocicfs.New(ocicfs.Config{Root: cfg.OcicfsRoot})
 		if err != nil {
 			failed = true
@@ -44,8 +44,8 @@ func runCheck(ctx context.Context, w io.Writer, cfg snapshot.Config, socketAddre
 			report(fmt.Sprintf("2. fs-verity on the ocicfs store (%s)", cfg.OcicfsRoot), engine.PreflightStore())
 		}
 	} else {
-		line(w, "1. mkcomposefs: skipped (out-of-band mode builds nothing locally)")
-		line(w, "2. fs-verity on the ocicfs store: skipped (out-of-band mode builds nothing locally)")
+		line(w, "1. mkcomposefs: skipped (preloaded mode builds nothing locally)")
+		line(w, "2. fs-verity on the ocicfs store: skipped (preloaded mode builds nothing locally)")
 	}
 	workers := cfg.IngestWorkers
 	if workers == 0 {
@@ -84,18 +84,18 @@ func runCheck(ctx context.Context, w io.Writer, cfg snapshot.Config, socketAddre
 			failed = true
 			line(w, "5. containerd proxy_plugins wiring: FAIL: no proxy_plugins entry points at %s", socketAddress)
 			line(w, "6. enable_remote_snapshot_annotations export: not checked (no wiring)")
-			reportDiffer(w, r, socketAddress, cfg.AllowUnstagedPulls)
+			reportDiffer(w, r, socketAddress, cfg.AdmitAny)
 		case !r.hasExport:
 			failed = true
 			line(w, "5. containerd proxy_plugins wiring: ok (proxy plugin %s)", r.entryID)
 			line(w, "6. enable_remote_snapshot_annotations export: FAIL: missing enable_remote_snapshot_annotations = \"true\" under [proxy_plugins.%s.exports]; pulls arrive without image identity and are declined", r.entryID)
-			reportDiffer(w, r, socketAddress, cfg.AllowUnstagedPulls)
+			reportDiffer(w, r, socketAddress, cfg.AdmitAny)
 		default:
 			line(w, "5. containerd proxy_plugins wiring: ok (proxy plugin %s)", r.entryID)
 			line(w, "6. enable_remote_snapshot_annotations export: ok")
-			reportDiffer(w, r, socketAddress, cfg.AllowUnstagedPulls)
+			reportDiffer(w, r, socketAddress, cfg.AdmitAny)
 		}
-		failed = failed || (cfg.AllowUnstagedPulls && !r.differWired)
+		failed = failed || (cfg.AdmitAny && !r.differWired)
 	}
 
 	if failed {
@@ -107,11 +107,11 @@ func runCheck(ctx context.Context, w io.Writer, cfg snapshot.Config, socketAddre
 }
 
 // reportDiffer checks that the proxy differ is registered. Missing wiring
-// fails staged mode but only warns out of band, though archive loads still
-// need it. Introspection cannot verify differ order or unpack selection.
-func reportDiffer(w io.Writer, r probeResult, socketAddress string, staged bool) {
+// fails admit-any mode but only warns in preloaded mode, though archive loads
+// still need it. Introspection cannot verify differ order or unpack selection.
+func reportDiffer(w io.Writer, r probeResult, socketAddress string, admitAny bool) {
 	if !r.differWired {
-		if staged {
+		if admitAny {
 			line(w, "7. containerd diff proxy_plugins wiring: FAIL: no proxy_plugins entry of type \"diff\" points at %s; staged pulls fail at the layer apply", socketAddress)
 		} else {
 			line(w, "7. containerd diff proxy_plugins wiring: WARN: no proxy_plugins entry of type \"diff\" points at %s; docker load fails at the layer apply", socketAddress)

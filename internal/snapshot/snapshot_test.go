@@ -60,7 +60,7 @@ func TestNewSnapshotterRejectsEmptyRoot(t *testing.T) {
 }
 
 // verityOcicfsRoot returns a fresh ocicfs root on the dev container's shared
-// fs-verity filesystem, skipping where that filesystem is absent. Staged mode
+// fs-verity filesystem, skipping where that filesystem is absent. Admit-any mode
 // refuses roots that cannot enable fs-verity, so its tests cannot use
 // t.TempDir.
 func verityOcicfsRoot(t *testing.T) string {
@@ -77,18 +77,18 @@ func verityOcicfsRoot(t *testing.T) string {
 	return dir
 }
 
-// TestNewSnapshotterServesUnstagedPulls covers that a snapshotter configured
-// to stage unheld pulls comes up: staged layers are turned into ocicfs content
+// TestNewSnapshotterAdmitsAny covers that a snapshotter configured
+// to admit any image comes up: staged layers are turned into ocicfs content
 // when their chain completes.
-func TestNewSnapshotterServesUnstagedPulls(t *testing.T) {
+func TestNewSnapshotterAdmitsAny(t *testing.T) {
 	if _, err := exec.LookPath("mkcomposefs"); err != nil {
 		t.Skip("mkcomposefs not found in PATH")
 	}
 	sn, err := NewSnapshotter(context.Background(), Config{
-		Root:               t.TempDir(),
-		OcicfsRoot:         verityOcicfsRoot(t),
-		AllowUnstagedPulls: true,
-		ContainerdAddress:  "/run/containerd/containerd.sock",
+		Root:              t.TempDir(),
+		OcicfsRoot:        verityOcicfsRoot(t),
+		AdmitAny:          true,
+		ContainerdAddress: "/run/containerd/containerd.sock",
 	})
 	if err != nil {
 		t.Fatalf("NewSnapshotter() error = %v", err)
@@ -99,15 +99,15 @@ func TestNewSnapshotterServesUnstagedPulls(t *testing.T) {
 }
 
 // TestNewSnapshotterFailsFastWithoutStagedPrerequisites covers the fail-fast
-// gate: a staged-mode snapshotter refuses to come up when the host lacks what
+// gate: an admit-any snapshotter refuses to come up when the host lacks what
 // staging needs, instead of failing at the first pull.
 func TestNewSnapshotterFailsFastWithoutStagedPrerequisites(t *testing.T) {
 	t.Setenv("PATH", t.TempDir())
 	_, err := NewSnapshotter(context.Background(), Config{
-		Root:               t.TempDir(),
-		OcicfsRoot:         t.TempDir(),
-		AllowUnstagedPulls: true,
-		ContainerdAddress:  "/run/containerd/containerd.sock",
+		Root:              t.TempDir(),
+		OcicfsRoot:        t.TempDir(),
+		AdmitAny:          true,
+		ContainerdAddress: "/run/containerd/containerd.sock",
 	})
 	if err == nil || !strings.Contains(err.Error(), "mkcomposefs") {
 		t.Fatalf("NewSnapshotter() error = %v, want staged-pull prerequisites failure naming mkcomposefs", err)
@@ -1361,7 +1361,7 @@ func TestApplyResumesAfterRestart(t *testing.T) {
 	root := t.TempDir()
 	engine := fakeEngineForImages()
 	engine.objectsDir = t.TempDir()
-	first := newConfiguredSnapshotter(t, Config{Root: root, AllowUnstagedPulls: true}, engine, notMounted)
+	first := newConfiguredSnapshotter(t, Config{Root: root, AdmitAny: true}, engine, notMounted)
 	layers := []digest.Digest{digest.FromString("layer-1"), digest.FromString("layer-2")}
 	manifest, chains := stageImage(t, first, layers...)
 
@@ -1379,7 +1379,7 @@ func TestApplyResumesAfterRestart(t *testing.T) {
 		t.Fatalf("engine calls = %v, want %v: the restart abandons the build", engine.calls, want)
 	}
 
-	second := newConfiguredSnapshotter(t, Config{Root: root, AllowUnstagedPulls: true}, engine, notMounted)
+	second := newConfiguredSnapshotter(t, Config{Root: root, AdmitAny: true}, engine, notMounted)
 	second.blobs.client = first.blobs.client
 	base := "moby/1/" + chains[0].String()
 	if err := second.Commit(ctx, base, "moby/1/extract"); err != nil {
@@ -1775,7 +1775,7 @@ func TestReconcileHoldsByRootAndHolder(t *testing.T) {
 	root := t.TempDir()
 	engine := fakeEngineForImages()
 	engine.objectsDir = t.TempDir()
-	sn := newConfiguredSnapshotter(t, Config{Root: root, AllowUnstagedPulls: true}, engine, notMounted)
+	sn := newConfiguredSnapshotter(t, Config{Root: root, AdmitAny: true}, engine, notMounted)
 	rootB, chains := stageImageBy(t, sn, "derived", x, y)
 	base := testImageInfo("base", chains[0])
 	addFakeImage(engine, base)
@@ -1799,7 +1799,7 @@ func TestReconcileHoldsByRootAndHolder(t *testing.T) {
 	}
 
 	engine.releases = nil
-	newConfiguredSnapshotter(t, Config{Root: root, AllowUnstagedPulls: true}, engine, notMounted)
+	newConfiguredSnapshotter(t, Config{Root: root, AdmitAny: true}, engine, notMounted)
 	if want := []holdCall{{ref: rootB.String(), holder: holder}}; !slices.Equal(engine.releases, want) {
 		t.Fatalf("engine Release calls at restart = %+v, want the derived image's stranded hold alone", engine.releases)
 	}
@@ -3189,7 +3189,7 @@ func newSnapshotterForTest(t *testing.T, engine *fakeEngine, mounted func(string
 // images the ocicfs store does not hold.
 func newStagingSnapshotter(t *testing.T, engine *fakeEngine) *snapshotter {
 	t.Helper()
-	return newConfiguredSnapshotter(t, Config{Root: t.TempDir(), AllowUnstagedPulls: true}, engine, notMounted)
+	return newConfiguredSnapshotter(t, Config{Root: t.TempDir(), AdmitAny: true}, engine, notMounted)
 }
 
 func newConfiguredSnapshotter(t *testing.T, cfg Config, engine *fakeEngine, mounted func(string) (bool, error)) *snapshotter {
@@ -3336,7 +3336,7 @@ func TestNewSnapshotterReleasesStrayHolds(t *testing.T) {
 	root := t.TempDir()
 	engine := fakeEngineForImages()
 	engine.objectsDir = t.TempDir()
-	first := newConfiguredSnapshotter(t, Config{Root: root, AllowUnstagedPulls: true}, engine, notMounted)
+	first := newConfiguredSnapshotter(t, Config{Root: root, AdmitAny: true}, engine, notMounted)
 	layers := []digest.Digest{digest.FromString("layer-1")}
 	image, chains := stageImage(t, first, layers...)
 	other, otherChains := stageImageBy(t, first, "other", layers...)
@@ -3371,7 +3371,7 @@ func TestNewSnapshotterReleasesStrayHolds(t *testing.T) {
 		image: {"agent", owned, stray},
 		other: {staged, strayRecord},
 	}
-	second := newConfiguredSnapshotter(t, Config{Root: root, AllowUnstagedPulls: true}, engine, notMounted)
+	second := newConfiguredSnapshotter(t, Config{Root: root, AdmitAny: true}, engine, notMounted)
 	awaitGCs(t, engine, 1)
 	if _, err := second.Stat(ctx, committed); err != nil {
 		t.Fatalf("Stat(%q) error = %v", committed, err)
@@ -3696,7 +3696,7 @@ func TestCloseStopsPendingRetry(t *testing.T) {
 	t.Cleanup(func() { gcRetryInterval = interval })
 	engine := fakeEngineForImages()
 	engine.gcErr = fmt.Errorf("busy: %w", ocicfs.ErrStoreBusy)
-	sn, err := newSnapshotter(context.Background(), Config{Root: t.TempDir(), AllowUnstagedPulls: true}, engine)
+	sn, err := newSnapshotter(context.Background(), Config{Root: t.TempDir(), AdmitAny: true}, engine)
 	if err != nil {
 		t.Fatalf("newSnapshotter() error = %v", err)
 	}
@@ -3955,7 +3955,7 @@ func TestPreparePromotionOutOfBand(t *testing.T) {
 	root := t.TempDir()
 	engine := fakeEngineForImages()
 	engine.objectsDir = t.TempDir()
-	staged := newConfiguredSnapshotter(t, Config{Root: root, AllowUnstagedPulls: true}, engine, notMounted)
+	staged := newConfiguredSnapshotter(t, Config{Root: root, AdmitAny: true}, engine, notMounted)
 	d := pullDerived(t, staged)
 	loadImage(t, staged, "registry.example/a:v1", d.x, d.y)
 	if err := staged.Close(); err != nil {

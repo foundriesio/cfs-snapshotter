@@ -48,12 +48,12 @@ var _ diff.Applier = (*snapshotter)(nil)
 // Apply handles a layer through a staging placeholder between Prepare and
 // Commit. Other mount types are declined so another differ can handle them.
 //
-// Records with image labels require staged mode. Their layer descriptor
+// Records with image labels require admit-any mode. Their layer descriptor
 // must match the manifest before ingestion. The last layer finishes the
 // build; labels written before ingestion let Commit preserve its hold.
 //
 // Records without image labels use applyLoadedLayer in either mode:
-// reuse a stored chain, or build from the content store in staged mode.
+// reuse a stored chain, or build from the content store in admit-any mode.
 func (s *snapshotter) Apply(ctx context.Context, desc ocispec.Descriptor, mounts []mount.Mount, _ ...diff.ApplyOpt) (ocispec.Descriptor, error) {
 	if len(mounts) != 1 || mounts[0].Type != stagingMountType {
 		return ocispec.Descriptor{}, fmt.Errorf("cfs differ applies staged layers only: %w", errdefs.ErrNotImplemented)
@@ -73,8 +73,8 @@ func (s *snapshotter) Apply(ctx context.Context, desc ocispec.Descriptor, mounts
 		return s.applyLoadedLayer(ctx, ns, key, labels[intermediateSnapshotLabel], start)
 	}
 	// Only a daemon that stages its pulls builds from runtime content.
-	if !s.allowUnstagedPulls {
-		return ocispec.Descriptor{}, fmt.Errorf("image unavailable for layer chain %s: this snapshotter requires it in the ocicfs store; run ocicfs pull <image>: %w", labels[intermediateSnapshotLabel], errdefs.ErrFailedPrecondition)
+	if !s.admitAny {
+		return ocispec.Descriptor{}, fmt.Errorf("image unavailable for layer chain %s: this snapshotter requires it in the ocicfs store (-admit=preloaded); run ocicfs pull <image>: %w", labels[intermediateSnapshotLabel], errdefs.ErrFailedPrecondition)
 	}
 	layer, err := s.resolveStagedLayer(ctx, labels)
 	if err != nil {
@@ -246,7 +246,7 @@ func (s *snapshotter) retireBuildsEndingAt(ns, chainID string) {
 
 // applyLoadedLayer resolves an archive layer by chain ID, checking the store
 // first. A full image match is adopted; a prefix returns only its diff ID.
-// Missing chains require staged mode and are handled by buildLoadedChain.
+// Missing chains require admit-any mode and are handled by buildLoadedChain.
 // Successful matches retire builds that this chain's commit would strand.
 // The descriptor is not checked: the chain identifies the uncompressed
 // content, whatever the blob compression.
@@ -260,8 +260,8 @@ func (s *snapshotter) applyLoadedLayer(ctx context.Context, ns, key, chainID str
 	}
 	source := "store"
 	if diffID == "" {
-		if !s.allowUnstagedPulls {
-			return ocispec.Descriptor{}, fmt.Errorf("image unavailable for layer chain %s: this snapshotter requires it in the ocicfs store; run ocicfs pull --from-tar <archive> before docker load, and use docker load --platform %s for a multi-platform archive: %w", chainID, hostPlatform(), errdefs.ErrFailedPrecondition)
+		if !s.admitAny {
+			return ocispec.Descriptor{}, fmt.Errorf("image unavailable for layer chain %s: this snapshotter requires it in the ocicfs store (-admit=preloaded); run ocicfs pull --from-tar <archive> before docker load, and use docker load --platform %s for a multi-platform archive: %w", chainID, hostPlatform(), errdefs.ErrFailedPrecondition)
 		}
 		if diffID, leaf, err = s.buildLoadedChain(ctx, ns, key, chainID); err != nil {
 			return ocispec.Descriptor{}, err

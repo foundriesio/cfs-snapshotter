@@ -26,6 +26,6 @@ Description: composefs-backed remote snapshotter for containerd
  from fs-verity-protected objects.
  .
  By default a plain docker/containerd pull fills the store; started with
- -allow-unstaged-pulls=false the daemon instead serves only images placed
+ -admit=preloaded the daemon instead serves only images placed
  in the store out of band with ocicfs, pinned by digest. Building pulled
  images into the store uses mkcomposefs from the composefs package.

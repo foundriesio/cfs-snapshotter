@@ -81,7 +81,7 @@ func (f *fakeIntrospectionServer) setPlugins(plugins []*introspectionapi.Plugin)
 // STATUS line it pushed to a fake systemd notification socket ("" when none
 // arrived), and the probe's return value — non-nil exactly when the first
 // verdict was binding.
-func runProbe(t *testing.T, version string, plugins []*introspectionapi.Plugin, socketAddress string, staged bool) ([]*logrus.Entry, string, error) {
+func runProbe(t *testing.T, version string, plugins []*introspectionapi.Plugin, socketAddress string, admitAny bool) ([]*logrus.Entry, string, error) {
 	t.Helper()
 	containerdSocket := filepath.Join(t.TempDir(), "containerd.sock")
 	listener, err := net.Listen("unix", containerdSocket)
@@ -108,7 +108,7 @@ func runProbe(t *testing.T, version string, plugins []*introspectionapi.Plugin, 
 	ctx, cancel := context.WithCancel(log.WithLogger(context.Background(), logrus.NewEntry(logger)))
 	done := make(chan error, 1)
 	go func() {
-		done <- probeContainerd(ctx, containerdSocket, socketAddress, staged)
+		done <- probeContainerd(ctx, containerdSocket, socketAddress, admitAny)
 	}()
 
 	status := ""
@@ -303,7 +303,7 @@ func TestProbeReportsWiredContainerd(t *testing.T) {
 	}
 }
 
-// TestProbeReportsMissingDifferEntry covers that staged mode, which needs the
+// TestProbeReportsMissingDifferEntry covers that admit-any mode, which needs the
 // differ to be handed its layers, reports a missing diff entry and treats it
 // as binding.
 func TestProbeReportsMissingDifferEntry(t *testing.T) {
@@ -336,6 +336,6 @@ func TestProbeDegradesOnMissingDifferOutOfBand(t *testing.T) {
 		t.Fatalf("status = %q, want %q", status, want)
 	}
 	if err != nil {
-		t.Fatalf("probe returned %v, want nil: out-of-band mode starts without a differ", err)
+		t.Fatalf("probe returned %v, want nil: preloaded mode starts without a differ", err)
 	}
 }

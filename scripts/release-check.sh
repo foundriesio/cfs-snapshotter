@@ -49,7 +49,7 @@ binary() {
     *-dirty*) fail "binary was built from a dirty tree: $ver_out" ;;
     esac
 
-    "$bin" -help 2>&1 | grep -q allow-unstaged-pulls || fail "-help failed"
+    "$bin" -help 2>&1 | grep -q -- -admit || fail "-help failed"
     echo "release-check: binary OK ($arch, $ver_out)"
 }
 
@@ -99,7 +99,7 @@ tar -xzf "/rel/$NAME"
 install -m 0755 "$(basename "$NAME" .tar.gz)/containerd-cfs-grpc" \
     /usr/local/bin/containerd-cfs-grpc
 containerd-cfs-grpc -version
-containerd-cfs-grpc -help 2>&1 | grep -q allow-unstaged-pulls
+containerd-cfs-grpc -help 2>&1 | grep -q -- -admit
 EOF
     done
     echo "release-check: install OK ($tarball)"

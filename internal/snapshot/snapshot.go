@@ -62,7 +62,7 @@
 //
 // Archive loads identify each layer chain through an extract key. Prepare
 // creates a staging snapshot in either mode; Apply reuses stored chains
-// and, in staged mode, builds missing images from the content store.
+// and, in admit-any mode, builds missing images from the content store.
 // Prefix matches leave staging records. If later used as a container's
 // image, such a record must first adopt or build an image ending there.
 //
@@ -211,9 +211,9 @@ type snapshotter struct {
 	// updateInfo writes a record's labels inside a transaction; it is
 	// storage.UpdateInfo in production and is replaced in tests.
 	updateInfo func(context.Context, snapshots.Info, ...string) (snapshots.Info, error)
-	// allowUnstagedPulls stages every pull instead of admitting only images
+	// admitAny stages every pull instead of admitting only images
 	// already in the ocicfs store.
-	allowUnstagedPulls bool
+	admitAny bool
 	// mountMu serializes shared chain mount creation and teardown.
 	mountMu sync.Mutex
 	// promoteMu serializes the promotion of recorded chains into chain
@@ -287,13 +287,13 @@ type Config struct {
 	Root string
 	// OcicfsRoot is the root of the ocicfs store the images are served from.
 	OcicfsRoot string
-	// AllowUnstagedPulls selects the machine's work mode. False admits only
+	// AdmitAny selects the machine's work mode. False admits only
 	// images already in the ocicfs store, put there out of band, and declines
 	// every other pull. True stages every pull — even of an image the store
 	// already holds — and builds it into the store once the chain is
 	// complete, so the runtime fetches and keeps each pulled image's layers
 	// in its own content store.
-	AllowUnstagedPulls bool
+	AdmitAny bool
 	// ContainerdAddress is the address of containerd's gRPC socket, whose
 	// content store the layers of a staged pull are read back from.
 	ContainerdAddress string
@@ -309,11 +309,11 @@ func NewSnapshotter(ctx context.Context, cfg Config) (Snapshotter, error) {
 	if err != nil {
 		return nil, fmt.Errorf("create ocicfs engine: %w", err)
 	}
-	// Staged mode builds every pull into the ocicfs store, so a host missing
+	// Admit-any mode builds every pull into the ocicfs store, so a host missing
 	// mkcomposefs or fs-verity fails every pull; refusing to start reports
 	// the misconfiguration at install time instead of at the first image.
-	// Out-of-band mode builds nothing locally and needs neither.
-	if cfg.AllowUnstagedPulls {
+	// Preloaded mode builds nothing locally and needs neither.
+	if cfg.AdmitAny {
 		if err := errors.Join(engine.PreflightTools(), engine.PreflightStore()); err != nil {
 			return nil, fmt.Errorf("staged-pull prerequisites: %w: %w", ErrPrerequisites, err)
 		}
@@ -348,20 +348,20 @@ func newSnapshotter(ctx context.Context, cfg Config, engine engineAPI) (*snapsho
 	}
 	lifetime, cancel := context.WithCancel(context.Background())
 	s := &snapshotter{
-		root:               root,
-		objectsDir:         objectsDir,
-		ms:                 ms,
-		engine:             engine,
-		blobs:              newContentBlobs(cfg.ContainerdAddress),
-		mounted:            mountinfo.Mounted,
-		updateInfo:         storage.UpdateInfo,
-		allowUnstagedPulls: cfg.AllowUnstagedPulls,
-		builds:             make(map[buildKey]*openBuild),
-		finishing:          make(map[string]*openBuild),
-		kick:               make(chan struct{}, 1),
-		retry:              make(chan struct{}, 1),
-		lifetime:           lifetime,
-		cancel:             cancel,
+		root:       root,
+		objectsDir: objectsDir,
+		ms:         ms,
+		engine:     engine,
+		blobs:      newContentBlobs(cfg.ContainerdAddress),
+		mounted:    mountinfo.Mounted,
+		updateInfo: storage.UpdateInfo,
+		admitAny:   cfg.AdmitAny,
+		builds:     make(map[buildKey]*openBuild),
+		finishing:  make(map[string]*openBuild),
+		kick:       make(chan struct{}, 1),
+		retry:      make(chan struct{}, 1),
+		lifetime:   lifetime,
+		cancel:     cancel,
 	}
 	// A previous run may have left holds behind — a build finished but never
 	// committed, a record that never landed — and the flag that says there is
@@ -1037,7 +1037,7 @@ func (s *snapshotter) createAndCommitIntermediateVirtualSnapshot(ctx context.Con
 	if imageRef == "" {
 		return fmt.Errorf("layer chain %q was pulled without image-identity annotations; containerd forwards them only when its config sets enable_remote_snapshot_annotations = \"true\" under [proxy_plugins.cfs.exports]: %w", name, errdefs.ErrFailedPrecondition)
 	}
-	if s.allowUnstagedPulls {
+	if s.admitAny {
 		return errStagePull
 	}
 	info, err := s.engine.Inspect(ctx, imageRef)
@@ -1360,7 +1360,7 @@ func (s *snapshotter) composeLowers(ctx context.Context, ancestors []ancestor) (
 }
 
 // promoteStagedRecord makes a staged chain usable as a container's image.
-// It adopts a stored image ending at the chain or, in staged mode, builds
+// It adopts a stored image ending at the chain or, in admit-any mode, builds
 // one from complete content in containerd's content store. A stored prefix
 // alone is not enough.
 //
@@ -1419,8 +1419,8 @@ func (s *snapshotter) promoteStagedRecord(ctx context.Context, name string) (str
 		}).Info("cfs snapshotter: promoted recorded chain")
 		return chainID, nil
 	}
-	if !s.allowUnstagedPulls {
-		return "", fmt.Errorf("image unavailable for layer chain %s: this snapshotter requires it in the ocicfs store; use ocicfs pull <image>: %w", chainID, errdefs.ErrFailedPrecondition)
+	if !s.admitAny {
+		return "", fmt.Errorf("image unavailable for layer chain %s: this snapshotter requires it in the ocicfs store (-admit=preloaded); use ocicfs pull <image>: %w", chainID, errdefs.ErrFailedPrecondition)
 	}
 	manifests, err := s.loadedManifests(ctx)
 	if err != nil {

@@ -39,15 +39,15 @@ sudo apt install ./cfs-snapshotter_<ver>_<arch>.deb
 This installs `/usr/bin/containerd-cfs-grpc` and a `cfs-snapshotter`
 systemd service, enabled and started. The daemon refuses to run until
 its prerequisites are met, and the unit shows as **failed** until they
-are: the staged-mode store tools immediately (most visibly
+are: the admit-any mode's store tools immediately (most visibly
 `mkcomposefs`, since the composefs package is not yet in the Debian or
 Ubuntu archives), and the containerd side — version 2.1+ and the
 [wiring below](#connect-containerd-and-docker) — as soon as containerd
 is up to answer. Once the
 [runtime requirements](#runtime-requirements) and the wiring are in
 place, `sudo systemctl restart cfs-snapshotter` recovers the unit.
-Daemon flags (for example the out-of-band mode,
-`-allow-unstaged-pulls=false`, which needs no local build tools) go in
+Daemon flags (for example the preloaded mode,
+`-admit=preloaded`, which needs no local build tools) go in
 `/etc/default/cfs-snapshotter`, followed by
 `sudo systemctl restart cfs-snapshotter`.
 
@@ -207,7 +207,7 @@ containerd image store and select cfs in `/etc/docker/daemon.json`, then
 }
 ```
 
-On Docker 29.9 and later the out-of-band mode also needs Docker's `lazy-pull`
+On Docker 29.9 and later the preloaded mode also needs Docker's `lazy-pull`
 feature: without it `docker pull` fetches every layer even when the
 snapshotter already holds the image (verified on Docker 29.9.1). Add it to
 the `features` object above:
@@ -229,14 +229,14 @@ containerd-cfs-grpc -version
 ```
 
 prints `containerd-cfs-grpc v<ver> (<commit>)` for a release build. One
-command verifies the whole setup — the staged-mode prerequisites and the
+command verifies the whole setup — the admit-any mode's prerequisites and the
 containerd wiring — and exits non-zero on any failure:
 
 ```sh
 sudo containerd-cfs-grpc -check
 ```
 
-Then, with the service running and containerd connected (default staged
+Then, with the service running and containerd connected (default admit-any
 mode):
 
 ```sh
@@ -281,15 +281,15 @@ Installation works on any Linux; *running* the snapshotter needs:
 - **Docker Engine 29 or newer, if Docker is used** — Docker reaches the
   snapshotter through its containerd image store, selected by
   `storage-driver` (tested with Docker 29.3; 29.9 and later also need the
-  `lazy-pull` feature for the out-of-band mode, see above).
+  `lazy-pull` feature for the preloaded mode, see above).
 - **`mkcomposefs`** (from the
   [composefs](https://github.com/composefs/composefs) project) — needed by
-  the default staged-pull mode, which builds pulled images into the store;
+  the default admit-any mode, which builds pulled images into the store;
   the daemon refuses to start in that mode without it. The .deb declares
   the `composefs` package as a Recommends because it is not yet in the
   Debian-stable or Ubuntu archives.
 - **[ocicfs](https://github.com/foundriesio/ocicfs)** — only for the
-  out-of-band mode (`-allow-unstaged-pulls=false`), where images enter the
+  preloaded mode (`-admit=preloaded`), where images enter the
   store via `ocicfs pull` before the runtime asks for them.
 - **Root privileges**: the daemon mounts, uses loop devices, and enables
   fs-verity.

@@ -24,8 +24,8 @@ PARTIAL_LAYER_BYTES=134217728
 
 work=""
 # ocicfs_root and cfs_root name the stores the phase in progress runs against.
-# The warm phase pins the out-of-band mode on the devcontainer's default
-# stores; the cold phase runs the staged mode — the boot posture — with
+# The warm phase pins the preloaded mode on the devcontainer's default
+# stores; the cold phase runs the admit-any mode — the boot posture — with
 # stores of its own, because the two work modes are never mixed on one
 # device.
 ocicfs_root="${WARM_OCICFS_ROOT}"
@@ -131,10 +131,10 @@ cleanup() {
 			echo "warning: failed to collect ${pair_store}" >&2
 	fi
 	# Either phase's failure leaves its own daemon running; put the
-	# devcontainer back in its boot posture (staged mode, default stores),
+	# devcontainer back in its boot posture (admit-any mode, default stores),
 	# pinned against any mode or store the caller's environment carries.
 	# On the success path this reconciles to a no-op.
-	CFS_ALLOW_UNSTAGED_PULLS=1 CFS_ROOT="${WARM_CFS_ROOT}" OCICFS_ROOT="${WARM_OCICFS_ROOT}" \
+	CFS_ADMIT=any CFS_ROOT="${WARM_CFS_ROOT}" OCICFS_ROOT="${WARM_OCICFS_ROOT}" \
 		"${SCRIPT_DIR}/run-cfs.sh" >&2 ||
 		echo "warning: failed to restore the boot snapshotter posture" >&2
 }
@@ -877,7 +877,7 @@ assert_mount_recovery() {
 	docker create --name cfs-e2e-recovery "${image_ref}" >/dev/null || fail "create recovery container"
 	umount "${chainfs}" || fail "unmount shared image mount"
 	findmnt -M "${chainfs}" >/dev/null 2>&1 && fail "shared image mount survived explicit unmount"
-	CFS_ALLOW_UNSTAGED_PULLS=0 CFS_ROOT="${WARM_CFS_ROOT}" OCICFS_ROOT="${WARM_OCICFS_ROOT}" \
+	CFS_ADMIT=preloaded CFS_ROOT="${WARM_CFS_ROOT}" OCICFS_ROOT="${WARM_OCICFS_ROOT}" \
 		CFS_FORCE_RESTART=1 "${SCRIPT_DIR}/run-cfs.sh" >&2 ||
 		fail "restart snapshotter"
 	output="$(docker start -a cfs-e2e-recovery)" || fail "start existing container after mount loss"
@@ -1174,11 +1174,11 @@ assert_rootfs_is_base() {
 # never reaches the snapshotter: containerd finds every chain of the base
 # recorded by the derived pull and reports it unpacked without a handshake,
 # fetching no layer. What the base's first container meets is therefore the
-# derived pull's record of that chain. In out-of-band mode that record is a
+# derived pull's record of that chain. In preloaded mode that record is a
 # chain member and the container mounts whatever the store holds under the
 # chain: the base, when the agent pulled it, otherwise nothing — the run
 # fails until the agent pulls the base, with no restart and no re-pull. In
-# staged mode, a base the agent pulled is adopted by the derived pull as it
+# admit-any mode, a base the agent pulled is adopted by the derived pull as it
 # applies the layer at the base's chain: that record holds the stored base
 # and is a chain member from its commit, and nothing is promoted. A base the
 # agent did not pull leaves a staged record that was never built, and the
@@ -1187,7 +1187,7 @@ assert_rootfs_is_base() {
 # derived image and goes with its own removal. prepull is whether the
 # agent pulled the base before the runtime did. The derived image enters the
 # store the way its mode admits: pulled by the agent out of band, built by
-# the runtime's own pull in staged mode — and by the agent as well when the
+# the runtime's own pull in admit-any mode — and by the agent as well when the
 # base is, so an agent's pair is one pair.
 assert_base_after_derived() {
 	local nonce="$1" mode="$2" prepull="$3" layers=2
@@ -1210,7 +1210,7 @@ assert_base_after_derived() {
 	[ "${base_first}" = "${derived_first}" ] || fail "the base is not a prefix of the derived image"
 
 	pair_store="${ocicfs_root}"
-	if [ "${mode}" = out-of-band ] || [ "${prepull}" = 1 ]; then
+	if [ "${mode}" = preloaded ] || [ "${prepull}" = 1 ]; then
 		pair_agent_refs="${derived_repo}@${derived_root}"
 		stage_image "${derived_repo}" "${derived_layout}"
 	fi
@@ -1222,7 +1222,7 @@ assert_base_after_derived() {
 	docker pull "${pair_derived_ref}" >/dev/null || fail "docker pull of the derived image failed"
 	[ "$(image_bindings "${derived_root}")" -eq 1 ] ||
 		fail "the derived image's pull did not leave exactly one composefs image"
-	if [ "${mode}" = staged ] && [ "${prepull}" = 1 ]; then
+	if [ "${mode}" = any ] && [ "${prepull}" = 1 ]; then
 		tail -n "+$((offset + 1))" "${CFS_LOG}" | grep -q '"cfs differ: adopted stored image for chain"' ||
 			fail "the derived image's pull did not adopt the stored base at its chain"
 	else
@@ -1234,7 +1234,7 @@ assert_base_after_derived() {
 	docker pull "${pair_base_ref}" >/dev/null || fail "docker pull of the base after the derived image failed"
 	applies="$(tail -n "+$((offset + 1))" "${CFS_LOG}" | grep -c '"cfs differ: applied staged layer"' || true)"
 	[ "${applies}" -eq 0 ] || fail "the base's pull applied ${applies} layers although its chain was recorded"
-	if [ "${mode}" = out-of-band ]; then
+	if [ "${mode}" = preloaded ]; then
 		while read -r digest; do
 			content_has "${digest}" && fail "a layer was fetched: ${digest}"
 		done < <(jq -r '.layers[].digest' "${derived_layout}/blobs/sha256/${derived_root#sha256:}")
@@ -1243,7 +1243,7 @@ assert_base_after_derived() {
 		[ "$(image_bindings "${base_root}")" -eq 1 ] || fail "the base's pull built a second composefs image"
 	else
 		no_image_binding "${base_root}" || fail "the base's pull built it although its chain was recorded"
-		if [ "${mode}" = out-of-band ]; then
+		if [ "${mode}" = preloaded ]; then
 			if output="$(docker run --network=none --name cfs-e2e-pair "${pair_base_ref}" 2>&1)"; then
 				fail "docker run of a base the store does not hold succeeded: ${output}"
 			fi
@@ -1263,7 +1263,7 @@ assert_base_after_derived() {
 	[ "${output}" = "cfs hello ${pair_nonce}" ] || fail "unexpected container output: ${output}"
 	assert_rootfs_is_base "${pair_base_ref}" "${layers}" "${pair_nonce}"
 	[ "$(image_bindings "${base_root}")" -eq 1 ] || fail "the base is not exactly one composefs image in the store"
-	if [ "${mode}" = staged ] && [ "${prepull}" = 0 ]; then
+	if [ "${mode}" = any ] && [ "${prepull}" = 0 ]; then
 		tail -n "+$((offset + 1))" "${CFS_LOG}" | grep -q '"cfs snapshotter: promoted recorded chain"' ||
 			fail "the base's first container did not promote its chain record"
 		[ -n "$(ocicfs_holder_of_digest "${base_root}")" ] ||
@@ -1272,7 +1272,7 @@ assert_base_after_derived() {
 		! tail -n "+$((offset + 1))" "${CFS_LOG}" | grep -q '"cfs snapshotter: promoted recorded chain"' ||
 			fail "a chain record was promoted although the base was stored"
 	fi
-	if [ "${mode}" = staged ] && [ "${prepull}" = 1 ]; then
+	if [ "${mode}" = any ] && [ "${prepull}" = 1 ]; then
 		# The adopted record holds the agent's base, so it cannot be removed.
 		assert_ocicfs_remove_declines "${base_repo}@${base_root}"
 	fi
@@ -1283,7 +1283,7 @@ assert_base_after_derived() {
 		fail "docker run of the base after the derived image was removed failed"
 	[ "${output}" = "cfs hello ${pair_nonce}" ] || fail "unexpected container output: ${output}"
 	docker rmi "${pair_base_ref}" >/dev/null || fail "docker rmi of the base failed"
-	if [ "${mode}" = staged ] && [ "${prepull}" = 0 ]; then
+	if [ "${mode}" = any ] && [ "${prepull}" = 0 ]; then
 		no_image_binding "${base_root}" || fail "the promoted base survived its removal from the runtime"
 		no_image_binding "${derived_root}" || fail "the derived image survived its removal from the runtime"
 	else
@@ -1293,7 +1293,7 @@ assert_base_after_derived() {
 	pair_base_ref=""
 	pair_derived_ref=""
 	pair_agent_refs=""
-	echo "PASS: ${mode} mode, base ${flavor}: a base pulled after its derived image ran as the base"
+	echo "PASS: admit=${mode}, base ${flavor}: a base pulled after its derived image ran as the base"
 }
 
 # assert_staged_rmi_reclaims covers the runtime dropping a staged image: the
@@ -1355,7 +1355,7 @@ assert_staged_self_heal() {
 	docker pull "${ref}" >/dev/null || fail "docker pull of the self-heal image failed"
 	root="$(manifest_digest "${layout}")"
 	ocicfs_cli hold --holder "${stray}" "${root}" >&2 || fail "cannot plant the stray hold"
-	CFS_INGEST_WORKERS=1 CFS_ALLOW_UNSTAGED_PULLS=1 CFS_ROOT="${COLD_CFS_ROOT}" OCICFS_ROOT="${COLD_OCICFS_ROOT}" \
+	CFS_INGEST_WORKERS=1 CFS_ADMIT=any CFS_ROOT="${COLD_CFS_ROOT}" OCICFS_ROOT="${COLD_OCICFS_ROOT}" \
 		CFS_FORCE_RESTART=1 "${SCRIPT_DIR}/run-cfs.sh" >&2 || fail "restart the snapshotter"
 	grep -q "releasing a hold no snapshot record owns" "${CFS_LOG}" ||
 		fail "the restarted snapshotter did not report releasing the stray hold"
@@ -1473,7 +1473,7 @@ assert_ingest_workers_converge() {
 	root="$(manifest_digest "${layout}")" || fail "cannot read the cold manifest digest"
 	[ -n "${cold_composefs}" ] || fail "the one-worker cold pull recorded no composefs digest"
 
-	CFS_INGEST_WORKERS=2 CFS_ALLOW_UNSTAGED_PULLS=1 CFS_ROOT="${COLD_CFS_ROOT}" OCICFS_ROOT="${COLD_OCICFS_ROOT}" \
+	CFS_INGEST_WORKERS=2 CFS_ADMIT=any CFS_ROOT="${COLD_CFS_ROOT}" OCICFS_ROOT="${COLD_OCICFS_ROOT}" \
 		"${SCRIPT_DIR}/run-cfs.sh" >&2 || fail "restart the snapshotter with two ingest workers"
 	offset="$(wc -l <"${CFS_LOG}")"
 	docker pull "${cold_ref}" >/dev/null || fail "re-pull at two ingest workers failed"
@@ -1616,7 +1616,7 @@ assert_load_declined() {
 	no_image_binding "${root}" || fail "the declined load built the image"
 	docker rmi "${load_derived_tag}" >/dev/null || fail "docker rmi of the declined image failed"
 	wait_until "the declined load's records to go" 60 0.5 no_cfs_snapshots
-	echo "PASS: out-of-band mode: docker load of an image the store lacks was declined, naming the sideload"
+	echo "PASS: admit=preloaded: docker load of an image the store lacks was declined, naming the sideload"
 }
 
 # assert_load_built covers docker load alone on a staging daemon: nothing is
@@ -1645,7 +1645,7 @@ assert_load_built() {
 	fi
 	no_image_binding "${root}" || fail "the composefs image survived docker rmi"
 	wait_until "the loaded image's records to go" 60 0.5 no_cfs_snapshots
-	echo "PASS: staged mode: an image loaded with docker load alone was built from its content, ran offline and was reclaimed by docker rmi"
+	echo "PASS: admit=any: an image loaded with docker load alone was built from its content, ran offline and was reclaimed by docker rmi"
 }
 
 # assert_load_from_store covers the offline recipe: the agent sideloads the
@@ -1675,7 +1675,7 @@ assert_load_from_store() {
 	ocicfs_remove_when_released "${ref}"
 	pair_agent_refs=""
 	wait_until "the loaded image's records to go" 60 0.5 no_cfs_snapshots
-	echo "PASS: ${mode} mode: a sideloaded image loaded with docker load ran offline from the store"
+	echo "PASS: admit=${mode}: a sideloaded image loaded with docker load ran offline from the store"
 }
 
 # assert_load_base_after_derived loads a base image after an image derived
@@ -1686,7 +1686,7 @@ assert_load_from_store() {
 # runs from it as it is; with the base sideloaded only between the loads
 # (store=late) the record answered as a prefix of the derived image, and the
 # base's first container promotes it by adopting the stored base. With
-# nothing sideloaded (store=none, staged mode only) the derived load built
+# nothing sideloaded (store=none, admit-any mode only) the derived load built
 # the derived image from its content and answered the base's chain as a
 # layer of it, and the base's first container promotes the record by
 # building the base from the content its load left. Every way the base runs
@@ -1759,10 +1759,10 @@ assert_load_base_after_derived() {
 		no_image_binding "${base_root}" || fail "the base built by its promotion survived docker rmi"
 		no_image_binding "${derived_root}" || fail "the derived image built by its load survived docker rmi"
 	fi
-	echo "PASS: ${mode} mode, base sideloaded ${store}: a base loaded after its derived image ran as the base offline"
+	echo "PASS: admit=${mode}, base sideloaded ${store}: a base loaded after its derived image ran as the base offline"
 }
 
-# assert_sideload_then_pull covers the out-of-band alternative to docker
+# assert_sideload_then_pull covers the preloaded alternative to docker
 # load: the agent sideloads the archive, and the runtime pulls the image by
 # the digest the sideload recorded while the registry is reachable, fetching
 # its metadata and no layer, so containerd keeps no copy of the archive's
@@ -1796,7 +1796,7 @@ assert_sideload_then_pull() {
 	wait_until "the pulled image's records to go" 60 0.5 no_cfs_snapshots
 	wait_until "the store to collect the pulled image" 60 0.5 collect_store
 	no_image_binding "${root}" || fail "the pulled image survived its removal and a collection"
-	echo "PASS: out-of-band mode: a sideloaded image pulled by digest fetched no layer and ran offline"
+	echo "PASS: admit=preloaded: a sideloaded image pulled by digest fetched no layer and ran offline"
 }
 
 # assert_load_offline runs the load legs with the registry stopped, against
@@ -1805,17 +1805,17 @@ assert_load_offline() {
 	local mode="$1"
 	drain_runtime_images
 	pair_store="${ocicfs_root}"
-	if [ "${mode}" = out-of-band ]; then
+	if [ "${mode}" = preloaded ]; then
 		assert_sideload_then_pull
 	fi
 	stop_registry
-	if [ "${mode}" = out-of-band ]; then
+	if [ "${mode}" = preloaded ]; then
 		assert_load_declined
 	else
 		assert_load_built
 	fi
 	assert_load_from_store "${mode}"
-	if [ "${mode}" = staged ]; then
+	if [ "${mode}" = any ]; then
 		assert_load_base_after_derived "${mode}" none
 	fi
 	assert_load_base_after_derived "${mode}" late
@@ -1827,11 +1827,11 @@ warm_phase() {
 	local nonce="$1" chainfs
 	echo "== warm phase: images enter the store out of band =="
 	drain_runtime_images
-	# The devcontainer boots in staged mode; the warm legs need the
-	# out-of-band posture, pinned explicitly rather than inherited.
-	CFS_ALLOW_UNSTAGED_PULLS=0 CFS_ROOT="${WARM_CFS_ROOT}" OCICFS_ROOT="${WARM_OCICFS_ROOT}" \
+	# The devcontainer boots in admit-any mode; the warm legs need the
+	# preloaded posture, pinned explicitly rather than inherited.
+	CFS_ADMIT=preloaded CFS_ROOT="${WARM_CFS_ROOT}" OCICFS_ROOT="${WARM_OCICFS_ROOT}" \
 		"${SCRIPT_DIR}/run-cfs.sh" >&2 ||
-		fail "start the snapshotter in out-of-band mode"
+		fail "start the snapshotter in preloaded mode"
 	forget_ocicfs_images
 	assert_handshake_identity "${nonce}"
 	seed_and_stage "${nonce}"
@@ -1846,9 +1846,9 @@ warm_phase() {
 	assert_warm_hold_released
 	assert_warm_tag_identity "${nonce}"
 	assert_delta_fast_path
-	assert_base_after_derived "${nonce}" out-of-band 1
-	assert_base_after_derived "${nonce}" out-of-band 0
-	assert_load_offline out-of-band
+	assert_base_after_derived "${nonce}" preloaded 1
+	assert_base_after_derived "${nonce}" preloaded 0
+	assert_load_offline preloaded
 }
 
 cold_phase() {
@@ -1863,7 +1863,7 @@ cold_phase() {
 	ocicfs_root="${COLD_OCICFS_ROOT}"
 	cfs_root="${COLD_CFS_ROOT}"
 	# One ingest worker first; the last leg switches to two and compares.
-	CFS_INGEST_WORKERS=1 CFS_ALLOW_UNSTAGED_PULLS=1 CFS_ROOT="${COLD_CFS_ROOT}" OCICFS_ROOT="${COLD_OCICFS_ROOT}" \
+	CFS_INGEST_WORKERS=1 CFS_ADMIT=any CFS_ROOT="${COLD_CFS_ROOT}" OCICFS_ROOT="${COLD_OCICFS_ROOT}" \
 		"${SCRIPT_DIR}/run-cfs.sh" >&2 || fail "start the snapshotter in cold-pull mode"
 	# The daemon collects the store once at start, on its own and retried
 	# while busy; run-cfs.sh truncated the log, so the first such entry is
@@ -1877,17 +1877,17 @@ cold_phase() {
 	assert_cold_repull_refetches "${nonce}"
 	assert_staged_rmi_reclaims
 	assert_cold_prefix_dedup "${nonce}"
-	assert_base_after_derived "${nonce}" staged 1
-	assert_base_after_derived "${nonce}" staged 0
+	assert_base_after_derived "${nonce}" any 1
+	assert_base_after_derived "${nonce}" any 0
 	assert_interrupted_pull_converges "${nonce}"
 	assert_cold_mixed_door "${nonce}"
 	assert_staged_adoption "${nonce}"
 	assert_staged_self_heal "${nonce}"
 	assert_ingest_workers_converge
-	assert_load_offline staged
+	assert_load_offline any
 
 	drain_runtime_images
-	CFS_ALLOW_UNSTAGED_PULLS=1 CFS_ROOT="${WARM_CFS_ROOT}" OCICFS_ROOT="${WARM_OCICFS_ROOT}" \
+	CFS_ADMIT=any CFS_ROOT="${WARM_CFS_ROOT}" OCICFS_ROOT="${WARM_OCICFS_ROOT}" \
 		"${SCRIPT_DIR}/run-cfs.sh" >&2 || fail "restore the boot snapshotter posture"
 	ocicfs_root="${WARM_OCICFS_ROOT}"
 	cfs_root="${WARM_CFS_ROOT}"

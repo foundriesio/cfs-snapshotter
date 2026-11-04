@@ -17,7 +17,7 @@ the same containerd — is pointed at them through two `proxy_plugins` entries.
 > it always would and the snapshotter's differ ingests each one into the
 > store as it lands, building the composefs image;
 > see [Pulling without staging first](#pulling-without-staging-first). A
-> machine set up the other way (`-allow-unstaged-pulls=false`) never fills
+> machine set up the other way (`-admit=preloaded`) never fills
 > the store itself: images enter it out of band via `ocicfs pull`, pinned by
 > digest, and the snapshotter answers the unpacker's per-layer handshake
 > only when the runtime-stamped image reference resolves to a held image
@@ -40,7 +40,7 @@ The defaults match the config below; see `-help` for the full list.
 | `-root` | `/var/lib/containerd-cfs-grpc` | Where the snapshotter keeps its metadata and each snapshot's directories. |
 | `-ocicfs-root` | `/var/lib/ocicfs` | The ocicfs store images are served from. |
 | `-containerd-address` | `/run/containerd/containerd.sock` | containerd's gRPC socket, whose content store the layers of a staged pull are read back from. |
-| `-allow-unstaged-pulls` | `true` | Selects the machine's work mode: stage every pull through containerd's content store and build it into the ocicfs store, instead of admitting only images already there. `=false` selects the out-of-band mode. |
+| `-admit` | `any` | Which images the machine admits: `any` stages every pull or load through containerd's content store and builds it into the ocicfs store; `preloaded` admits only images already in the store (put there with `ocicfs pull`) and declines the rest. |
 | `-ingest-workers` | `0` (ocicfs's default, 2) | How many layers staged pulls ingest into the ocicfs store at once, across every pull in progress. Two is the gain on every platform measured; a many-core host with fast storage may take a few percent more from four. |
 | `-log-level` | `info` | `trace`, `debug`, `info`, `warn`, `error`, `fatal`, `panic`. |
 | `-check` | off | Check the runtime prerequisites and the containerd wiring of both the snapshotter and the differ instead of serving: one verdict line per aspect, the effective ingest worker count, and a non-zero exit on any failure. |
@@ -114,7 +114,7 @@ the containerd image store and select cfs in `/etc/docker/daemon.json`, then
 }
 ```
 
-On Docker 29.9 and later the out-of-band mode also needs Docker's `lazy-pull`
+On Docker 29.9 and later the preloaded mode also needs Docker's `lazy-pull`
 feature: without it `docker pull` fetches every layer even when the
 snapshotter already holds the image (verified on Docker 29.9.1). Add it to
 the `features` object above:
@@ -128,8 +128,8 @@ the `features` object above:
 
 ## 4. Stage, pull, run
 
-This flow is the out-of-band mode: it needs the daemon started with
-`-allow-unstaged-pulls=false` (with the staged default, a pull fetches its
+This flow is the preloaded mode: it needs the daemon started with
+`-admit=preloaded` (with the `-admit=any` default, a pull fetches its
 layers instead; see
 [Pulling without staging first](#pulling-without-staging-first)).
 
@@ -266,22 +266,23 @@ Four residuals of routing layers through the differ are worth knowing:
   ingest. On a device with a faster secondary disk, moving containerd's
   root there is worth more than any worker count.
 
-The two work modes are exclusive, and the flag defaults to on:
+The two work modes are exclusive, and the flag defaults to `any`:
 
-- **Out of band (`-allow-unstaged-pulls=false`).** Only images already in the
+- **Preloaded (`-admit=preloaded`).** Only images already in the
   store are admitted; every other pull is declined at the snapshotter's
   gate. What runs on the machine is decided by whatever put the images
   there — an update agent pulling digests it verified — and not by whoever
   can reach the runtime.
-- **Staged (default).** Any pull the runtime accepts fills the store, and
-  every pull is staged — even of an image the store already holds.
+- **Any (`-admit=any`, default).** Any pull the runtime accepts fills the
+  store, and every pull is staged — even of an image the store already holds.
   The content is still verified as it is built, mounted under fs-verity, and
-  identical on disk to an out-of-band pull; what staged mode gives up is the
-  gate deciding *which* images may arrive, and the out-of-band mode's
+  identical on disk to an out-of-band pull; what `-admit=any` gives up is the
+  gate deciding *which* images may arrive, and the preloaded mode's
   zero-download answer to a pull of a store-held image.
 
-Pick one per machine and keep it: a store filled one way and then served the
-other has records made against a posture that no longer holds.
+Pick one per machine. Switching does not corrupt the store, but images
+admitted under `any` keep serving under `preloaded` until removed, so a
+device reprovisioned as preloaded should start from a fresh store.
 
 ## Loading images offline (`docker load`)
 
@@ -296,7 +297,7 @@ docker run --rm --network=none registry.example/app:1.0
 
 `--from-tar` needs ocicfs v0.4.0 or newer. Take `$digest` from
 the agent's trusted release metadata; the pull fails unless the archive holds
-it. In **staged mode**, `docker load -i app.tar` alone also works: an image
+it. In **`-admit=any`**, `docker load -i app.tar` alone also works: an image
 missing from ocicfs is built from the copy `docker load` puts in containerd.
 
 For a multi-platform archive, add `--platform <os>/<arch>` for the host to
@@ -314,11 +315,11 @@ if grep -q 'Error unpacking image' <<<"$out"; then echo "$out" >&2; exit 1; fi
 ```
 
 Out of band a missing image is declined; sideload it and run the image, no
-second `docker load` needed. In staged mode, a load that only partly
+second `docker load` needed. In admit-any mode, a load that only partly
 provides an image, such as an incomplete image sharing a chain with a
 complete one, succeeds and fails at its first container start instead.
 
-**Images built in staged mode.** The last layer's unpack builds the whole
+**Images built in admit-any mode.** The last layer's unpack builds the whole
 image, so `docker load` takes longer (seconds for a small image). Nothing
 pins what is built. `docker rmi` reclaims it from ocicfs. A sideloaded
 image stays in ocicfs after `docker rmi` until the agent runs
@@ -327,9 +328,9 @@ image stays in ocicfs after `docker rmi` until the agent runs
 **Load base images before derived images.** A base loaded after a derived
 image unpacks nothing, and one loaded into a store holding only the derived
 image is answered as part of it; either way it is adopted or built at its
-first container start, where its build time and failures surface. Out of
-band, the base must already be in ocicfs; staged mode can rebuild it from
-containerd's copy.
+first container start, where its build time and failures surface. In the
+preloaded mode, the base must already be in ocicfs; admit-any mode can
+rebuild it from containerd's copy.
 
 **Prepare the archive.** Save one tagged image per uncompressed archive with
 `docker save -o app.tar <name>:<tag>` on a daemon that uses the containerd
@@ -361,15 +362,15 @@ paths stamp it as follows:
 | CRI local pull | Set `disable_snapshot_annotations = false`; the Unix default is `true`. |
 | CRI transfer-service pull | Keep the mandatory `enable_remote_snapshot_annotations = "true"` proxy-plugin export shown above. |
 
-The stamped value is the reference exactly as invoked. In the out-of-band
+The stamped value is the reference exactly as invoked. In the preloaded
 mode the snapshotter resolves it against the ocicfs store: a digest reference
 must be held, and a tag reference resolves to the digest ocicfs's most recent
-pull by that tag recorded — a tag ocicfs holds no alias for is declined. A
-staging machine stages the pull without consulting the store, but the
+pull by that tag recorded — a tag ocicfs holds no alias for is declined. An
+admit-any machine stages the pull without consulting the store, but the
 reference and manifest digest still anchor the conversion. A missing
 annotation is declined in both modes; non-stamping configurations are
 unsupported for image-identity
-admission. Staged mode turns the two declines that mean "the store
+admission. Admit-any mode turns the two declines that mean "the store
 does not hold this" into admissions that stage the pull; a reference the
 runtime does not stamp at all is still declined, in either mode. If an unsupported client can forge the annotation, chain membership
 still limits it to rootfs content belonging to the named held image, but the
