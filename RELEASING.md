@@ -37,9 +37,12 @@ maintainer's job is choosing the version, writing the summary, and tagging.
    Signing the tag is recommended:
 
    ```sh
-   git tag -a vX.Y.Z        # or: git tag -s vX.Y.Z
+   git tag -s --cleanup=whitespace vX.Y.Z -F notes.md   # or: git tag -a ...
    git push origin vX.Y.Z
    ```
+
+   `--cleanup=whitespace` keeps the `## ` headings, which the default
+   cleanup strips as comments.
 
 3. The workflow builds both architectures, validates everything, uploads
    all artifacts to a **draft** release, and finalizes it as the last
@@ -48,32 +51,40 @@ maintainer's job is choosing the version, writing the summary, and tagging.
    `checksums.txt` listing every artifact including the SBOMs, the source
    archives, and notes consisting of your tag message (plus the generated
    pull-request list when a previous stable release exists).
+5. Remove the Dependabot entries from the generated list, and the "New
+   Contributors" line for Dependabot, with `gh release edit vX.Y.Z
+   --notes-file <file>`.
 
 ## Tag message template
 
+Write one line per paragraph and per bullet, without hard wrapping: the
+release page renders every newline as a line break.
+
 ```
-Highlights
+<project> X.Y.Z — <short summary>
+
+## Highlights
 
 - <the two or three changes a user cares about>
 
-Breaking changes
+## Breaking changes
 
-- <changed daemon flags / on-disk layout / admission behavior, or "None">
+- <changed daemon flags / on-disk layout / admission behavior, or "None since v<previous>">
 
-Upgrade notes
+## Upgrade notes
 
 - <changed defaults, containerd config changes, required restarts, or "None">
 
-Compatibility
+## Compatibility
 
 - Kernel: Linux 6.6+ (EROFS, fs-verity, overlayfs data-only lowers)
 - ocicfs: built against <version>
 - containerd: <supported range / config notes>
 - Tested on: <distros / devices>
 
-Known issues
+## Known issues
 
-- <or "None">
+- <omit the section when there are none>
 ```
 
 The very first release (`v0.1.0`) is introduction-style: what the
