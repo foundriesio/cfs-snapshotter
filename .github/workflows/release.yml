@@ -73,7 +73,7 @@ jobs:
       # uses — the full suite plus the composefs e2e data plane; tags do not
       # trigger ci.yml, so this is the test gate.
       - name: Build and test in the dev container
-        run: ./devshell.sh sh -c 'make all && make test-e2e'
+        run: ./devshell.sh sh -c 'make check build && make test-e2e'
 
       # The dev container runs as root, leaving bin/ root-owned on the
       # host; later host-side steps write under bin/ and dist/.

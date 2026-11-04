@@ -19,7 +19,11 @@ REVISION ?= $(shell git rev-parse HEAD 2>/dev/null || echo none)
 LDFLAGS := -s -w -X $(PKG)/pkg/version.Version=$(VERSION) -X $(PKG)/pkg/version.Revision=$(REVISION)
 
 .PHONY: all
-all: fmt vet lint test build
+all: build
+
+# check runs the formatting check, the linters, go vet, and the unit tests.
+.PHONY: check
+check: lint vet test
 
 # build compiles the snapshotter daemon into bin/. cgo is disabled so the
 # binary is fully static and runs on any Linux of the right architecture.
