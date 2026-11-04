@@ -4,6 +4,6 @@ Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
 This product is licensed under the Apache License, Version 2.0 (see the LICENSE
 file). It includes software developed at Qualcomm Technologies, Inc.
 
-This project's design and prior art draw on the thindock proof of concept and on
-the composefs, EROFS, fs-verity, and containerd projects. Those upstream works
-remain under their own licenses and are not redistributed here.
+This project's design draws on the composefs, EROFS, fs-verity, and containerd
+projects. Those upstream works remain under their own licenses and are not
+redistributed here.
