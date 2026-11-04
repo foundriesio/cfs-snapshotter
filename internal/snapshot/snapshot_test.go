@@ -1805,6 +1805,22 @@ func TestReconcileHoldsByRootAndHolder(t *testing.T) {
 	}
 }
 
+// TestReconcileHoldsOnEmptyRecordStore covers a start on a root with no
+// records while the ocicfs store still holds images under this
+// snapshotter's holder names: every such hold is released and holds under
+// other holders are kept.
+func TestReconcileHoldsOnEmptyRecordStore(t *testing.T) {
+	ours, foreign := digest.FromString("ours"), digest.FromString("foreign")
+	holder := buildHolder("moby", "moby/1/extract")
+	engine := fakeEngineForImages()
+	engine.held = map[digest.Digest][]string{ours: {holder}, foreign: {"agent"}}
+
+	newConfiguredSnapshotter(t, Config{Root: t.TempDir()}, engine, notMounted)
+	if want := []holdCall{{ref: ours.String(), holder: holder}}; !slices.Equal(engine.releases, want) {
+		t.Fatalf("engine Release calls at start = %+v, want %+v", engine.releases, want)
+	}
+}
+
 // TestRemoveClosesAbortedPullBuild covers the runtime aborting a pull: the
 // active staging snapshot is removed on the garbage collector's context,
 // which names no namespace, under the namespaced key containerd files backend
