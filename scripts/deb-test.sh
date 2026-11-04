@@ -39,7 +39,7 @@ dpkg-deb -f "$deb" Suggests | grep -q ocicfs
 apt-get update
 apt-get install -y --no-install-recommends "$deb"
 containerd-cfs-grpc -version | grep -F "containerd-cfs-grpc ${VERSION}"
-containerd-cfs-grpc -help 2>&1 | grep -q allow-unstaged-pulls
+containerd-cfs-grpc -help 2>&1 | grep -q -- -admit
 [ -f /usr/lib/systemd/system/cfs-snapshotter.service ] \
     || [ -f /lib/systemd/system/cfs-snapshotter.service ]
 grep -q RestartPreventExitStatus=3 /usr/lib/systemd/system/cfs-snapshotter.service

@@ -125,9 +125,9 @@ override it:
 CFS_LOG_LEVEL=debug make run-cfs
 ```
 
-The devcontainer boots the snapshotter in the default staged mode. A plain
-`make run-cfs` restarts it that way; `CFS_ALLOW_UNSTAGED_PULLS=0 make run-cfs`
-restarts it in the out-of-band mode instead (the mode is part of the state the
+The devcontainer boots the snapshotter in the default admit-any mode. A plain
+`make run-cfs` restarts it that way; `CFS_ADMIT=preloaded make run-cfs`
+restarts it in the preloaded mode instead (the mode is part of the state the
 restart reconciles, so switching back is another `make run-cfs`).
 
 ## End-To-End Test
@@ -153,8 +153,8 @@ Zot with runnable multi-layer OCI images
 through Docker, in two phases — one per work mode, since a machine runs in one
 or the other and never both.
 
-The warm phase restarts the snapshotter in the out-of-band mode
-(`-allow-unstaged-pulls=false`), admitting only images staged in the ocicfs
+The warm phase restarts the snapshotter in the preloaded mode
+(`-admit=preloaded`), admitting only images staged in the ocicfs
 store with `ocicfs pull --from-dir` pinned by manifest digest:
 
 - Pulls of an image the store does not hold — including one that reuses a held
@@ -182,7 +182,7 @@ store with `ocicfs pull --from-dir` pinned by manifest digest:
   snapshotter, and releasing, removing and collecting the base reclaims what
   only the first release carried while the second stays whole.
 
-The cold phase then restarts the snapshotter in the staged mode — the boot
+The cold phase then restarts the snapshotter in the admit-any mode — the boot
 default — with
 stores of its own (`/var/lib/ocicfs-cold`,
 `/var/lib/containerd-cfs-grpc-cold`), and asserts that a plain `docker pull`

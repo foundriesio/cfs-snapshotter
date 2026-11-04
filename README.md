@@ -12,13 +12,13 @@ container rootfs from content-addressed, composefs-backed storage — using
 > fs-verity-backed objects. By default a plain `docker pull` fills the
 > store: containerd fetches the layers as it always would, the snapshotter
 > stages them, and the whole image is built into the store when the last
-> layer is committed. A machine started with `-allow-unstaged-pulls=false`
+> layer is committed. A machine started with `-admit=preloaded`
 > instead admits only images put in the store out of band — `ocicfs pull`,
 > pinned by digest — and declines every other pull; the pulls it admits
 > download no layers (`ctr` and `docker` still fetch the image metadata:
 > index, manifest, config, etc.). Either way a container gets the same
-> mounts. For offline use, staged mode needs only `docker load`; out-of-band
-> mode needs `ocicfs pull --from-tar` first. See the
+> mounts. For offline use, `-admit=any` needs only `docker load`;
+> `-admit=preloaded` needs `ocicfs pull --from-tar` first. See the
 > [offline loading guide](docs/running.md#loading-images-offline-docker-load).
 
 ## Install or build
@@ -49,12 +49,12 @@ Inside the container:
 
 ```sh
 make run-cfs      # rebuild and restart the snapshotter after editing code
-                  # (CFS_ALLOW_UNSTAGED_PULLS=0 selects the out-of-band mode;
-                  # unset, it restarts in the default staged mode)
+                  # (CFS_ADMIT=preloaded selects the preloaded mode;
+                  # unset, it restarts in the default admit-any mode)
 make check        # lint, vet, unit tests
 make test         # unit tests
-make test-e2e     # end to end, both work modes: out-of-band zero-fetch
-                  # and staged cold pull
+make test-e2e     # end to end, both work modes: preloaded zero-fetch
+                  # and admit-any cold pull
 ```
 
 Where each target runs:
@@ -70,12 +70,12 @@ Where each target runs:
 
 To test manually, drive the snapshotter with plain `docker` and `ctr`
 commands — both are preconfigured to use cfs. The devcontainer boots in the
-default staged mode, so a `docker pull` of any seeded image just works. The
-walkthrough below shows the out-of-band mode instead: switch the daemon,
+default admit-any mode, so a `docker pull` of any seeded image just works. The
+walkthrough below shows the preloaded mode instead: switch the daemon,
 seed the local registry with a runnable test image, and stage it:
 
 ```sh
-CFS_ALLOW_UNSTAGED_PULLS=0 make run-cfs   # switch to the out-of-band mode
+CFS_ADMIT=preloaded make run-cfs   # switch to the preloaded mode
 
 layout=$(mktemp -d)
 SEED_RUNNABLE=1 SEED_KEEP_LAYOUT="${layout}" \

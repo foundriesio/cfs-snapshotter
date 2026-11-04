@@ -61,7 +61,7 @@ func TestPrepareLoadHandshakeStages(t *testing.T) {
 	for _, staged := range []bool{false, true} {
 		t.Run(fmt.Sprintf("staged=%v", staged), func(t *testing.T) {
 			ctx := pullNamespace()
-			sn := newConfiguredSnapshotter(t, Config{Root: t.TempDir(), AllowUnstagedPulls: staged}, fakeEngineForImages(), notMounted)
+			sn := newConfiguredSnapshotter(t, Config{Root: t.TempDir(), AdmitAny: staged}, fakeEngineForImages(), notMounted)
 			chain := digest.FromString("chain")
 			for n := range 2 {
 				key := loadKey(n, chain)
@@ -160,7 +160,7 @@ func forEachMode(t *testing.T, fn func(t *testing.T, sn *snapshotter, engine *fa
 	for _, staged := range []bool{false, true} {
 		t.Run(fmt.Sprintf("staged=%v", staged), func(t *testing.T) {
 			engine := fakeEngineForImages()
-			sn := newConfiguredSnapshotter(t, Config{Root: t.TempDir(), AllowUnstagedPulls: staged}, engine, notMounted)
+			sn := newConfiguredSnapshotter(t, Config{Root: t.TempDir(), AdmitAny: staged}, engine, notMounted)
 			fn(t, sn, engine)
 		})
 	}

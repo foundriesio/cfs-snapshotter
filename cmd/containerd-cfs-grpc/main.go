@@ -39,15 +39,15 @@ const (
 )
 
 var (
-	address            = flag.String("address", defaultAddress, "address for the snapshotter's gRPC server")
-	rootDir            = flag.String("root", defaultRootDir, "path to the root directory for this snapshotter")
-	ocicfsRoot         = flag.String("ocicfs-root", "/var/lib/ocicfs", "path to the shared ocicfs image store root")
-	containerdAddress  = flag.String("containerd-address", "/run/containerd/containerd.sock", "address of containerd's gRPC server")
-	allowUnstagedPulls = flag.Bool("allow-unstaged-pulls", true, "stage every pull through containerd's content store and build it into the ocicfs store, instead of admitting only images already there")
-	ingestWorkers      = flag.Int("ingest-workers", 0, fmt.Sprintf("number of layers a staged pull ingests into the ocicfs store at once, across all pulls in progress (0 selects the default of %d)", ocicfs.DefaultIngestWorkers))
-	logLevel           = flag.String("log-level", log.InfoLevel.String(), "logging level [trace, debug, info, warn, error, fatal, panic]")
-	printVersion       = flag.Bool("version", false, "print the version and exit")
-	runChecks          = flag.Bool("check", false, "check the runtime prerequisites and the containerd wiring instead of serving, and exit non-zero on any failure")
+	address           = flag.String("address", defaultAddress, "address for the snapshotter's gRPC server")
+	rootDir           = flag.String("root", defaultRootDir, "path to the root directory for this snapshotter")
+	ocicfsRoot        = flag.String("ocicfs-root", "/var/lib/ocicfs", "path to the shared ocicfs image store root")
+	containerdAddress = flag.String("containerd-address", "/run/containerd/containerd.sock", "address of containerd's gRPC server")
+	admit             = flag.String("admit", "any", "which images to admit: any builds every docker/containerd pull or load into the ocicfs store; preloaded admits only images already in the store (ocicfs pull) and declines the rest")
+	ingestWorkers     = flag.Int("ingest-workers", 0, fmt.Sprintf("number of layers a staged pull ingests into the ocicfs store at once, across all pulls in progress (0 selects the default of %d)", ocicfs.DefaultIngestWorkers))
+	logLevel          = flag.String("log-level", log.InfoLevel.String(), "logging level [trace, debug, info, warn, error, fatal, panic]")
+	printVersion      = flag.Bool("version", false, "print the version and exit")
+	runChecks         = flag.Bool("check", false, "check the runtime prerequisites and the containerd wiring instead of serving, and exit non-zero on any failure")
 )
 
 func main() {
@@ -67,13 +67,19 @@ func main() {
 		os.Exit(1)
 	}
 
+	admitAny, err := parseAdmit(*admit)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+
 	ctx := log.WithLogger(context.Background(), log.L)
 	cfg := snapshot.Config{
-		Root:               *rootDir,
-		OcicfsRoot:         *ocicfsRoot,
-		AllowUnstagedPulls: *allowUnstagedPulls,
-		ContainerdAddress:  *containerdAddress,
-		IngestWorkers:      *ingestWorkers,
+		Root:              *rootDir,
+		OcicfsRoot:        *ocicfsRoot,
+		AdmitAny:          admitAny,
+		ContainerdAddress: *containerdAddress,
+		IngestWorkers:     *ingestWorkers,
 	}
 	if *runChecks {
 		// Bounded: a check answers now, it does not wait for containerd the
@@ -91,6 +97,18 @@ func main() {
 		}
 		log.G(ctx).WithError(err).Fatal("cfs-snapshotter exited with error")
 	}
+}
+
+// parseAdmit maps the -admit value to whether the snapshotter admits every
+// image (any) or only images already in the ocicfs store (preloaded).
+func parseAdmit(value string) (bool, error) {
+	switch value {
+	case "any":
+		return true, nil
+	case "preloaded":
+		return false, nil
+	}
+	return false, fmt.Errorf("invalid -admit value %q: want any or preloaded", value)
 }
 
 // exitPrerequisites is the exit status for unmet runtime prerequisites. The
@@ -141,7 +159,7 @@ func run(ctx context.Context, address string, cfg snapshot.Config) error {
 	// the same error path as any other startup failure.
 	probeErrCh := make(chan error, 1)
 	go func() {
-		if probeErr := probeContainerd(ctx, cfg.ContainerdAddress, address, cfg.AllowUnstagedPulls); probeErr != nil {
+		if probeErr := probeContainerd(ctx, cfg.ContainerdAddress, address, cfg.AdmitAny); probeErr != nil {
 			probeErrCh <- probeErr
 		}
 	}()

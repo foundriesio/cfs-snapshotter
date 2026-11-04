@@ -52,7 +52,7 @@ const (
 //     it pulls arrive without image identity and are declined;
 //   - a proxy differ entry points at this daemon's socket, so staged pulls
 //     and archive loads reach the correct differ. Missing wiring fails
-//     startup in staged mode; out of band it only degrades status.
+//     startup in admit-any mode; in preloaded mode it only degrades status.
 //
 // Each round's verdict is pushed to systemd as the unit's status line, where
 // systemctl status shows it next to "active (running)"; findings are logged
@@ -60,14 +60,14 @@ const (
 //
 // The first definite verdict is binding: a containerd that cannot drive this
 // snapshotter — too old, not wired, wiring without the annotations export, or
-// in staged mode without the differ — is an unmet prerequisite, reported as a
+// in admit-any mode without the differ — is an unmet prerequisite, reported as a
 // non-nil return so the daemon exits and the unit lands in the failed state
 // until the fix and a manual restart.
 // After a healthy first verdict the rounds only inform: a live data plane
 // with containers on it is never self-terminated over later drift, which the
 // status line reports instead — and recovery from drift is likewise noticed
 // without a restart.
-func probeContainerd(ctx context.Context, containerdAddress, socketAddress string, staged bool) error {
+func probeContainerd(ctx context.Context, containerdAddress, socketAddress string, admitAny bool) error {
 	conn, err := dialContainerd(containerdAddress)
 	if err != nil {
 		log.G(ctx).WithError(err).WithField("address", containerdAddress).
@@ -91,15 +91,15 @@ func probeContainerd(ctx context.Context, containerdAddress, socketAddress strin
 			log.G(ctx).WithError(r.introspectErr).
 				Warn("containerd probe: cannot list containerd's plugins; skipping the wiring check")
 		}
-		if status := r.status(staged); status != "" {
+		if status := r.status(admitAny); status != "" {
 			if status != last {
-				r.logVerdict(ctx, socketAddress, staged)
+				r.logVerdict(ctx, socketAddress, admitAny)
 				last = status
 			}
 			notify(ctx, "STATUS="+status)
 			if binding {
 				binding = false
-				if r.tooOld || !r.wired || !r.hasExport || (staged && !r.differWired) {
+				if r.tooOld || !r.wired || !r.hasExport || (admitAny && !r.differWired) {
 					return fmt.Errorf("%w: %s", snapshot.ErrPrerequisites, strings.TrimPrefix(status, "degraded: "))
 				}
 			}
@@ -178,7 +178,7 @@ func probeOnce(ctx context.Context, conn *grpc.ClientConn, socketAddress string)
 // status renders the verdict for the unit's status line, the first problem
 // winning. It is empty when introspection failed before any finding, so a
 // transient listing error does not overwrite the last real verdict.
-func (r probeResult) status(staged bool) string {
+func (r probeResult) status(admitAny bool) string {
 	switch {
 	case r.tooOld:
 		return "degraded: containerd " + r.version + " is older than 2.1; pulls will fail"
@@ -188,7 +188,7 @@ func (r probeResult) status(staged bool) string {
 		return "degraded: containerd has no proxy_plugins entry for this snapshotter's socket"
 	case !r.hasExport:
 		return "degraded: proxy_plugins." + r.entryID + " lacks enable_remote_snapshot_annotations; pulls will be declined"
-	case staged && !r.differWired:
+	case admitAny && !r.differWired:
 		return "degraded: containerd has no diff proxy_plugins entry for this snapshotter's socket; staged pulls will fail"
 	case !r.differWired:
 		return "degraded: containerd has no diff proxy_plugins entry for this snapshotter's socket; docker load will fail"
@@ -201,7 +201,7 @@ func (r probeResult) status(staged bool) string {
 // its remedy. The wiring fields are skipped when introspection failed, and
 // correct wiring is not announced as success while the version already makes
 // every pull fail.
-func (r probeResult) logVerdict(ctx context.Context, socketAddress string, staged bool) {
+func (r probeResult) logVerdict(ctx context.Context, socketAddress string, admitAny bool) {
 	if r.tooOld {
 		log.G(ctx).WithField("version", r.version).
 			Error("containerd probe: containerd is older than 2.1, whose transfer service does not forward the unpack handshake and image-identity annotations to proxy snapshotters; every pull through this snapshotter will fail")
@@ -216,7 +216,7 @@ func (r probeResult) logVerdict(ctx context.Context, socketAddress string, stage
 	case !r.hasExport:
 		log.G(ctx).WithField("plugin", r.entryID).
 			Errorf("containerd probe: the proxy snapshotter entry does not export enable_remote_snapshot_annotations = \"true\", so pulls arrive without image identity and are declined; add it under [proxy_plugins.%s.exports] and restart containerd", r.entryID)
-	case staged && !r.differWired:
+	case admitAny && !r.differWired:
 		log.G(ctx).WithField("socket", socketAddress).
 			Error("containerd probe: no proxy differ in containerd's config points at this daemon's socket, so the layers of a staged pull go to containerd's own differ and fail on the staging placeholder; add the [proxy_plugins] diff entry (shipped as containerd-cfs.toml) and restart containerd")
 	case !r.differWired:

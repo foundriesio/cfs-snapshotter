@@ -60,8 +60,8 @@ func TestRunCheckPassesOutOfBand(t *testing.T) {
 		t.Fatalf("runCheck = %d, want 0; output:\n%s", code, out.String())
 	}
 	wantLines(t, out.String(),
-		"1. mkcomposefs: skipped (out-of-band mode",
-		"2. fs-verity on the ocicfs store: skipped (out-of-band mode",
+		"1. mkcomposefs: skipped (preloaded mode",
+		"2. fs-verity on the ocicfs store: skipped (preloaded mode",
 		"ingest workers: 2",
 		"3. containerd: ok (version v2.2.3)",
 		"4. containerd version 2.1+: ok",
@@ -105,7 +105,7 @@ func TestRunCheckFailsOnMissingDiffer(t *testing.T) {
 		[]*introspectionapi.Plugin{wiredPlugin(map[string]string{"enable_remote_snapshot_annotations": "true"})})
 	var out bytes.Buffer
 	code := runCheck(context.Background(), &out,
-		snapshot.Config{OcicfsRoot: t.TempDir(), ContainerdAddress: address, AllowUnstagedPulls: true},
+		snapshot.Config{OcicfsRoot: t.TempDir(), ContainerdAddress: address, AdmitAny: true},
 		testSocket)
 	if code != 1 {
 		t.Fatalf("runCheck = %d, want 1; output:\n%s", code, out.String())
@@ -156,7 +156,7 @@ func TestRunCheckReportsAllStagedPrerequisites(t *testing.T) {
 	address := fakeContainerd(t, "v2.2.3", wiredPlugins(map[string]string{"enable_remote_snapshot_annotations": "true"}))
 	var out bytes.Buffer
 	code := runCheck(context.Background(), &out,
-		snapshot.Config{OcicfsRoot: t.TempDir(), ContainerdAddress: address, AllowUnstagedPulls: true},
+		snapshot.Config{OcicfsRoot: t.TempDir(), ContainerdAddress: address, AdmitAny: true},
 		testSocket)
 	if code != 1 {
 		t.Fatalf("runCheck = %d, want 1; output:\n%s", code, out.String())
@@ -174,9 +174,9 @@ func TestRunCheckReportsAllStagedPrerequisites(t *testing.T) {
 	}
 }
 
-// TestRunCheckWarnsOnMissingDifferOutOfBand covers that out-of-band mode
+// TestRunCheckWarnsOnMissingDifferOutOfBand covers that preloaded mode
 // applies loaded layers only from the store, so missing differ wiring that
-// fails the check in staged mode is only a warning here.
+// fails the check in admit-any mode is only a warning here.
 func TestRunCheckWarnsOnMissingDifferOutOfBand(t *testing.T) {
 	address := fakeContainerd(t, "v2.2.3",
 		[]*introspectionapi.Plugin{wiredPlugin(map[string]string{"enable_remote_snapshot_annotations": "true"})})
