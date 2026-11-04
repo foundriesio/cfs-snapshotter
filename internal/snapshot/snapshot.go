@@ -397,7 +397,9 @@ func (s *snapshotter) reconcileHolds(ctx context.Context) error {
 			return nil
 		})
 	})
-	if err != nil {
+	// A fresh record store has no snapshots bucket yet: no record owns any
+	// hold, so every hold of this snapshotter's is released.
+	if err != nil && !errdefs.IsNotFound(err) {
 		return fmt.Errorf("walk snapshot records: %w", err)
 	}
 	held, err := s.engine.Holds(ctx)
