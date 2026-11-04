@@ -166,8 +166,7 @@ integrity. Treat that surface with care.
 
 A change is complete only when, at minimum:
 
-- `gofmt` reports no diffs, and `make vet`, `make test`, and `make build` pass
-  cleanly.
+- `make check` and `make build` pass cleanly.
 - Changes touching the snapshotter's privileged paths additionally pass
   `make root-test` (the containerd conformance suite).
 - Concurrency-sensitive changes pass the race detector
