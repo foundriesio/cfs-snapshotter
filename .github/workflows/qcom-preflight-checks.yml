@@ -15,12 +15,7 @@ jobs:
       enable-dependency-review: true
       enable-repolinter-check: true
       enable-copyright-license-check: true
-      # Disabled: the reusable commit-email-check job only grants itself
-      # `contents: read`, but the underlying action needs `pull-requests: read`
-      # to list a PR's commits via the API. That's fine on public repos (PR
-      # data is public), but this repo is internal, so the check 403s. Revisit
-      # once qualcomm/qcom-reusable-workflows grants that permission upstream.
-      enable-commit-email-check: false
+      enable-commit-email-check: true
       enable-commit-msg-check: false
     permissions:
       contents: read
