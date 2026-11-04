@@ -116,7 +116,7 @@ COPY config/ /tmp/cfs-devcontainer-config/
 
 RUN set -eux; \
     install -d /etc/containerd/certs.d /etc/docker /etc/zot; \
-    cp -a /tmp/cfs-devcontainer-config/containerd-certs.d/. /etc/containerd/certs.d/; \
+    install -D -m 0644 /tmp/cfs-devcontainer-config/containerd-hosts.toml '/etc/containerd/certs.d/127.0.0.1:5000/hosts.toml'; \
     install -m 0644 /tmp/cfs-devcontainer-config/containerd-config.toml /etc/containerd/config.toml; \
     install -m 0644 /tmp/cfs-devcontainer-config/containerd-erofs-unpack.toml /etc/containerd/containerd-erofs-unpack.toml; \
     install -m 0644 /tmp/cfs-devcontainer-config/docker-daemon.json /etc/docker/daemon.json; \
