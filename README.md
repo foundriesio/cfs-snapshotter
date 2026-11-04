@@ -51,10 +51,22 @@ Inside the container:
 make run-cfs      # rebuild and restart the snapshotter after editing code
                   # (CFS_ALLOW_UNSTAGED_PULLS=0 selects the out-of-band mode;
                   # unset, it restarts in the default staged mode)
+make check        # lint, vet, unit tests
 make test         # unit tests
 make test-e2e     # end to end, both work modes: out-of-band zero-fetch
                   # and staged cold pull
 ```
+
+Where each target runs:
+
+| Target | Dev host | Devcontainer |
+|---|---|---|
+| `make`, `build`, `fmt`, `clean` | yes | yes |
+| `install` | yes, as root or with a writable `PREFIX` or `DESTDIR` | yes |
+| `check`, `test`, `vet`, `lint` | yes, with Go and golangci-lint installed; tests that need root, fs-verity or mkcomposefs skip themselves | yes, as in CI |
+| `run-cfs`, `test-e2e` | no: needs the devcontainer's runtime stack and registry | yes; `test-e2e` needs a container started with `./devshell.sh` (an editor-opened one lacks the ocicfs CLI) |
+| `root-test` | as real root only; same failures as in the container | runs, but all subtests currently fail; see [Conformance Suite](docs/devcontainer.md#conformance-suite) |
+| `deb`, `deb-lint`, `deb-test` | yes, with Go and Docker: the package builds in its own container | not needed |
 
 To test manually, drive the snapshotter with plain `docker` and `ctr`
 commands — both are preconfigured to use cfs. The devcontainer boots in the
