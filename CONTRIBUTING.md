@@ -73,26 +73,24 @@ If you use a coding agent in this repository, it must also follow the rules in
 
 ## Code style and checks
 
-- Go code uses standard formatting. Run `gofmt` (CI rejects unformatted code) and
-  `go vet ./...`.
+- Go code uses standard formatting.
 - Run the relevant tests before submitting:
   ```bash
-  make vet
-  make test       # unit tests
+  make check      # formatting, lint, vet, unit tests
   make build
   ```
-- Changes that touch the snapshotter's privileged paths must pass the containerd
-  conformance suite, which requires root:
+- Changes that touch the snapshotter's privileged paths must also pass the
+  end-to-end suite, which needs the devcontainer:
   ```bash
-  sudo -E PATH=$PATH make root-test   # or: podman unshare make root-test
+  ./devshell.sh make test-e2e
   ```
 - Every Go source file carries the Apache-2.0 SPDX header
   (`// SPDX-License-Identifier: Apache-2.0`).
 
 ## Continuous integration
 
-CI runs `gofmt`, `go vet`, `make build`, the unit tests, and the privileged
-snapshotter conformance suite. A pull request is expected to be green before
+CI runs `make vet`, `make test` (also with `-race`), `make build`, `make lint`
+and `./devshell.sh make test-e2e`. A pull request is expected to be green before
 review.
 
 ## Reporting security issues
