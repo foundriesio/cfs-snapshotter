@@ -69,8 +69,18 @@ registry_down=""
 cold_composefs=""
 cold_store_bytes=""
 fresh_ocicfs_root=""
+# The run's progress, for the summary the exit trap prints: the section in
+# progress, each check's section, status (ok or skip) and description, and the
+# message and leg of a failure.
+SECTION="setup"
+CHECK_SECTIONS=()
+CHECK_STATUS=()
+CHECK_TITLES=()
+FAILMSG=""
+FAILLEG=""
 
 cleanup() {
+	local rc=$?
 	# A failure inside the interrupted-pull leg can leave its background pull
 	# running; it has to go before the images it references are removed.
 	if [ -n "${pull_pid}" ] && kill -0 "${pull_pid}" 2>/dev/null; then
@@ -137,10 +147,65 @@ cleanup() {
 	CFS_ADMIT=any CFS_ROOT="${WARM_CFS_ROOT}" OCICFS_ROOT="${WARM_OCICFS_ROOT}" \
 		"${SCRIPT_DIR}/run-cfs.sh" >&2 ||
 		echo "warning: failed to restore the boot snapshotter posture" >&2
+	summarize "${rc}"
 }
 
+# summarize prints the checks that ran, grouped by section, and a verdict as
+# the last lines of the run, after any cleanup output.
+summarize() {
+	local rc="$1" i last="" passed=0 skipped=0
+	printf '\nE2E summary (%ss):\n' "${SECONDS}"
+	for i in "${!CHECK_TITLES[@]}"; do
+		if [ "${CHECK_SECTIONS[i]}" != "${last}" ]; then
+			last="${CHECK_SECTIONS[i]}"
+			printf '  %s\n' "${last}"
+		fi
+		printf '    %-4s %2d. %s\n' "${CHECK_STATUS[i]}" $((i + 1)) "${CHECK_TITLES[i]}"
+		case "${CHECK_STATUS[i]}" in
+		ok) passed=$((passed + 1)) ;;
+		skip) skipped=$((skipped + 1)) ;;
+		esac
+	done
+	if [ "${rc}" -eq 0 ]; then
+		echo "E2E OK: ${passed} passed, ${skipped} skipped"
+		return
+	fi
+	# The failing leg never reached its check, so it gets a row of its own.
+	[ "${SECTION}" = "${last}" ] || printf '  %s\n' "${SECTION}"
+	printf '    %-4s %2d. %s\n' FAIL $((${#CHECK_TITLES[@]} + 1)) "${FAILLEG:-the step after the previous check}"
+	echo "E2E FAIL in ${SECTION%%:*}${FAILLEG:+, ${FAILLEG}}: ${FAILMSG:-exit ${rc}}" >&2
+}
+
+# section starts a numbered part of the run; pass records a check that held
+# and skip one that cannot run on this host.
+section() {
+	SECTION="$*"
+	printf '\n=== %s ===\n' "${SECTION}"
+}
+
+pass() {
+	CHECK_SECTIONS+=("${SECTION}")
+	CHECK_STATUS+=(ok)
+	CHECK_TITLES+=("$*")
+	printf '  %-4s %2d. %s\n' ok "${#CHECK_TITLES[@]}" "$*"
+}
+
+skip() {
+	CHECK_SECTIONS+=("${SECTION}")
+	CHECK_STATUS+=(skip)
+	CHECK_TITLES+=("$*")
+	printf '  %-4s %2d. %s\n' skip "${#CHECK_TITLES[@]}" "$*"
+}
+
+# fail records the message and the leg (the outermost assert_* function) the
+# exit trap reports, after dumping the snapshotter's state for diagnosis.
 fail() {
-	echo "E2E FAIL: $1" >&2
+	local fn
+	FAILMSG="$1"
+	for fn in "${FUNCNAME[@]}"; do
+		case "${fn}" in assert_*) FAILLEG="${fn}" ;; esac
+	done
+	echo "FAIL: $1" >&2
 	tail -80 "${CFS_LOG}" >&2 2>/dev/null || echo "warning: failed to read ${CFS_LOG}" >&2
 	ctr --address "${CONTAINERD_SOCKET}" --namespace "${DOCKER_NAMESPACE}" \
 		snapshots --snapshotter cfs ls >&2 2>/dev/null || echo "warning: failed to list cfs snapshots" >&2
@@ -583,21 +648,21 @@ assert_handshake_identity() {
 	fi
 	grep -Fq 'is not present in the local store' <<<"${output}" ||
 		fail "config-substitution pull did not fail at the identity gate: ${output}"
-	echo "PASS: an unheld config substitution with identical layers failed during docker pull"
+	pass "an unheld config substitution with identical layers failed during docker pull"
 
 	if output="$(docker pull "${unheld_ref}" 2>&1)"; then
 		fail "docker pull succeeded for an image absent from ocicfs: ${output}"
 	fi
 	grep -Fq 'is not present in the local store' <<<"${output}" ||
 		fail "unheld pull did not fail at the handshake identity gate: ${output}"
-	echo "PASS: an unrelated image absent from ocicfs failed during docker pull"
+	pass "an unrelated image absent from ocicfs failed during docker pull"
 
 	if output="$(docker pull "${base_ref}" 2>&1)"; then
 		fail "docker pull succeeded for an unheld base prefix: ${output}"
 	fi
 	grep -Fq 'is not present in the local store' <<<"${output}" ||
 		fail "base-prefix pull did not fail at the handshake identity gate: ${output}"
-	echo "PASS: an unheld base prefix failed during docker pull"
+	pass "an unheld base prefix failed during docker pull"
 }
 
 assert_real_zero_fetch_run() {
@@ -617,7 +682,7 @@ assert_real_zero_fetch_run() {
 		content_has "${digest}" && fail "layer was fetched: ${digest}"
 	done < <(jq -r '.layers[].digest' <<<"${manifest}")
 	content_has "${config}" || fail "image config was not fetched"
-	echo "PASS: ocicfs pull -> zero-fetch docker run served real image content"
+	pass "ocicfs pull -> zero-fetch docker run served real image content"
 }
 
 assert_warm_hold_declines_remove() {
@@ -627,7 +692,7 @@ assert_warm_hold_declines_remove() {
 	output="$(docker run --rm --network=none "${image_ref}")" ||
 		fail "docker run after the declined removal failed"
 	[ "${output}" = "cfs hello ${nonce}" ] || fail "unexpected container output: ${output}"
-	echo "PASS: an admitted image is cfs-held and ocicfs declined to remove it"
+	pass "an admitted image is cfs-held and ocicfs declined to remove it"
 }
 
 assert_warm_hold_released() {
@@ -636,7 +701,7 @@ assert_warm_hold_released() {
 	# the store kept it and only the runtime's hold is gone.
 	ref="$(ocicfs_ref_for_digest "$(manifest_digest "${work}/layout")")"
 	ocicfs_remove_when_released "${ref}"
-	echo "PASS: removing the image from the runtime released the cfs hold and kept the agent's image"
+	pass "removing the image from the runtime released the cfs hold and kept the agent's image"
 }
 
 # assert_warm_tag_identity stages an index-rooted image by TAG through the
@@ -673,7 +738,7 @@ assert_warm_tag_identity() {
 	assert_ocicfs_remove_declines "${tag_ref}"
 	docker rmi "${tag_ref}" >/dev/null || fail "docker rmi of the tag failed"
 	ocicfs_remove_when_released "${tag_ref}"
-	echo "PASS: a tag staged out of band admitted, held, and removed by its manifest identity"
+	pass "a tag staged out of band admitted, held, and removed by its manifest identity"
 }
 
 # ocicfs_fixtures prints the directory of the pinned ocicfs module's
@@ -762,7 +827,7 @@ assert_delta_fast_path() {
 	local arch
 	arch="$(go env GOHOSTARCH)" || fail "cannot determine the host architecture"
 	if [ "${arch}" != amd64 ]; then
-		echo "== skipped: the delta fixtures are linux/amd64 images" >&2
+		skip "delta fast path: the fixtures are linux/amd64 images"
 		return 0
 	fi
 	fixtures="$(ocicfs_fixtures)"
@@ -804,7 +869,7 @@ assert_delta_fast_path() {
 	size="$(sed -n 's/.* size=\([0-9]*\).*/\1/p' <<<"${summary}")"
 	[ "${fetched}" -gt 0 ] && [ "${fetched}" -lt "${size}" ] ||
 		fail "the delta pull fetched ${fetched} of ${size} layer bytes"
-	echo "PASS: release N+1 was pulled by ranges over the held release N"
+	pass "release N+1 was pulled by ranges over the held release N"
 
 	# The fresh store must sit on the shared fs-verity filesystem, like every
 	# other store the devcontainer uses.
@@ -822,7 +887,7 @@ assert_delta_fast_path() {
 		fail "the delta pull's fs-verity digest differs from the plain pull's"
 	rm -rf "${fresh_ocicfs_root}" || fail "cannot remove the fresh ocicfs root"
 	fresh_ocicfs_root=""
-	echo "PASS: the delta pull built the composefs image a plain pull builds"
+	pass "the delta pull built the composefs image a plain pull builds"
 
 	config="$(jq -r '.config.digest' <<<"${n1_manifest}")"
 	layers_absent "${n1_manifest}" || fail "a layer of release N+1 was in containerd's content store before the pull"
@@ -830,10 +895,10 @@ assert_delta_fast_path() {
 	docker image inspect "${delta_ref}" >/dev/null || fail "the runtime does not list the delta-pulled image"
 	layers_absent "${n1_manifest}" || fail "docker pull fetched a layer of the delta-pulled image"
 	content_has "${config}" || fail "image config was not fetched"
-	echo "PASS: docker pull of the delta-pulled image fetched no layer"
+	pass "docker pull of the delta-pulled image fetched no layer"
 
 	assert_delta_rootfs
-	echo "PASS: the runtime read release N+1's delta-fetched files through the snapshotter"
+	pass "the runtime read release N+1's delta-fetched files through the snapshotter"
 
 	ocicfs_cli release --holder delta-base "${n_ref}" >&2 || fail "cannot release the delta base"
 	ocicfs_cli remove "${n_ref}" >&2 || fail "cannot remove release N"
@@ -842,7 +907,7 @@ assert_delta_fast_path() {
 	[ ! -e "${old_object}" ] || fail "release N's app/old object survived its removal and collection"
 	[ "$(image_bindings "${n1_digest}")" -eq 1 ] || fail "release N+1 lost its composefs image"
 	assert_delta_rootfs
-	echo "PASS: releasing, removing and collecting the delta base kept release N+1 whole"
+	pass "releasing, removing and collecting the delta base kept release N+1 whole"
 
 	docker rmi "${delta_ref}" >/dev/null || fail "docker rmi of the delta-pulled image failed"
 	ocicfs_remove_when_released "${delta_ref}"
@@ -869,7 +934,7 @@ assert_concurrent_shared_mount() {
 		[ "${fstype}" = overlay ] || fail "${name} rootfs is ${fstype}, want overlay"
 	done
 	docker rm -f cfs-e2e-1 cfs-e2e-2 >/dev/null || fail "remove concurrent containers"
-	echo "PASS: concurrent containers shared one EROFS mount and used two flat overlays"
+	pass "concurrent containers shared one EROFS mount and used two flat overlays"
 }
 
 assert_mount_recovery() {
@@ -884,7 +949,7 @@ assert_mount_recovery() {
 	[ "${output}" = "cfs hello ${nonce}" ] || fail "recovered container output: ${output}"
 	[ "$(findmnt -n -o FSTYPE -M "${chainfs}")" = erofs ] || fail "Mounts did not restore EROFS mount"
 	docker rm cfs-e2e-recovery >/dev/null || fail "remove recovery container"
-	echo "PASS: an existing container recovered its image mount through Mounts"
+	pass "an existing container recovered its image mount through Mounts"
 }
 
 assert_gc_teardown() {
@@ -898,7 +963,7 @@ assert_gc_teardown() {
 	if losetup "${loopdev}" >/dev/null 2>&1; then
 		fail "image loop device ${loopdev} remains attached"
 	fi
-	echo "PASS: image GC removed the chain mount, loop device, and rm-* mount residue"
+	pass "image GC removed the chain mount, loop device, and rm-* mount residue"
 }
 
 # hello_objects lists the names under dir holding the seeded /hello binary of
@@ -934,7 +999,7 @@ assert_tamper_fails_at_open() {
 		fail "tampered run failed before establishing EROFS metadata mount"
 	docker rmi "${image_ref}" >/dev/null || fail "remove image after tamper check"
 	wait_unmounted "${tamper_chain}" || fail "tamper-check image mount survived cleanup"
-	echo "PASS: verity rejected the tampered object when overlayfs opened /hello"
+	pass "verity rejected the tampered object when overlayfs opened /hello"
 }
 
 # report_layer_applies prints how long the differ spent on each layer of a
@@ -1056,7 +1121,7 @@ assert_cold_pull_lands_composefs() {
 	[ -n "${chainfs}" ] || fail "the cold-pulled image has no shared image mount"
 	[ "$(findmnt -n -o FSTYPE -M "${chainfs}")" = erofs ] || fail "the cold image mount is not EROFS"
 	docker rm -f cfs-e2e-cold >/dev/null || fail "remove the mount inspection container"
-	echo "PASS: a plain docker pull was ingested layer by layer into one composefs image and ran"
+	pass "a plain docker pull was ingested layer by layer into one composefs image and ran"
 }
 
 assert_cold_repull_refetches() {
@@ -1078,7 +1143,7 @@ assert_cold_repull_refetches() {
 	output="$(docker run --rm --network=none "${cold_ref}")" ||
 		fail "docker run after the re-pull failed"
 	[ "${output}" = "cfs hello ${nonce}-cold" ] || fail "unexpected container output: ${output}"
-	echo "PASS: re-pulling a converted image refetched its layers and kept one image"
+	pass "re-pulling a converted image refetched its layers and kept one image"
 }
 
 assert_cold_prefix_dedup() {
@@ -1121,7 +1186,7 @@ assert_cold_prefix_dedup() {
 		fail "the store grew from ${before_bytes} to ${after_bytes} bytes; the shared layers were stored twice"
 	copies="$(hello_objects "$(cas_dir)" "${more_layout}" | wc -l)"
 	[ "${copies}" -eq 1 ] || fail "the store holds ${copies} copies of the shared /hello, want 1"
-	echo "PASS: a prefix-sharing image cold-pulled after a base re-pull and shared its objects"
+	pass "a prefix-sharing image cold-pulled after a base re-pull and shared its objects"
 
 	# Shared content follows the last image that needs it: dropping the base
 	# reclaims nothing the longer image reads, and that image still mounts —
@@ -1145,7 +1210,7 @@ assert_cold_prefix_dedup() {
 		fail "the shared-base image survived the removal of the last image standing on its chain"
 	copies="$(hello_objects "$(cas_dir)" "${more_layout}" | wc -l)"
 	[ "${copies}" -eq 0 ] || fail "the shared /hello survived the removal of every image reading it"
-	echo "PASS: removing one of two images sharing a chain kept the other's content, removing both reclaimed it"
+	pass "removing one of two images sharing a chain kept the other's content, removing both reclaimed it"
 }
 
 # assert_rootfs_is_base reads a container's rootfs the way the runtime serves
@@ -1293,7 +1358,7 @@ assert_base_after_derived() {
 	pair_base_ref=""
 	pair_derived_ref=""
 	pair_agent_refs=""
-	echo "PASS: admit=${mode}, base ${flavor}: a base pulled after its derived image ran as the base"
+	pass "base ${flavor}: a base pulled after its derived image ran as the base"
 }
 
 # assert_staged_rmi_reclaims covers the runtime dropping a staged image: the
@@ -1319,7 +1384,7 @@ assert_staged_rmi_reclaims() {
 	bytes="$(cas_object_bytes)"
 	[ "${bytes}" -eq "${cold_store_bytes}" ] ||
 		fail "the store holds ${bytes} object bytes after docker rmi, ${cold_store_bytes} before the pull"
-	echo "PASS: docker rmi of a staged image reclaimed it from the store before returning"
+	pass "docker rmi of a staged image reclaimed it from the store before returning"
 }
 
 # assert_staged_adoption covers an agent adopting a staged image with a hold
@@ -1340,7 +1405,7 @@ assert_staged_adoption() {
 	if ocicfs_lists_digest "${root}"; then
 		fail "the image survived the agent's release and collection"
 	fi
-	echo "PASS: an agent's hold kept a staged image past docker rmi, its release let it go"
+	pass "an agent's hold kept a staged image past docker rmi, its release let it go"
 }
 
 # assert_staged_self_heal covers a hold of the snapshotter's own that no
@@ -1363,7 +1428,7 @@ assert_staged_self_heal() {
 	if ocicfs_lists_digest "${root}"; then
 		fail "the stray hold kept the image past docker rmi"
 	fi
-	echo "PASS: a hold no record owned was released at startup and the image reclaimed"
+	pass "a hold no record owned was released at startup and the image reclaimed"
 }
 
 assert_interrupted_pull_converges() {
@@ -1412,7 +1477,7 @@ assert_interrupted_pull_converges() {
 	[ "$(image_bindings "$(manifest_digest "${layout}")")" -eq 1 ] ||
 		fail "the re-pull did not build exactly one composefs image"
 	assert_no_staging_residue
-	echo "PASS: an interrupted cold pull left nothing behind and a re-pull converged"
+	pass "an interrupted cold pull left nothing behind and a re-pull converged"
 }
 
 # assert_cold_mixed_door covers the two doors meeting on one image: the
@@ -1459,7 +1524,7 @@ assert_cold_mixed_door() {
 
 	docker rmi "${tag_ref}" >/dev/null || fail "docker rmi of the mixed-door image failed"
 	ocicfs_remove_when_released "${tag_ref}"
-	echo "PASS: an ocicfs pull of a runtime-staged tag kept one held image and remove declined"
+	pass "an ocicfs pull of a runtime-staged tag kept one held image and remove declined"
 }
 
 # assert_ingest_workers_converge re-pulls the cold image with the snapshotter
@@ -1494,7 +1559,7 @@ assert_ingest_workers_converge() {
 	[ "${fresh_composefs}" = "${cold_composefs}" ] ||
 		fail "ocicfs pull built ${fresh_composefs}, the snapshotter built ${cold_composefs}"
 	[ "${root}" = "$(manifest_digest "${layout}")" ] || fail "the cold layout changed underneath the test"
-	echo "PASS: one and two ingest workers and an ocicfs pull built the same composefs image"
+	pass "one and two ingest workers and an ocicfs pull built the same composefs image"
 }
 
 # stop_registry and start_registry take the devcontainer's registry down and
@@ -1616,7 +1681,7 @@ assert_load_declined() {
 	no_image_binding "${root}" || fail "the declined load built the image"
 	docker rmi "${load_derived_tag}" >/dev/null || fail "docker rmi of the declined image failed"
 	wait_until "the declined load's records to go" 60 0.5 no_cfs_snapshots
-	echo "PASS: admit=preloaded: docker load of an image the store lacks was declined, naming the sideload"
+	pass "docker load of an image the store lacks was declined, naming the sideload"
 }
 
 # assert_load_built covers docker load alone on a staging daemon: nothing is
@@ -1645,7 +1710,7 @@ assert_load_built() {
 	fi
 	no_image_binding "${root}" || fail "the composefs image survived docker rmi"
 	wait_until "the loaded image's records to go" 60 0.5 no_cfs_snapshots
-	echo "PASS: admit=any: an image loaded with docker load alone was built from its content, ran offline and was reclaimed by docker rmi"
+	pass "an image loaded with docker load alone was built from its content, ran offline and was reclaimed by docker rmi"
 }
 
 # assert_load_from_store covers the offline recipe: the agent sideloads the
@@ -1675,7 +1740,7 @@ assert_load_from_store() {
 	ocicfs_remove_when_released "${ref}"
 	pair_agent_refs=""
 	wait_until "the loaded image's records to go" 60 0.5 no_cfs_snapshots
-	echo "PASS: admit=${mode}: a sideloaded image loaded with docker load ran offline from the store"
+	pass "a sideloaded image loaded with docker load ran offline from the store"
 }
 
 # assert_load_base_after_derived loads a base image after an image derived
@@ -1759,7 +1824,7 @@ assert_load_base_after_derived() {
 		no_image_binding "${base_root}" || fail "the base built by its promotion survived docker rmi"
 		no_image_binding "${derived_root}" || fail "the derived image built by its load survived docker rmi"
 	fi
-	echo "PASS: admit=${mode}, base sideloaded ${store}: a base loaded after its derived image ran as the base offline"
+	pass "base sideloaded ${store}: a base loaded after its derived image ran as the base offline"
 }
 
 # assert_sideload_then_pull covers the preloaded alternative to docker
@@ -1796,7 +1861,7 @@ assert_sideload_then_pull() {
 	wait_until "the pulled image's records to go" 60 0.5 no_cfs_snapshots
 	wait_until "the store to collect the pulled image" 60 0.5 collect_store
 	no_image_binding "${root}" || fail "the pulled image survived its removal and a collection"
-	echo "PASS: admit=preloaded: a sideloaded image pulled by digest fetched no layer and ran offline"
+	pass "a sideloaded image pulled by digest fetched no layer and ran offline"
 }
 
 # assert_load_offline runs the load legs with the registry stopped, against
@@ -1825,7 +1890,7 @@ assert_load_offline() {
 
 warm_phase() {
 	local nonce="$1" chainfs
-	echo "== warm phase: images enter the store out of band =="
+	section "1. Preloaded mode (-admit=preloaded): images enter the store with ocicfs pull"
 	drain_runtime_images
 	# The devcontainer boots in admit-any mode; the warm legs need the
 	# preloaded posture, pinned explicitly rather than inherited.
@@ -1853,7 +1918,7 @@ warm_phase() {
 
 cold_phase() {
 	local nonce="$1"
-	echo "== cold phase: the runtime's own pull fills the store =="
+	section "2. Admit-any mode (-admit=any): the runtime's own pull or load fills the store"
 	# A device runs in one mode or the other, never both, so the cold phase
 	# gets its own snapshotter and ocicfs stores; no record made in one mode is
 	# ever read back in the other.
@@ -1894,20 +1959,18 @@ cold_phase() {
 }
 
 main() {
-	[ -x "${OCICFS_BIN}" ] ||
-		fail "ocicfs CLI not found at ${OCICFS_BIN}; run the e2e from the host as
+	if [ ! -x "${OCICFS_BIN}" ]; then
+		echo "E2E FAIL: ocicfs CLI not found at ${OCICFS_BIN}; run the e2e from the host as
 ./devshell.sh make test-e2e — devshell builds the ocicfs CLI there and
-mounts it into the container (a container started any other way has none)"
+mounts it into the container (a container started any other way has none)" >&2
+		exit 1
+	fi
 	work="$(mktemp -d)"
 	trap cleanup EXIT
 	local nonce="${RANDOM}${RANDOM}"
 	prepare_load_archives "${nonce}"
 	warm_phase "${nonce}"
 	cold_phase "${nonce}"
-	echo "E2E PASS: handshake identity, real content, recovery, concurrency, teardown," \
-		"tamper enforcement, holds, tag identity, delta fast path, base after derived, cold conversion," \
-		"rmi reclaim, dedup, interrupted-pull recovery, mixed-door identity, adoption, self-heal, worker-count identity," \
-		"and offline docker load"
 }
 
 main "$@"
