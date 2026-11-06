@@ -12,13 +12,13 @@
 // ancestors' upper directories stack as lowers, and the walk stops at the
 // first image chain snapshot, whose data plane — the image's read-only EROFS
 // metadata mount, with the ocicfs object directory stacked below it as a
-// data-only lower requiring fs-verity — is the base lower. The snapshot's own
-// upper receives its writes. Image content reaches the ocicfs store one of two
-// ways: it is put there out of band, in which case every unpack handshake is
-// answered as if the content were already present locally, or the runtime
-// fetches it and the snapshotter, serving containerd's diff API as well,
-// ingests each layer into the store as the unpacker applies it (see the
-// calling contract below).
+// data-only lower, verified by fs-verity when the store runs with it — is the
+// base lower. The snapshot's own upper receives its writes. Image content
+// reaches the ocicfs store one of two ways: it is put there out of band, in
+// which case every unpack handshake is answered as if the content were
+// already present locally, or the runtime fetches it and the snapshotter,
+// serving containerd's diff API as well, ingests each layer into the store
+// as the unpacker applies it (see the calling contract below).
 //
 // # Calling contract
 //
@@ -214,6 +214,9 @@ type snapshotter struct {
 	// admitAny stages every pull instead of admitting only images
 	// already in the ocicfs store.
 	admitAny bool
+	// verityRequired reports whether the ocicfs store runs with fs-verity;
+	// a snapshot's overlay requires it on the store's objects only then.
+	verityRequired bool
 	// mountMu serializes shared chain mount creation and teardown.
 	mountMu sync.Mutex
 	// promoteMu serializes the promotion of recorded chains into chain
@@ -305,23 +308,8 @@ type Config struct {
 // NewSnapshotter returns a Snapshotter configured by cfg, serving composefs
 // images from the ocicfs store at cfg.OcicfsRoot.
 func NewSnapshotter(ctx context.Context, cfg Config) (Snapshotter, error) {
-	engine, err := ocicfs.New(ocicfs.Config{Root: cfg.OcicfsRoot, IngestWorkers: cfg.IngestWorkers})
-	if err != nil {
-		return nil, fmt.Errorf("create ocicfs engine: %w", err)
-	}
-	// Admit-any mode builds every pull into the ocicfs store, so a host missing
-	// mkcomposefs or fs-verity fails every pull; refusing to start reports
-	// the misconfiguration at install time instead of at the first image.
-	// Preloaded mode builds nothing locally and needs neither.
-	if cfg.AdmitAny {
-		if err := errors.Join(engine.PreflightTools(), engine.PreflightStore()); err != nil {
-			return nil, fmt.Errorf("staged-pull prerequisites: %w: %w", ErrPrerequisites, err)
-		}
-	}
-	return newSnapshotter(ctx, cfg, engine)
-}
-
-func newSnapshotter(ctx context.Context, cfg Config, engine engineAPI) (*snapshotter, error) {
+	// The root is checked before the ocicfs store is opened and probed, so a
+	// configuration error is reported as one, without touching the store.
 	root := cfg.Root
 	if root == "" {
 		return nil, fmt.Errorf("cfs snapshotter: root directory must not be empty: %w", errdefs.ErrInvalidArgument)
@@ -329,12 +317,41 @@ func newSnapshotter(ctx context.Context, cfg Config, engine engineAPI) (*snapsho
 	if strings.ContainsAny(root, ":,") {
 		return nil, fmt.Errorf("cfs snapshotter: root directory must not contain ':' or ',' (paths under it become overlay mount options): %w", errdefs.ErrInvalidArgument)
 	}
+	engine, err := ocicfs.New(ocicfs.Config{Root: cfg.OcicfsRoot, IngestWorkers: cfg.IngestWorkers})
+	if err != nil {
+		return nil, fmt.Errorf("create ocicfs engine: %w", err)
+	}
+	// Both modes mount from the ocicfs store, and a store this build cannot
+	// run fails every mount; admit-any mode also builds every pull into the
+	// store, so a host missing mkcomposefs fails every pull. Refusing to
+	// start reports the misconfiguration at install time instead of at the
+	// first image. Preloaded mode builds nothing locally and needs no
+	// mkcomposefs.
+	err = engine.PreflightStore()
+	if cfg.AdmitAny {
+		err = errors.Join(engine.PreflightTools(), err)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrPrerequisites, err)
+	}
+	return newSnapshotter(ctx, cfg, engine)
+}
+
+func newSnapshotter(ctx context.Context, cfg Config, engine engineAPI) (*snapshotter, error) {
+	root := cfg.Root
 	objectsDir, err := engine.ObjectsDir()
 	if err != nil {
 		return nil, fmt.Errorf("cfs snapshotter: resolve ocicfs object directory: %w", err)
 	}
 	if strings.ContainsAny(objectsDir, ":,") {
 		return nil, fmt.Errorf("cfs snapshotter: ocicfs object directory must not contain ':' or ',' (it becomes an overlay mount option): %w", errdefs.ErrInvalidArgument)
+	}
+	verityRequired, err := engine.VerityRequired()
+	if err != nil {
+		return nil, fmt.Errorf("cfs snapshotter: determine whether the ocicfs store runs with fs-verity: %w", err)
+	}
+	if !verityRequired {
+		log.G(ctx).Warn("cfs snapshotter: ocicfs store runs without fs-verity; container mounts do not verify object contents")
 	}
 	if err := os.MkdirAll(root, 0700); err != nil {
 		return nil, fmt.Errorf("cfs snapshotter: create root: %w", err)
@@ -348,20 +365,21 @@ func newSnapshotter(ctx context.Context, cfg Config, engine engineAPI) (*snapsho
 	}
 	lifetime, cancel := context.WithCancel(context.Background())
 	s := &snapshotter{
-		root:       root,
-		objectsDir: objectsDir,
-		ms:         ms,
-		engine:     engine,
-		blobs:      newContentBlobs(cfg.ContainerdAddress),
-		mounted:    mountinfo.Mounted,
-		updateInfo: storage.UpdateInfo,
-		admitAny:   cfg.AdmitAny,
-		builds:     make(map[buildKey]*openBuild),
-		finishing:  make(map[string]*openBuild),
-		kick:       make(chan struct{}, 1),
-		retry:      make(chan struct{}, 1),
-		lifetime:   lifetime,
-		cancel:     cancel,
+		root:           root,
+		objectsDir:     objectsDir,
+		ms:             ms,
+		engine:         engine,
+		blobs:          newContentBlobs(cfg.ContainerdAddress),
+		mounted:        mountinfo.Mounted,
+		updateInfo:     storage.UpdateInfo,
+		admitAny:       cfg.AdmitAny,
+		verityRequired: verityRequired,
+		builds:         make(map[buildKey]*openBuild),
+		finishing:      make(map[string]*openBuild),
+		kick:           make(chan struct{}, 1),
+		retry:          make(chan struct{}, 1),
+		lifetime:       lifetime,
+		cancel:         cancel,
 	}
 	// A previous run may have left holds behind — a build finished but never
 	// committed, a record that never landed — and the flag that says there is
@@ -548,6 +566,7 @@ type engineAPI interface {
 	MountChain(ctx context.Context, chainID, target string, opts ...ocicfs.MountOption) error
 	Unmount(ctx context.Context, target string) error
 	ObjectsDir() (string, error)
+	VerityRequired() (bool, error)
 	GC(ctx context.Context, opts ...ocicfs.GCOption) (*ocicfs.GCReport, error)
 }
 
@@ -1287,7 +1306,9 @@ func (s *snapshotter) mounts(ctx context.Context, key string) ([]mount.Mount, er
 		"lowerdir=" + strings.Join(lowers, ":") + "::" + s.objectsDir,
 		"redirect_dir=on",
 		"metacopy=on",
-		"verity=require",
+	}
+	if s.verityRequired {
+		opts = append(opts, "verity=require")
 	}
 	if kind == snapshots.KindActive {
 		opts = append([]string{
