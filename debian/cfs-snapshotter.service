@@ -14,7 +14,8 @@ ExecStart=/usr/bin/containerd-cfs-grpc $CFS_OPTS
 Restart=always
 RestartSec=2
 # Exit status 3 means an unmet runtime prerequisite (missing mkcomposefs, a
-# store without fs-verity, a containerd that cannot drive this snapshotter):
+# store without fs-verity in a build that requires it, a containerd that
+# cannot drive this snapshotter):
 # restarting cannot succeed until an administrator fixes it, so the unit goes
 # straight to the failed state. Recover with systemctl restart after the fix.
 RestartPreventExitStatus=3

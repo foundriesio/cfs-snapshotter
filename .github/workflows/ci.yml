@@ -40,6 +40,23 @@ jobs:
       - run: GOFLAGS=-race make test
       - run: make build
 
+  # The tagged fs-verity build modes of ocicfs change whether the overlay
+  # requires fs-verity and what -check reports, so the unit tests also run
+  # in a build of each mode; the default (auto) build runs above.
+  build-modes:
+    name: vet & test (${{ matrix.tags }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        tags: [ocicfs_verity_required, ocicfs_verity_off]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - run: make GOFLAGS=-tags=${{ matrix.tags }} vet test
+
   lint:
     name: golangci-lint
     runs-on: ubuntu-latest

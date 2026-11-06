@@ -15,6 +15,11 @@ WARM_OCICFS_ROOT=/var/lib/ocicfs
 WARM_CFS_ROOT=/var/lib/containerd-cfs-grpc
 COLD_OCICFS_ROOT=/var/lib/ocicfs-cold
 COLD_CFS_ROOT=/var/lib/containerd-cfs-grpc-cold
+# The store of the last phase sits on a tmpfs, a filesystem that cannot
+# enable fs-verity; its snapshotter root stays on the shared ext4 like the
+# others, since run-cfs.sh binds any root nothing is mounted at there.
+TMPFS_OCICFS_ROOT=/var/lib/ocicfs-tmpfs
+TMPFS_CFS_ROOT=/var/lib/containerd-cfs-grpc-tmpfs
 OCICFS_BIN=${OCICFS_BIN:-/opt/cfs-dev/bin/ocicfs}
 CFS_LOG=/var/log/cfs-devcontainer/containerd-cfs-grpc.log
 # Size of the last layer of the image the interrupt leg pulls. It is
@@ -69,6 +74,8 @@ registry_down=""
 cold_composefs=""
 cold_store_bytes=""
 fresh_ocicfs_root=""
+# tmpfs_ref is the runtime's image of the tmpfs-store leg while it runs.
+tmpfs_ref=""
 # The run's progress, for the summary the exit trap prints: the section in
 # progress, each check's section, status (ok or skip) and description, and the
 # message and leg of a failure.
@@ -91,7 +98,7 @@ cleanup() {
 		start_registry || echo "warning: failed to restart the registry" >&2
 	fi
 	local name
-	for name in cfs-e2e-1 cfs-e2e-2 cfs-e2e-recovery cfs-e2e-cold cfs-e2e-delta cfs-e2e-pair; do
+	for name in cfs-e2e-1 cfs-e2e-2 cfs-e2e-recovery cfs-e2e-cold cfs-e2e-delta cfs-e2e-pair cfs-e2e-tmpfs; do
 		if docker container inspect "${name}" >/dev/null 2>&1; then
 			docker rm -f "${name}" >/dev/null 2>&1 || echo "warning: failed to remove ${name}" >&2
 		fi
@@ -99,7 +106,8 @@ cleanup() {
 	local ref
 	for ref in "${image_ref}" "${unheld_ref}" "${base_ref}" "${substitution_ref}" \
 		"${cold_ref}" "${share_ref}" "${share_more_ref}" "${partial_ref}" "${delta_ref}" \
-		"${pair_base_ref}" "${pair_derived_ref}" "${load_base_tag}" "${load_derived_tag}" "${load_pulled_ref}"; do
+		"${pair_base_ref}" "${pair_derived_ref}" "${load_base_tag}" "${load_derived_tag}" "${load_pulled_ref}" \
+		"${tmpfs_ref}"; do
 		if [ -n "${ref}" ] && docker image inspect "${ref}" >/dev/null 2>&1; then
 			docker rmi -f "${ref}" >/dev/null 2>&1 || echo "warning: failed to remove ${ref}" >&2
 		fi
@@ -144,10 +152,23 @@ cleanup() {
 	# devcontainer back in its boot posture (admit-any mode, default stores),
 	# pinned against any mode or store the caller's environment carries.
 	# On the success path this reconciles to a no-op.
-	CFS_ADMIT=any CFS_ROOT="${WARM_CFS_ROOT}" OCICFS_ROOT="${WARM_OCICFS_ROOT}" \
-		"${SCRIPT_DIR}/run-cfs.sh" >&2 ||
-		echo "warning: failed to restore the boot snapshotter posture" >&2
+	# The tmpfs store comes down only once the restored daemon serves the
+	# default stores; a failed restore may leave the tmpfs-store daemon up.
+	if CFS_ADMIT=any CFS_ROOT="${WARM_CFS_ROOT}" OCICFS_ROOT="${WARM_OCICFS_ROOT}" \
+		"${SCRIPT_DIR}/run-cfs.sh" >&2; then
+		unmount_tmpfs_store
+	else
+		echo "warning: failed to restore the boot snapshotter posture; leaving the tmpfs store mounted" >&2
+	fi
 	summarize "${rc}"
+}
+
+# unmount_tmpfs_store takes down the tmpfs-store leg's store once no daemon
+# serves it. A store still busy stays mounted and the next run reuses it.
+unmount_tmpfs_store() {
+	if mountpoint -q "${TMPFS_OCICFS_ROOT}" 2>/dev/null; then
+		umount "${TMPFS_OCICFS_ROOT}" || echo "warning: failed to unmount the tmpfs store" >&2
+	fi
 }
 
 # summarize prints the checks that ran, grouped by section, and a verdict as
@@ -1958,6 +1979,58 @@ cold_phase() {
 	cfs_root="${WARM_CFS_ROOT}"
 }
 
+# tmpfs_phase runs the admit-any mode with the ocicfs store on a tmpfs, which
+# cannot enable fs-verity. A build in the default mode runs such a store
+# without fs-verity: the pull lands and runs, the daemon says so at startup,
+# and the container's overlay leaves out verity=require, which on a store
+# without fs-verity would fail every file read.
+tmpfs_phase() {
+	local nonce="$1" repo="cfs/e2e-tmpfs" layout="${work}/tmpfs-layout" output pid options
+	section "3. Admit-any mode on a store without fs-verity: the default build runs it unverified"
+	drain_runtime_images
+	ocicfs_root="${TMPFS_OCICFS_ROOT}"
+	cfs_root="${TMPFS_CFS_ROOT}"
+	# run-cfs.sh binds a root onto the shared ext4 unless something is mounted
+	# at it already, so the tmpfs goes on first.
+	mkdir -p "${TMPFS_OCICFS_ROOT}"
+	if ! mountpoint -q "${TMPFS_OCICFS_ROOT}"; then
+		mount -t tmpfs tmpfs "${TMPFS_OCICFS_ROOT}" || fail "mount a tmpfs for the ocicfs store"
+	fi
+	CFS_ADMIT=any CFS_ROOT="${TMPFS_CFS_ROOT}" OCICFS_ROOT="${TMPFS_OCICFS_ROOT}" \
+		"${SCRIPT_DIR}/run-cfs.sh" >&2 || fail "start the snapshotter on a tmpfs store"
+	grep -q "ocicfs store runs without fs-verity" "${CFS_LOG}" ||
+		fail "the snapshotter did not report a store running without fs-verity"
+	forget_ocicfs_images
+
+	seed_image "${nonce}-tmpfs" "${REGISTRY}/${repo}:${nonce}" 2 "${layout}"
+	tmpfs_ref="$(pinned_ref "${REGISTRY}/${repo}" "${layout}")" || fail "cannot pin the tmpfs-store image ref"
+	docker pull "${tmpfs_ref}" >/dev/null || fail "docker pull onto the tmpfs store failed"
+	output="$(docker run --rm --network=none "${tmpfs_ref}")" ||
+		fail "docker run from the tmpfs store failed"
+	[ "${output}" = "cfs hello ${nonce}-tmpfs" ] || fail "unexpected container output: ${output}"
+
+	docker run -d --network=none --name cfs-e2e-tmpfs "${tmpfs_ref}" /hello sleep >/dev/null ||
+		fail "start the tmpfs-store image for mount inspection"
+	pid="$(docker inspect -f '{{.State.Pid}}' cfs-e2e-tmpfs)"
+	options="$(findmnt -N "${pid}" -n -o OPTIONS --target /)"
+	grep -q "::${TMPFS_OCICFS_ROOT}/" <<<"${options}" ||
+		fail "the container rootfs does not read the tmpfs store's objects: ${options}"
+	if grep -q 'verity=require' <<<"${options}"; then
+		fail "the container rootfs requires fs-verity on a store that runs without it: ${options}"
+	fi
+	docker rm -f cfs-e2e-tmpfs >/dev/null || fail "remove the mount inspection container"
+	docker rmi "${tmpfs_ref}" >/dev/null || fail "docker rmi of the tmpfs-store image failed"
+	tmpfs_ref=""
+	pass "a store on tmpfs runs without fs-verity: the pull lands and runs, and its overlay leaves out verity=require"
+
+	drain_runtime_images
+	CFS_ADMIT=any CFS_ROOT="${WARM_CFS_ROOT}" OCICFS_ROOT="${WARM_OCICFS_ROOT}" \
+		"${SCRIPT_DIR}/run-cfs.sh" >&2 || fail "restore the boot snapshotter posture"
+	ocicfs_root="${WARM_OCICFS_ROOT}"
+	cfs_root="${WARM_CFS_ROOT}"
+	unmount_tmpfs_store
+}
+
 main() {
 	if [ ! -x "${OCICFS_BIN}" ]; then
 		echo "E2E FAIL: ocicfs CLI not found at ${OCICFS_BIN}; run the e2e from the host as
@@ -1971,6 +2044,7 @@ mounts it into the container (a container started any other way has none)" >&2
 	prepare_load_archives "${nonce}"
 	warm_phase "${nonce}"
 	cold_phase "${nonce}"
+	tmpfs_phase "${nonce}"
 }
 
 main "$@"

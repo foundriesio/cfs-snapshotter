@@ -8,8 +8,11 @@ container rootfs from content-addressed, composefs-backed storage — using
 > **Status: early development.** The snapshotter serves real image content
 > from a local [ocicfs](https://github.com/foundriesio/ocicfs) store: `docker
 > run` mounts the image's EROFS metadata once per image and gives each
-> container one flat overlay whose data comes from the store's
-> fs-verity-backed objects. By default a plain `docker pull` fills the
+> container one flat overlay whose data comes from the store's objects,
+> verified by fs-verity when the store's filesystem can enable it (the
+> default build; a build tag makes it mandatory, see
+> [INSTALL.md](INSTALL.md#runtime-requirements)). By default a plain
+> `docker pull` fills the
 > store: containerd fetches the layers as it always would, the snapshotter
 > stages them, and the whole image is built into the store when the last
 > layer is committed. A machine started with `-admit=preloaded`

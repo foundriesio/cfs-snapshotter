@@ -233,6 +233,14 @@ each: `apply: <image> layer <i> in <T>s` for the layers fed into the image
 build, and `finish: <image> layer <i> in <T>s` for the last one, which also
 finishes the image.
 
+A last phase restarts the admit-any snapshotter with its ocicfs store on a
+tmpfs (`/var/lib/ocicfs-tmpfs`), which cannot enable fs-verity, and its
+snapshotter root (`/var/lib/containerd-cfs-grpc-tmpfs`) on the shared ext4
+like the others. The default build runs such a store without fs-verity: the
+daemon logs so at startup, a plain `docker pull` lands and `docker run`
+prints the seeded program's output, and the container's overlay reads the
+tmpfs store's objects without `verity=require`.
+
 ## Conformance Suite
 
 `make root-test` runs containerd's reusable snapshotter conformance suite
