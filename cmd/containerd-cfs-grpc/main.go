@@ -47,7 +47,7 @@ var (
 	ingestWorkers     = flag.Int("ingest-workers", 0, fmt.Sprintf("number of layers a staged pull ingests into the ocicfs store at once, across all pulls in progress (0 selects the default of %d)", ocicfs.DefaultIngestWorkers))
 	logLevel          = flag.String("log-level", log.InfoLevel.String(), "logging level [trace, debug, info, warn, error, fatal, panic]")
 	printVersion      = flag.Bool("version", false, "print the version and exit")
-	runChecks         = flag.Bool("check", false, "check the runtime prerequisites and the containerd wiring instead of serving, and exit non-zero on any failure")
+	runChecks         = flag.Bool("check", false, "check the runtime prerequisites and the containerd wiring instead of serving, and exit non-zero on any failure; opens the ocicfs store as the daemon would in either mode, creating its directories and writing one probe file")
 )
 
 func main() {

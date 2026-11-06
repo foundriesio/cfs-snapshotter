@@ -33,19 +33,24 @@ func runCheck(ctx context.Context, w io.Writer, cfg snapshot.Config, socketAddre
 		line(w, "%s: ok", name)
 	}
 
-	if cfg.AdmitAny {
-		engine, err := ocicfs.New(ocicfs.Config{Root: cfg.OcicfsRoot})
-		if err != nil {
-			failed = true
-			line(w, "1. mkcomposefs: FAIL: create ocicfs engine: %v", err)
-			line(w, "2. fs-verity on the ocicfs store (%s): FAIL: create ocicfs engine: %v", cfg.OcicfsRoot, err)
-		} else {
-			report("1. mkcomposefs", engine.PreflightTools())
-			report(fmt.Sprintf("2. fs-verity on the ocicfs store (%s)", cfg.OcicfsRoot), engine.PreflightStore())
-		}
-	} else {
+	// Both modes mount from the store, so its fs-verity state is checked in
+	// both; only admit-any mode builds into it and needs mkcomposefs.
+	engine, err := ocicfs.New(ocicfs.Config{Root: cfg.OcicfsRoot})
+	switch {
+	case !cfg.AdmitAny:
 		line(w, "1. mkcomposefs: skipped (preloaded mode builds nothing locally)")
-		line(w, "2. fs-verity on the ocicfs store: skipped (preloaded mode builds nothing locally)")
+	case err != nil:
+		failed = true
+		line(w, "1. mkcomposefs: FAIL: create ocicfs engine: %v", err)
+	default:
+		report("1. mkcomposefs", engine.PreflightTools())
+	}
+	store := fmt.Sprintf("2. fs-verity on the ocicfs store (%s)", cfg.OcicfsRoot)
+	if err != nil {
+		failed = true
+		line(w, "%s: FAIL: create ocicfs engine: %v", store, err)
+	} else if reportStoreVerity(w, store, engine) {
+		failed = true
 	}
 	workers := cfg.IngestWorkers
 	if workers == 0 {
@@ -104,6 +109,29 @@ func runCheck(ctx context.Context, w io.Writer, cfg snapshot.Config, socketAddre
 	}
 	line(w, "check passed")
 	return 0
+}
+
+// reportStoreVerity prints how this build runs the store under name, with
+// the fs-verity mode it was built with, and reports whether that fails the
+// check. A store the build runs without fs-verity passes: the daemon mounts
+// it without requiring fs-verity, and the line says what that gives up. A
+// store whose filesystem cannot enable fs-verity in a build that requires it
+// fails, as does a probe that cannot run.
+func reportStoreVerity(w io.Writer, name string, engine ocicfs.Engine) bool {
+	state, err := engine.VerityState()
+	switch {
+	case err != nil:
+		line(w, "%s: FAIL: %v", name, err)
+		return true
+	case state == "unsupported":
+		line(w, "%s: FAIL: unsupported (build: %s): the store's filesystem cannot enable fs-verity, which this build requires", name, ocicfs.BuildVerityMode)
+		return true
+	case state == "disabled":
+		line(w, "%s: disabled (build: %s): mounts do not verify object contents", name, ocicfs.BuildVerityMode)
+		return false
+	}
+	line(w, "%s: %s (build: %s)", name, state, ocicfs.BuildVerityMode)
+	return false
 }
 
 // reportDiffer checks that the proxy differ is registered. Missing wiring
