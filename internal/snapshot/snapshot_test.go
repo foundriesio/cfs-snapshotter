@@ -60,9 +60,9 @@ func TestNewSnapshotterRejectsEmptyRoot(t *testing.T) {
 }
 
 // verityOcicfsRoot returns a fresh ocicfs root on the dev container's shared
-// fs-verity filesystem, skipping where that filesystem is absent. Admit-any mode
-// refuses roots that cannot enable fs-verity, so its tests cannot use
-// t.TempDir.
+// fs-verity filesystem, skipping where that filesystem is absent, so a build
+// made in auto or required mode runs the store with fs-verity; t.TempDir may
+// sit on a filesystem that cannot enable it, which a required build refuses.
 func verityOcicfsRoot(t *testing.T) string {
 	t.Helper()
 	dir, err := os.MkdirTemp("/var/lib/cfs-shared-root", "ocicfs-test-*")
@@ -110,15 +110,35 @@ func TestNewSnapshotterFailsFastWithoutStagedPrerequisites(t *testing.T) {
 		ContainerdAddress: "/run/containerd/containerd.sock",
 	})
 	if err == nil || !strings.Contains(err.Error(), "mkcomposefs") {
-		t.Fatalf("NewSnapshotter() error = %v, want staged-pull prerequisites failure naming mkcomposefs", err)
+		t.Fatalf("NewSnapshotter() error = %v, want a prerequisites failure naming mkcomposefs", err)
 	}
 	if !errors.Is(err, ErrPrerequisites) {
 		t.Fatalf("NewSnapshotter() error = %v, want ErrPrerequisites so the daemon exits with the no-restart status", err)
 	}
 }
 
+// TestNewSnapshotterAcceptsValidRoot covers that a preloaded snapshotter comes
+// up on a store this build can run, and refuses one it cannot: a required
+// build on a filesystem that cannot enable fs-verity. Which one t.TempDir is
+// depends on the host and the build mode, so a throwaway engine on the same
+// store decides what to expect.
 func TestNewSnapshotterAcceptsValidRoot(t *testing.T) {
-	sn, err := NewSnapshotter(context.Background(), Config{Root: t.TempDir(), OcicfsRoot: t.TempDir()})
+	ocicfsRoot := t.TempDir()
+	probe, err := ocicfs.New(ocicfs.Config{Root: ocicfsRoot})
+	if err != nil {
+		t.Fatalf("ocicfs.New() error = %v", err)
+	}
+	state, err := probe.VerityState()
+	if err != nil {
+		t.Fatalf("VerityState() error = %v", err)
+	}
+	sn, err := NewSnapshotter(context.Background(), Config{Root: t.TempDir(), OcicfsRoot: ocicfsRoot})
+	if state == "unsupported" {
+		if !errors.Is(err, ErrPrerequisites) {
+			t.Fatalf("NewSnapshotter() error = %v, want ErrPrerequisites: this build requires fs-verity and the store's filesystem cannot enable it", err)
+		}
+		return
+	}
 	if err != nil {
 		t.Fatalf("NewSnapshotter() error = %v", err)
 	}
@@ -134,9 +154,8 @@ func TestNewSnapshotterRejectsMountOptionSeparators(t *testing.T) {
 	ctx := context.Background()
 	for _, sep := range []string{":", ","} {
 		t.Run("root "+sep, func(t *testing.T) {
-			engine := &fakeEngine{objectsDir: t.TempDir()}
-			if _, err := newSnapshotter(ctx, Config{Root: t.TempDir() + sep + "root"}, engine); !errdefs.IsInvalidArgument(err) {
-				t.Fatalf("newSnapshotter() root error = %v, want invalid argument", err)
+			if _, err := NewSnapshotter(ctx, Config{Root: t.TempDir() + sep + "root", OcicfsRoot: t.TempDir()}); !errdefs.IsInvalidArgument(err) {
+				t.Fatalf("NewSnapshotter() root error = %v, want invalid argument", err)
 			}
 		})
 		t.Run("objects "+sep, func(t *testing.T) {
@@ -2378,6 +2397,41 @@ func TestPrepareOverImageReturnsWritableOverlay(t *testing.T) {
 	}
 }
 
+// TestPrepareOverImageFollowsStoreVerity covers that the overlay requires
+// fs-verity on the store's objects only when the store runs with it: a store
+// without it would fail every file read under verity=require.
+func TestPrepareOverImageFollowsStoreVerity(t *testing.T) {
+	ctx := context.Background()
+	chain := digest.FromString("chain-1")
+	image := testImageInfo("image-root", chain)
+	engine := fakeEngineForImages(image)
+	engine.verityOff = true
+	sn := newSnapshotterForTest(t, engine, notMounted)
+	seedChainRecord(t, ctx, sn, chain.String(), "", image.Root.String())
+	var calls []mountCall
+	recordMounts(engine, &calls)
+
+	mounts, err := sn.Prepare(ctx, "container", chain.String())
+	if err != nil {
+		t.Fatalf("Prepare() error = %v", err)
+	}
+	id, _, err := sn.snapshotInfo(ctx, "container")
+	if err != nil {
+		t.Fatalf("snapshotInfo(container) error = %v", err)
+	}
+	dir := sn.getSnapshotDir(id)
+	want := []string{
+		"workdir=" + filepath.Join(dir, "work"),
+		"upperdir=" + filepath.Join(dir, "upper"),
+		"lowerdir=" + calls[0].target + "::" + engine.objectsDir,
+		"redirect_dir=on",
+		"metacopy=on",
+	}
+	if len(mounts) != 1 || !slices.Equal(mounts[0].Options, want) {
+		t.Fatalf("mounts = %v, want overlay without verity=require: %v", mounts, want)
+	}
+}
+
 func TestViewOverImageHasNoUpper(t *testing.T) {
 	ctx := context.Background()
 	sn, engine, leaf := newBackedSnapshotter(t, notMounted)
@@ -2662,8 +2716,11 @@ type fakeEngine struct {
 	mountChainFunc func(context.Context, string, string, ...ocicfs.MountOption) error
 	unmountFunc    func(context.Context, string) error
 	objectsDir     string
-	holdErr        error
-	releaseErr     error
+	// verityOff makes VerityRequired report a store running without
+	// fs-verity; the zero value reports one running with it.
+	verityOff  bool
+	holdErr    error
+	releaseErr error
 	// newBuildErr fails every NewBuild; ingestErr and finishErr fail the
 	// corresponding call of every build the engine creates. finishHeldErr
 	// fails Finish after the build's hold has been recorded, the way a hold
@@ -2864,6 +2921,10 @@ func (e *fakeEngine) Unmount(ctx context.Context, target string) error {
 
 func (e *fakeEngine) ObjectsDir() (string, error) {
 	return e.objectsDir, nil
+}
+
+func (e *fakeEngine) VerityRequired() (bool, error) {
+	return !e.verityOff, nil
 }
 
 func fakeEngineForImages(infos ...*ocicfs.ImageInfo) *fakeEngine {
