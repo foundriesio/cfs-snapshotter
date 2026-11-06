@@ -12,7 +12,8 @@ the same containerd — is pointed at them through two `proxy_plugins` entries.
 > [ocicfs](https://github.com/foundriesio/ocicfs) store. A container
 > snapshot mounts the image's read-only EROFS metadata — once per image,
 > shared by all its containers — and gets one flat overlay whose data comes
-> from the store's fs-verity-backed objects (`verity=require`). By default
+> from the store's objects, with `verity=require` when the store runs with
+> fs-verity (see the note under the flags below). By default
 > the runtime's own pull fills the store: containerd fetches the layers as
 > it always would and the snapshotter's differ ingests each one into the
 > store as it lands, building the composefs image;
@@ -43,12 +44,18 @@ The defaults match the config below; see `-help` for the full list.
 | `-admit` | `any` | Which images the machine admits: `any` stages every pull or load through containerd's content store and builds it into the ocicfs store; `preloaded` admits only images already in the store (put there with `ocicfs pull`) and declines the rest. |
 | `-ingest-workers` | `0` (ocicfs's default, 2) | How many layers staged pulls ingest into the ocicfs store at once, across every pull in progress. Two is the gain on every platform measured; a many-core host with fast storage may take a few percent more from four. |
 | `-log-level` | `info` | `trace`, `debug`, `info`, `warn`, `error`, `fatal`, `panic`. |
-| `-check` | off | Check the runtime prerequisites and the containerd wiring of both the snapshotter and the differ instead of serving: one verdict line per aspect, the effective ingest worker count, and a non-zero exit on any failure. |
+| `-check` | off | Check the runtime prerequisites and the containerd wiring of both the snapshotter and the differ instead of serving: one verdict line per aspect, the effective ingest worker count, and a non-zero exit on any failure. It opens the ocicfs store as the daemon would in either mode, creating its directories and writing one probe file, and reports whether this build runs the store with fs-verity. |
 
 The snapshotter root hosts each container's overlay upper and work
 directories, so it must live on a regular filesystem (ext4, xfs, …) — overlay
-cannot stack on overlay. The ocicfs store's filesystem must support fs-verity
-(on ext4 that means `mkfs.ext4 -O verity -b 4096`).
+cannot stack on overlay. The ocicfs store's filesystem should support
+fs-verity (on ext4 that means `mkfs.ext4 -O verity -b 4096`): the default
+build runs a store whose filesystem cannot enable it without fs-verity, logs
+so once at startup, and its container mounts then do not verify object
+contents. A build made with `make build GOFLAGS=-tags=ocicfs_verity_required`
+refuses such a store at startup instead. The `ocicfs` CLI that fills the
+store must be built in the same mode; see the fs-verity bullet of
+[INSTALL.md's runtime requirements](../INSTALL.md#runtime-requirements).
 
 ## 2. Configure containerd
 
@@ -275,10 +282,10 @@ The two work modes are exclusive, and the flag defaults to `any`:
   can reach the runtime.
 - **Any (`-admit=any`, default).** Any pull the runtime accepts fills the
   store, and every pull is staged — even of an image the store already holds.
-  The content is still verified as it is built, mounted under fs-verity, and
-  identical on disk to an out-of-band pull; what `-admit=any` gives up is the
-  gate deciding *which* images may arrive, and the preloaded mode's
-  zero-download answer to a pull of a store-held image.
+  The content is still verified as it is built, mounted under fs-verity where
+  the store runs with it, and identical on disk to an out-of-band pull; what
+  `-admit=any` gives up is the gate deciding *which* images may arrive, and
+  the preloaded mode's zero-download answer to a pull of a store-held image.
 
 Pick one per machine. Switching does not corrupt the store, but images
 admitted under `any` keep serving under `preloaded` until removed, so a
@@ -398,7 +405,8 @@ docker stop cfs-hold           # clean shutdown, no SIGKILL wait
 
 The container's root is one `overlay` mount whose `lowerdir` ends with the
 image's EROFS metadata mount followed by `::<ocicfs objects>` (a data-only
-layer) and `verity=require`; the shared EROFS mount itself appears in the
+layer) and, when the store runs with fs-verity, `verity=require`; the shared
+EROFS mount itself appears in the
 host's mount table under the snapshotter root
 (`.../containerd-cfs-grpc/snapshots/<id>/fs`, fstype `erofs`, on a loop
 device). The test image has no shell, so inspect the mounts from the host via

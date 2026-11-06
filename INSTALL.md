@@ -105,6 +105,13 @@ sudo make install
 `PREFIX=/usr` or `DESTDIR=<staging>` for packaging. Start the daemon as in
 the archive path above.
 
+The default build — also the released binaries and .deb — runs the ocicfs
+store with fs-verity when its filesystem can enable it and without it
+otherwise (`auto`). `make build GOFLAGS=-tags=ocicfs_verity_required`
+builds one that refuses a store without fs-verity instead (`make deb` does
+not take it: `debian/rules` sets its own `GOFLAGS`). See
+[Runtime requirements](#runtime-requirements) for what each mode needs.
+
 ## Connect containerd (and Docker)
 
 containerd reaches the daemon through one `proxy_plugins` entry. The
@@ -267,10 +274,22 @@ Installation works on any Linux; *running* the snapshotter needs:
 - **Kernel: Linux 6.6 or newer** — EROFS, fs-verity, and overlayfs with
   data-only lower layers and verity validation. A vendor kernel carrying
   the same support also works.
-- **fs-verity enabled on the filesystem holding the ocicfs store**
-  (`-ocicfs-root`, `/var/lib/ocicfs` by default). ext4 needs a 4096-byte
-  block size and the `verity` feature; btrfs supports fs-verity out of
-  the box.
+- **fs-verity on the filesystem holding the ocicfs store** (`-ocicfs-root`,
+  `/var/lib/ocicfs` by default) — required only by a build made in the
+  `required` fs-verity mode (`make build GOFLAGS=-tags=ocicfs_verity_required`),
+  which refuses to start on a filesystem that cannot enable it. The default
+  `auto` build runs such a store without fs-verity: containers run, but
+  their mounts do not verify object contents; `containerd-cfs-grpc -check`
+  reports which the store gets. ext4 needs a 4096-byte block size and the
+  `verity` feature; btrfs supports fs-verity out of the box. Build the
+  `ocicfs` CLI that fills the store in the same mode: a snapshotter that
+  runs the store with fs-verity fails every read of objects written without
+  it with EIO, and an `off` one (`ocicfs_verity_off`) reads fs-verity
+  objects without enforcing it. Before switching a host to another mode,
+  stop its containers and unmount every mount of the store: an overlay
+  keeps the mode it was made in until it is unmounted. An `auto` build decides from a probe that anyone
+  who can write the store root can influence; where an attacker who can
+  write `/var` is in scope, deploy a `required` build.
 - **containerd 2.1 or newer** — the transfer service forwards the unpack
   handshake and image-identity annotations to proxy snapshotters starting
   with containerd 2.1. On anything older (distro archives often still
