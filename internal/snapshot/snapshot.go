@@ -15,10 +15,10 @@
 // data-only lower, verified by fs-verity when the store runs with it — is the
 // base lower. The snapshot's own upper receives its writes. Image content
 // reaches the ocicfs store one of two ways: it is put there out of band, in
-// which case every unpack handshake is answered as if the content were
-// already present locally, or the runtime fetches it and the snapshotter,
-// serving containerd's diff API as well, ingests each layer into the store
-// as the unpacker applies it (see the calling contract below).
+// which case preloaded mode answers admitted unpack handshakes as if the
+// content were already present locally, or the runtime fetches it and the
+// snapshotter ingests each layer through containerd's diff API as the
+// unpacker applies it (see the calling contract below).
 //
 // # Calling contract
 //
@@ -46,10 +46,10 @@
 // committed snapshot the unpacker actually wants. A snapshotter that can
 // produce that snapshot without the caller fetching anything answers
 // ErrAlreadyExists, which skips the fetch/apply/Commit round for that layer.
-// When it does, the pull completes with zero layer fetches — the caller still
-// downloads the image metadata (index, manifest, config, etc.) — and the
-// mounts the container flow later receives compose the image's EROFS metadata
-// and ocicfs objects as the base of one flat overlay (see mounts).
+// A caller honoring that answer can skip layer fetches; it still downloads
+// image metadata (index, manifest, config, etc.). The mounts the container
+// flow later receives compose the image's EROFS metadata and ocicfs objects
+// as the base of one flat overlay (see mounts).
 //
 // A snapshotter that stages its pulls instead answers the handshake with a
 // staging snapshot: a metadata record whose one mount is a placeholder no
@@ -290,12 +290,12 @@ type Config struct {
 	Root string
 	// OcicfsRoot is the root of the ocicfs store the images are served from.
 	OcicfsRoot string
-	// AdmitAny selects the machine's work mode. False admits only
-	// images already in the ocicfs store, put there out of band, and declines
-	// every other pull. True stages every pull — even of an image the store
-	// already holds — and builds it into the store once the chain is
-	// complete, so the runtime fetches and keeps each pulled image's layers
-	// in its own content store.
+	// AdmitAny selects admission for new labeled unpack handshakes. False
+	// requires the named image and chain in the ocicfs store. True stages
+	// the pull even if the image is stored, ingesting runtime-fetched layers.
+	// Archive loads reuse stored chains in either mode; true also permits
+	// building missing loaded images from containerd's content store.
+	// Cached snapshots can bypass admission; this is not a config allowlist.
 	AdmitAny bool
 	// ContainerdAddress is the address of containerd's gRPC socket, whose
 	// content store the layers of a staged pull are read back from.
@@ -444,7 +444,8 @@ func (s *snapshotter) reconcileHolds(ctx context.Context) error {
 // containerd calls it at the end of each of its own collection cycles, after
 // the Remove of every record that cycle pruned, and — for an image removal
 // the client asked to be synchronous, as docker's is — waits for it, so the
-// store is reclaimed by the time the client's command returns. The
+// collection is attempted before the client's command returns. A busy
+// store defers collection; other collection failures are returned. The
 // collection runs on the snapshotter's own context: the RPC's only waits.
 // A cycle that released no hold since the last completed collection, such as
 // a container's removal, returns at once instead of waiting for a collection
