@@ -43,14 +43,14 @@ func expectStoreVerity(t *testing.T, root string) storeVerity {
 	if err != nil {
 		t.Fatalf("VerityState() error = %v", err)
 	}
-	prefix := fmt.Sprintf("2. fs-verity on the ocicfs store (%s): ", root)
+	prefix := fmt.Sprintf("2. fs-verity on %s: ", root)
 	switch state {
 	case "unsupported":
-		return storeVerity{line: prefix + "FAIL: unsupported (build: " + ocicfs.BuildVerityMode + ")", fails: true}
+		return storeVerity{line: prefix + "FAIL: the filesystem cannot enable fs-verity", fails: true}
 	case "disabled":
-		return storeVerity{line: prefix + "disabled (build: " + ocicfs.BuildVerityMode + "): mounts do not verify object contents"}
+		return storeVerity{line: prefix + "disabled (file contents are not checked on read)"}
 	}
-	return storeVerity{line: prefix + "enabled (build: " + ocicfs.BuildVerityMode + ")"}
+	return storeVerity{line: prefix + "enabled"}
 }
 
 // verdict returns the exit code and the last line of a check that fails on
@@ -105,9 +105,9 @@ func TestRunCheckPassesOutOfBand(t *testing.T) {
 		t.Fatalf("runCheck = %d, want %d; output:\n%s", code, wantCode, out.String())
 	}
 	wantLines(t, out.String(),
+		"checking runtime prerequisites (-admit=preloaded, -ingest-workers=2):",
 		"1. mkcomposefs: skipped (preloaded mode",
 		store.line,
-		"ingest workers: 2",
 		"3. containerd: ok (version v2.2.3)",
 		"4. containerd version 2.1+: ok",
 		"5. containerd proxy_plugins wiring: ok (proxy plugin cfs)",
@@ -127,7 +127,7 @@ func TestRunCheckReportsConfiguredWorkers(t *testing.T) {
 	if code != wantCode {
 		t.Fatalf("runCheck = %d, want %d; output:\n%s", code, wantCode, out.String())
 	}
-	wantLines(t, out.String(), "ingest workers: 4", verdict)
+	wantLines(t, out.String(), "checking runtime prerequisites (-admit=preloaded, -ingest-workers=4):", verdict)
 }
 
 func TestRunCheckFailsOnOldContainerd(t *testing.T) {
@@ -213,7 +213,7 @@ func TestRunCheckReportsAllStagedPrerequisites(t *testing.T) {
 	// both prerequisites appear, each with its own result.
 	wantLines(t, out.String(),
 		"1. mkcomposefs: FAIL:",
-		"2. fs-verity on the ocicfs store (",
+		"2. fs-verity on ",
 		"3. containerd: ok (version v2.2.3)",
 		"7. containerd diff proxy_plugins wiring: ok (proxy plugin cfs-diff)",
 		"check failed")
