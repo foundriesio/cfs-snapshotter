@@ -22,7 +22,15 @@ import (
 // at startup, but as a plain command whose non-zero exit a script or a
 // provisioning step can act on.
 func runCheck(ctx context.Context, w io.Writer, cfg snapshot.Config, socketAddress string) int {
-	line(w, "checking runtime prerequisites:")
+	admit := "preloaded"
+	if cfg.AdmitAny {
+		admit = "any"
+	}
+	workers := cfg.IngestWorkers
+	if workers == 0 {
+		workers = ocicfs.DefaultIngestWorkers
+	}
+	line(w, "checking runtime prerequisites (-admit=%s, -ingest-workers=%d):", admit, workers)
 	failed := false
 	report := func(name string, err error) {
 		if err != nil {
@@ -45,19 +53,13 @@ func runCheck(ctx context.Context, w io.Writer, cfg snapshot.Config, socketAddre
 	default:
 		report("1. mkcomposefs", engine.PreflightTools())
 	}
-	store := fmt.Sprintf("2. fs-verity on the ocicfs store (%s)", cfg.OcicfsRoot)
+	store := fmt.Sprintf("2. fs-verity on %s", cfg.OcicfsRoot)
 	if err != nil {
 		failed = true
 		line(w, "%s: FAIL: create ocicfs engine: %v", store, err)
 	} else if reportStoreVerity(w, store, engine) {
 		failed = true
 	}
-	workers := cfg.IngestWorkers
-	if workers == 0 {
-		workers = ocicfs.DefaultIngestWorkers
-	}
-	line(w, "ingest workers: %d", workers)
-
 	r, reachable := containerdRound(ctx, cfg.ContainerdAddress, socketAddress)
 	if !reachable {
 		failed = true
@@ -111,12 +113,12 @@ func runCheck(ctx context.Context, w io.Writer, cfg snapshot.Config, socketAddre
 	return 0
 }
 
-// reportStoreVerity prints how this build runs the store under name, with
-// the fs-verity mode it was built with, and reports whether that fails the
-// check. A store the build runs without fs-verity passes: the daemon mounts
-// it without requiring fs-verity, and the line says what that gives up. A
-// store whose filesystem cannot enable fs-verity in a build that requires it
-// fails, as does a probe that cannot run.
+// reportStoreVerity prints whether this build runs the store under name with
+// fs-verity, and reports whether that fails the check. A store the build runs
+// without fs-verity passes: the daemon mounts it without requiring fs-verity,
+// and the line says what that gives up. A store whose filesystem cannot
+// enable fs-verity in a build that requires it fails, as does a probe that
+// cannot run.
 func reportStoreVerity(w io.Writer, name string, engine ocicfs.Engine) bool {
 	state, err := engine.VerityState()
 	switch {
@@ -124,13 +126,13 @@ func reportStoreVerity(w io.Writer, name string, engine ocicfs.Engine) bool {
 		line(w, "%s: FAIL: %v", name, err)
 		return true
 	case state == "unsupported":
-		line(w, "%s: FAIL: unsupported (build: %s): the store's filesystem cannot enable fs-verity, which this build requires", name, ocicfs.BuildVerityMode)
+		line(w, "%s: FAIL: the filesystem cannot enable fs-verity, which this build (ocicfs_verity_required) requires", name)
 		return true
 	case state == "disabled":
-		line(w, "%s: disabled (build: %s): mounts do not verify object contents", name, ocicfs.BuildVerityMode)
+		line(w, "%s: disabled (file contents are not checked on read)", name)
 		return false
 	}
-	line(w, "%s: %s (build: %s)", name, state, ocicfs.BuildVerityMode)
+	line(w, "%s: %s", name, state)
 	return false
 }
 

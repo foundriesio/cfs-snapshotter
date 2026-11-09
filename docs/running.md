@@ -44,7 +44,7 @@ The defaults match the config below; see `-help` for the full list.
 | `-admit` | `any` | Which images the machine admits: `any` stages every pull or load through containerd's content store and builds it into the ocicfs store; `preloaded` admits only images already in the store (put there with `ocicfs pull`) and declines the rest. |
 | `-ingest-workers` | `0` (ocicfs's default, 2) | How many layers staged pulls ingest into the ocicfs store at once, across every pull in progress. Two is the gain on every platform measured; a many-core host with fast storage may take a few percent more from four. |
 | `-log-level` | `info` | `trace`, `debug`, `info`, `warn`, `error`, `fatal`, `panic`. |
-| `-check` | off | Check the runtime prerequisites and the containerd wiring of both the snapshotter and the differ instead of serving: one verdict line per aspect, the effective ingest worker count, and a non-zero exit on any failure. It opens the ocicfs store as the daemon would in either mode, creating its directories and writing one probe file, and reports whether this build runs the store with fs-verity. |
+| `-check` | off | Check the runtime prerequisites and the containerd wiring of both the snapshotter and the differ instead of serving: one verdict line per aspect under a header naming the admit mode and the effective ingest worker count, and a non-zero exit on any failure. It opens the ocicfs store as the daemon would in either mode, creating its directories and writing one probe file, and reports whether this build runs the store with fs-verity. |
 
 The snapshotter root hosts each container's overlay upper and work
 directories, so it must live on a regular filesystem (ext4, xfs, …) — overlay
