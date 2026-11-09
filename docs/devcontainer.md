@@ -1,327 +1,309 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# Devcontainer Runtime Testing
+# Devcontainer runtime testing
 
-This repository includes a privileged devcontainer for testing the cfs proxy
-snapshotter against a nested, version-pinned runtime stack:
+The privileged devcontainer runs a nested Docker/containerd stack and a
+local Zot registry at `127.0.0.1:5000`. Both runtime clients are configured
+for cfs. This is a development environment; the snapshotter itself still
+only provides storage primitives.
 
-- Docker Engine from Docker's static binary archive.
-- Upstream containerd from containerd release assets.
-- Upstream runc.
-- CNI plugins.
-- Zot, used as a local test registry on `127.0.0.1:5000`.
-- erofs-utils built from source (Debian's package predates the tar mode that
-  containerd's built-in erofs snapshotter needs).
-- composefs built from source (`mkcomposefs`, `mount.composefs`), which ocicfs
-  shells out to.
-- The ocicfs CLI for staging images into the store — see the note below.
-- The locally built `bin/containerd-cfs-grpc`.
+| You want | Start from the host |
+|---|---|
+| Interactive development, including e2e | `./devshell.sh` |
+| One command in a fresh container | `./devshell.sh make test-e2e` |
+| Another shell or command in the running session | `./devshell.sh exec` or `./devshell.sh exec <command>` |
+| An editor-managed session | Reopen in Container; the ocicfs CLI must be supplied separately for e2e. |
 
-The ocicfs CLI is not baked into the image: `./devshell.sh` builds it on the
-host at the exact version the snapshotter pins and mounts the binary at
-`/opt/cfs-dev/bin/ocicfs`, so the CLI always matches the pinned module. A
-container opened directly from an editor does not get it, and `make test-e2e`
-(which needs it) will fail there — use `./devshell.sh` for the e2e.
+## 1. Prepare the host
 
-The container's Go build and module caches and that ocicfs binary are kept on
-the host under `~/.cache/cfs-snapshotter` (`$XDG_CACHE_HOME` when set), so
-they survive container runs and stay off a size-limited `/tmp`. Set
-`CFS_DEV_CACHE` to put them elsewhere. Anything that pre-fetches modules for
-the container, as CI does, must use the same module cache:
-`GOMODCACHE=~/.cache/cfs-snapshotter/go-mod go mod download`.
+Use a Linux Docker host that allows privileged containers, loop devices
+and nested mounts. It needs the
+[runtime kernel features](../INSTALL.md#runtime-requirements), including
+fs-verity for the verification tests, and network access to build the
+image and fetch dependencies. `devshell.sh` also needs Go on the host to
+build the pinned ocicfs CLI.
 
-The container is intentionally for development and conformance-style wiring
-checks only. It does not add Docker or container lifecycle behavior to
-cfs-snapshotter itself.
+The image is based on Debian Bookworm via
+`mcr.microsoft.com/devcontainers/go:<GO_VERSION>-bookworm`. Docker,
+containerd, runc, CNI plugins and Zot come from upstream release archives.
+It builds erofs-utils and composefs from source. ocicfs uses `mkcomposefs`
+when building images; mounting uses its Go implementation.
 
-## Host Requirements
-
-- Linux Docker host.
-- Privileged containers enabled.
-- Kernel support for nested mounts and the snapshotter operations being tested.
-- Network access during devcontainer build to fetch the requested binary
-  release archives.
-
-The devcontainer uses Debian Bookworm through
-`mcr.microsoft.com/devcontainers/go:<GO_VERSION>-bookworm`. It does not install
-Docker or containerd from Debian packages, so runtime versions are controlled
-only through build arguments.
-
-## Version Knobs
-
-Override versions in `.devcontainer/devcontainer.json` by changing the build
-arguments:
-
-```jsonc
-"build": {
-  "dockerfile": "Dockerfile",
-  "args": {
-    "GO_VERSION": "1.26",
-    "DOCKER_VERSION": "29.3.0",
-    "CONTAINERD_VERSION": "2.2.2",
-    "RUNC_VERSION": "1.3.3",
-    "CNI_PLUGINS_VERSION": "1.8.0",
-    "ZOT_VERSION": "2.1.17",
-    "EROFS_UTILS_VERSION": "1.9.2",
-    "GOLANGCI_LINT_VERSION": "2.6.2"
-  }
-}
-```
-
-The Dockerfile downloads exact release artifacts and fails during build if a
-requested archive is missing or cannot be installed. The composefs build is
-pinned by tag and commit through the Dockerfile's `COMPOSEFS_VERSION` and
-`COMPOSEFS_COMMIT` build arguments.
-
-Reference release locations:
-
-- Docker static binaries: <https://docs.docker.com/engine/install/binaries/>
-- containerd release assets: <https://github.com/containerd/containerd/releases>
-- Zot release assets: <https://github.com/project-zot/zot/releases>
-- erofs-utils release tags: <https://github.com/erofs/erofs-utils/tags>
-
-## Startup
-
-Opening the devcontainer runs the image entrypoint. The entrypoint:
-
-- Starts Zot, `containerd`, and `dockerd`.
-- Mounts one loop-backed, fs-verity-enabled ext4 filesystem and binds
-  subdirectories of it as the ocicfs store root (`/var/lib/ocicfs`) and the
-  snapshotter roots: the ocicfs store needs fs-verity, and the overlay
-  upper/work directories need a real filesystem (they cannot live on the
-  container's own overlayfs). Its size in MiB comes from the host's
-  `CFS_SHARED_ROOT_SIZE_MB` (default 1024), passed through by `devshell.sh`
-  and `devcontainer.json` and applied when the filesystem is first created.
-- Starts `bin/containerd-cfs-grpc` with `-ocicfs-root /var/lib/ocicfs`, before
-  `containerd`, so containerd can register the `cfs` proxy snapshotter during
-  startup.
-- Waits for `ctr version`, `docker version`, and `docker info`.
-- Runs the requested command, or the default `sleep infinity` command for an
-  interactive devcontainer session.
-
-The Dockerfile bakes in `/etc/containerd/config.toml` with the `cfs` proxy
-snapshotter and unpack entries for `overlayfs` and `cfs`. It also bakes in
-`/etc/docker/daemon.json` with Docker's containerd image store enabled and `cfs`
-as the selected storage driver. Both Docker and containerd are configured to use
-the local insecure registry at `127.0.0.1:5000`.
-
-Logs and pid files are written under `/var/log/cfs-devcontainer/`.
-
-Rebuild and restart the cfs proxy snapshotter after editing snapshotter code:
+## 2. Open a shell and build
 
 ```sh
+./devshell.sh
+```
+
+Startup ends with these lines before handing over to the requested shell
+or command:
+
+```text
+devcontainer daemons are ready
+logs: /var/log/cfs-devcontainer
+```
+
+Inside the container:
+
+```sh
+make check
+make build
 make run-cfs
 ```
 
-`make run-cfs` builds `bin/containerd-cfs-grpc`, restarts it in the background,
-and ensures containerd sees the `cfs` proxy snapshotter. It does not restart
-containerd after every cfs restart; it restarts containerd only if the `cfs`
-proxy plugin is not registered.
+`make run-cfs` rebuilds the daemon and restarts it if its binary or settings
+changed. It leaves an unchanged process running unless
+`CFS_FORCE_RESTART=1` is set. It restarts containerd only if the cfs
+snapshotter plugin is not registered.
 
-The cfs snapshotter runs with trace logging by default in the devcontainer. To
-override it:
+## 3. Check a container
+
+The stack starts in admit-any mode. Seed a runnable image into the local
+registry, pull it and run it:
 
 ```sh
-CFS_LOG_LEVEL=debug make run-cfs
+image=127.0.0.1:5000/cfs/demo:latest
+SEED_RUNNABLE=1 SEED_NONCE=demo \
+    .devcontainer/scripts/seed-registry.sh "$image"
+docker pull "$image"
+docker run --rm "$image"
 ```
 
-The devcontainer boots the snapshotter in the default admit-any mode. A plain
-`make run-cfs` restarts it that way; `CFS_ADMIT=preloaded make run-cfs`
-restarts it in the preloaded mode instead (the mode is part of the state the
-restart reconciles, so switching back is another `make run-cfs`).
+Expected container output:
+
+```text
+cfs hello demo
+```
+
+Inspect Docker's snapshots and daemon log:
+
+```sh
+ctr --namespace moby snapshots --snapshotter cfs ls
+cfs-log
+```
+
+The shell helpers `cfs-log` and `cfs-log-follow` pretty-print
+`/var/log/cfs-devcontainer/containerd-cfs-grpc.log` using `jq`.
+[Keep the container running](running.md#inspecting-a-running-container-devcontainer)
+to inspect its mounts.
+
+## Try preloaded mode
+
+Use a new image so existing runtime snapshots do not bypass admission:
+
+```sh
+CFS_ADMIT=preloaded make run-cfs
+layout=$(mktemp -d)
+SEED_RUNNABLE=1 SEED_NONCE=preloaded SEED_KEEP_LAYOUT="$layout" \
+    .devcontainer/scripts/seed-registry.sh 127.0.0.1:5000/cfs/preloaded:latest
+digest=$(jq -r '.manifests[0].digest' "$layout/index.json")
+image="127.0.0.1:5000/cfs/preloaded@$digest"
+ocicfs pull --from-dir "$layout" "$image"
+docker pull "$image"
+docker run --rm "$image"
+```
+
+Expected output from the container:
+
+```text
+cfs hello preloaded
+```
+
+The runtime needs only image metadata for this pull. An image absent from
+the store is declined. Return to admit-any mode with `make run-cfs`, with
+`CFS_ADMIT` unset. See [admission limits](running.md#image-reference-stamping-and-admission)
+before treating mode changes as a deployment policy.
 
 ## End-To-End Test
 
-From the host, run the e2e inside the devcontainer with the nested daemon
-stack started:
+Run from the host:
 
 ```sh
 ./devshell.sh make test-e2e
 ```
 
-From an already-open devcontainer session (started via `./devshell.sh`, which
-provides the ocicfs CLI):
+Or run `make test-e2e` inside a devshell session. It depends on
+`make run-cfs`, then runs `.devcontainer/scripts/e2e-fastpath.sh`. It
+changes runtime state, seeds images and switches the daemon between modes.
+Use the dedicated development stack.
+
+The suite checks these flows:
+
+| Check group | Store and checks |
+|---|---|
+| Preloaded | Reject absent images and config substitutions on fresh pulls; check layer absence in containerd, container output, holds, shared EROFS mounts, recovery after unmount/restart, loop teardown and tamper rejection. |
+| Delta preload | Pull two zstd:chunked fixture releases, check range-transfer counters, compare the resulting image, export changed/added/removed files through cfs, and collect the old base. |
+| Admit-any | Use `/var/lib/ocicfs-cold` and `/var/lib/containerd-cfs-grpc-cold`; check incremental ingest, mount options, refetch, shared objects, runtime-reference retention, orphan holds, interrupted pulls and cleanup. Compare builds at one and two workers and with a plain ocicfs pull. |
+| Offline loads | In both modes, load with the registry stopped; check missing/preloaded images, base-after-derived ordering and recovery. Also check sideload followed by a digest pull before disconnecting. |
+| Without fs-verity | Use `/var/lib/ocicfs-tmpfs` on tmpfs and `/var/lib/containerd-cfs-grpc-tmpfs` on ext4. Check the startup warning, pull/run output and an overlay without `verity=require`. |
+
+The cold tests also check that files superseded by later layers remain
+after pull and are reclaimed by an explicit `ocicfs gc`. Agent holds keep
+images after runtime removal until released and collected. A retained
+derived image keeps its base chain. The test's immediate-reclamation
+assertions apply to its controlled, idle store; operational limits are in
+[retention and collection](running.md#image-retention-and-garbage-collection).
+
+The script prints `ok` or `skip` for individual checks and exits non-zero
+on failure. A successful run ends with `E2E OK: <passed> passed, <skipped>
+skipped`, with counts for that host. It reports per-layer timings as
+`apply: <image> layer <i> in <T>s`, or
+`finish: <image> layer <i> in <T>s` for the final layer. These
+come from the differ's elapsed-time logs, not separate benchmarks.
+Layer absence and registry counters are the suite's evidence for skipped
+fetches; they are not packet captures.
+
+## Host Requirements
+
+The prerequisites are listed in [step 1](#1-prepare-the-host). For targets
+that do not need a nested runtime, use the host directly:
+
+| Target | Where it runs |
+|---|---|
+| `make`, `build`, `fmt`, `clean` | Host or devcontainer. |
+| `install` | Either; requires permission to write `PREFIX`/`DESTDIR`. |
+| `check`, `test`, `vet`, `lint` | Either with Go and, for lint/check, golangci-lint. Some integration tests skip when tools or privileges are absent. |
+| `run-cfs`, `test-e2e` | Devcontainer; e2e also needs the ocicfs CLI. |
+| `root-test` | Privileged environment; see limitations below. |
+| `deb`, `deb-lint`, `deb-test` | Host with Go and Docker; packaging uses its own container. |
+
+## Version Knobs
+
+`devshell.sh` builds directly from
+[.devcontainer/Dockerfile](../.devcontainer/Dockerfile). Editor sessions
+apply the build arguments in
+[devcontainer.json](../.devcontainer/devcontainer.json). Editing those
+JSON arguments does not change a devshell build.
+
+| Component | Dockerfile default | Editor override |
+|---|---|---|
+| Go image series | `1.26` | `1.26` |
+| Docker | `29.3.0` | same |
+| containerd | `2.2.2` | same |
+| runc | `1.3.3` | same |
+| CNI plugins | `1.8.0` | same |
+| Zot | `2.1.17` | same |
+| erofs-utils | `1.9.2` | same |
+| golangci-lint | `2.12.2` | `2.6.2` |
+
+The Go version required by the module is in `go.mod`. composefs is pinned
+by `COMPOSEFS_VERSION` and `COMPOSEFS_COMMIT` in the Dockerfile. Missing
+release archives fail the image build. Update the appropriate build
+arguments and rebuild when testing another runtime version.
+
+The ocicfs CLI is not baked into the image. `devshell.sh` tries to build
+exactly the module version pinned in `go.mod` on the host, then mounts it
+at `/opt/cfs-dev/bin/ocicfs`. A failed build warns but still opens the
+shell; e2e then cannot run. An editor-opened container does not receive
+that binary automatically.
+
+Devshell keeps Go caches and the CLI under
+`${XDG_CACHE_HOME:-$HOME/.cache}/cfs-snapshotter`. Override the directory
+with `CFS_DEV_CACHE`. They survive sessions and avoid a small `/tmp`.
+Editor sessions use their configured in-container caches instead. To
+prefetch into devshell's default module cache as CI does:
 
 ```sh
-make test-e2e
+GOMODCACHE="$HOME/.cache/cfs-snapshotter/go-mod" go mod download
 ```
 
-`make test-e2e` depends on `make run-cfs`, so it rebuilds and restarts the cfs
-proxy first, then runs `.devcontainer/scripts/e2e-fastpath.sh`. The e2e seeds
-Zot with runnable multi-layer OCI images
-(`.devcontainer/scripts/seed-registry.sh`) and drives the full data plane
-through Docker, in two phases — one per work mode, since a machine runs in one
-or the other and never both.
+Adjust the path when overriding the cache location.
 
-The warm phase restarts the snapshotter in the preloaded mode
-(`-admit=preloaded`), admitting only images staged in the ocicfs
-store with `ocicfs pull --from-dir` pinned by manifest digest:
+## Startup
 
-- Pulls of an image the store does not hold — including one that reuses a held
-  image's layers under a different config — are declined at the snapshotter's
-  admission gate.
-- `docker pull` completes with zero layer fetches and `docker run` prints the
-  seeded program's output — real image content, served from the ocicfs store.
-- An admitted image is held in the store: `ocicfs remove` declines and names
-  the holder, the container still runs, and the hold is released once the
-  image is removed from the runtime.
-- Concurrent containers share one EROFS image mount and each get their own
-  flat overlay rootfs.
-- An existing container recovers after the shared image mount is unmounted
-  and the snapshotter is restarted.
-- Removing the image tears down the chain mount and its loop device.
-- Tampering with a backing object in the store makes the container fail with
-  an I/O error — fs-verity rejects the modified content when overlayfs opens
-  the file.
-- An image staged by `ocicfs pull --delta` is served like any other: two
-  zstd:chunked releases sharing a base layer (the pinned ocicfs module's own
-  fixtures, pushed to Zot blob by blob) are pulled with the first held as the
-  delta base, the second is fetched by ranges only and builds the composefs
-  image a plain pull builds, `docker pull` fetches none of its layers, a
-  container's export reads its changed, added and removed files through the
-  snapshotter, and releasing, removing and collecting the base reclaims what
-  only the first release carried while the second stays whole.
+The entrypoint starts Zot, builds cfs and prepares a loop-backed ext4
+filesystem with fs-verity. It binds subdirectories onto the ocicfs and
+snapshotter roots. This gives verification tests fs-verity and gives
+overlay upper/work directories a filesystem other than the container's
+own overlayfs. fs-verity is optional for normal cfs operation.
 
-The cold phase then restarts the snapshotter in the admit-any mode — the boot
-default — with
-stores of its own (`/var/lib/ocicfs-cold`,
-`/var/lib/containerd-cfs-grpc-cold`), and asserts that a plain `docker pull`
-of an image nobody staged:
+`CFS_SHARED_ROOT_SIZE_MB` selects the size (default 1024 MiB) when the
+filesystem is created. Devshell and the editor configuration pass it
+from the host. An already mounted shared root keeps its current size.
 
-- lands in the ocicfs store as exactly one composefs image, present in the CAS
-  and named in the fs-verity view, with no staging directories on disk and
-  the chain's snapshot records kept — and the content its layers wrote that
-  the image does not reference (every layer rewrites one file) is left in
-  the store by the pull and reclaimed by the `ocicfs gc` the test then runs;
-- reaches the store a layer at a time through the differ: a known file of the
-  first layer is a store object while the last, large layer is still being
-  transferred;
-- runs under `docker run`, on a shared EROFS mount and a `verity=require`
-  overlay, and prints the seeded program's output;
-- fetches its layers again when it is removed from the runtime and
-  re-pulled — a staging machine refetches rather than answering from the
-  store — and converges on the same single store image;
-- is the runtime's alone: the store lists it under the reference docker
-  pulled, as a runtime reference for the snapshotter's holder that resolves
-  by name but pins nothing, `ocicfs gc` would reclaim none of it while the
-  runtime lists it, and
-  `docker rmi` reclaims it — from the store's listing and from disk, back to
-  the byte count before the pull — before the command returns, with no wait
-  and no ocicfs command;
-- shares its objects with a second image built on the same layers — the store
-  does not grow by a second copy — and removing the shorter of the two from
-  the runtime keeps what the longer reads (and the shorter itself, whose
-  chain still stands under the longer), keeps the longer mountable, and
-  removing both reclaims everything;
-- stays when an agent holds it: `docker rmi` drops only the runtime's hold,
-  and the image goes once the agent releases and runs `ocicfs gc`;
-- is not pinned for good by a hold of the snapshotter's own that no record
-  owns — the daemon releases such a hold when it starts, and the next
-  `docker rmi` reclaims the image;
-- leaves nothing behind when the pull is interrupted midway: the active
-  snapshot is aborted, the staged records are collected once nothing
-  references them, `ocicfs gc` runs against the store the abandoned build let
-  go of, and a re-pull of the same reference converges on the same one
-  composefs image;
-- builds the same composefs image at one and at two ingest workers, and the
-  same one `ocicfs pull` builds from the image's OCI layout into a fresh store.
+The entrypoint starts cfs before containerd, then starts dockerd with an
+explicit connection to that containerd. It waits for the runtime clients
+to answer before executing your command. Docker and containerd allow the
+local HTTP registry. Logs and pid files live under
+`/var/log/cfs-devcontainer/`.
 
-The cold phase runs the snapshotter with `-ingest-workers 1` and switches to
-`-ingest-workers 2` for the last leg. The e2e prints one line per layer the
-differ applied for a cold pull, from the elapsed time the snapshotter logs for
-each: `apply: <image> layer <i> in <T>s` for the layers fed into the image
-build, and `finish: <image> layer <i> in <T>s` for the last one, which also
-finishes the image.
+The daemon starts with trace logging, admit-any mode and the default
+worker count. Change settings for a subsequent run with:
 
-A last phase restarts the admit-any snapshotter with its ocicfs store on a
-tmpfs (`/var/lib/ocicfs-tmpfs`), which cannot enable fs-verity, and its
-snapshotter root (`/var/lib/containerd-cfs-grpc-tmpfs`) on the shared ext4
-like the others. The default build runs such a store without fs-verity: the
-daemon logs so at startup, a plain `docker pull` lands and `docker run`
-prints the seeded program's output, and the container's overlay reads the
-tmpfs store's objects without `verity=require`.
+```sh
+CFS_LOG_LEVEL=debug CFS_INGEST_WORKERS=2 make run-cfs
+```
+
+`CFS_ROOT` and `OCICFS_ROOT` select alternate roots for the run script.
+`CFS_ADMIT=preloaded` selects preloaded mode. Unset overrides return to
+the script defaults on the next `make run-cfs`.
 
 ## Conformance Suite
 
-`make root-test` runs containerd's reusable snapshotter conformance suite
-(`core/snapshots/testsuite`) against a cfs snapshotter backed by a real ocicfs
-store. It mounts, so it needs root; a plain `make test` skips it.
+`make root-test` invokes containerd's reusable `SnapshotterSuite` with
+`-test.root`. Plain `make test` skips it. It needs a privileged environment
+capable of mounting and preserving file ownership:
 
 ```sh
 ./devshell.sh make root-test
 ```
 
-All 21 subtests currently fail, every one of them on the same call and with
-the same error:
+The suite prepares parentless scratch snapshots. cfs requires an image
+ancestor and rejects that shape with an error beginning:
 
-```
+```text
 snapshot has no image in its ancestry; scratch snapshots are not supported
 ```
 
-The suite builds its fixtures from the bottom up: each test starts by
-preparing a snapshot with no parent and applying files into it. cfs has no
-answer for that by design — a snapshot's lowest layer is an image in the ocicfs
-store, and a mount with no image beneath it would be unverified scratch, so
-`Prepare` refuses it. Nothing gets far enough to exercise what the suite is
-really checking (layer semantics, whiteouts, `Rename`, the 128-layer mount),
-so the run says nothing about those yet.
-
-Making the suite meaningful needs fixtures that start from an image the store
-holds, which the suite has no seam for; the e2e above is what covers the
-snapshotter's behaviour in the meantime.
+This prevents those cases from reaching their layer semantics, whiteout,
+rename and deep-stack checks. The suite is not currently a passing
+conformance gate. The e2e exercises supported image-backed flows; it is
+not a substitute for resolving the conformance mismatch. Do not modify
+the upstream suite to hide the failure.
 
 ## Debugging Niceties
 
-Two shell functions and an environment variable make interactive debugging
-easier from any login shell inside the devcontainer (`./devshell.sh`, a VS Code
-terminal, etc.):
-
-- `cfs-log` -- pretty-print the whole `containerd-cfs-grpc` daemon log.
-- `cfs-log-follow` -- tail and pretty-print the log as new entries arrive.
-
-Both read `/var/log/cfs-devcontainer/containerd-cfs-grpc.log` (see Startup
-above) through `jq`.
-
-A plain `docker run` of the seeded test image exits immediately once it
-prints its greeting, leaving nothing to inspect. Running its `/hello` binary
-with the `sleep` argument makes it block instead, so the container and its
-overlay mount stay up for inspection from the host. See
-[docs/running.md](running.md#inspecting-a-running-container-devcontainer)
-for the full example.
+Use the [log helpers](#3-check-a-container) and the
+[mount inspection example](running.md#inspecting-a-running-container-devcontainer).
+The seeded `/hello sleep` process handles termination, so `docker stop`
+does not need to wait for a forced kill.
 
 ## Comparing Against The erofs Snapshotter
 
-containerd's built-in erofs snapshotter is wired up as a reference point: it
-converts each layer to an EROFS blob at unpack time and mounts the result,
-which makes it a useful side-by-side comparison for cfs's snapshot and mount
-shapes. Ask for it explicitly (the devcontainer default is cfs):
+The entrypoint enables containerd's built-in erofs snapshotter when
+`/proc/filesystems` lists erofs. Without it, startup prints:
+
+```text
+host kernel lacks EROFS; erofs snapshotter comparison disabled
+```
+
+That avoids registering an unusable comparison plugin; cfs itself still
+needs EROFS to serve containers. To compare on a capable host:
 
 ```sh
-ctr image pull --snapshotter=erofs docker.io/library/busybox:latest
-ctr run --rm --snapshotter=erofs docker.io/library/busybox:latest erofs-demo echo hello
+ctr images pull --snapshotter erofs docker.io/library/busybox:latest
+ctr run --rm --snapshotter erofs \
+    docker.io/library/busybox:latest erofs-demo echo hello
 ctr snapshots --snapshotter erofs ls
 ```
 
-Unlike cfs, these pulls download the layers: the erofs snapshotter is a local
-snapshotter, not a remote one, so no unpack handshake is answered and the
-transfer service fetches and converts every layer.
-
-This needs EROFS support in the host kernel. The entrypoint enables the erofs
-snapshotter only when `/proc/filesystems` lists erofs; on hosts without it
-(CI runners included) it prints a notice and leaves erofs out, and cfs is
-unaffected either way.
+The container prints `hello`. This local snapshotter downloads layers and
+converts each to EROFS during unpack; it does not use cfs's preloaded
+handshake. The image builds erofs-utils with the tar support it needs.
 
 ## Shutdown And Cleanup
 
-Stopping the devcontainer stops the nested daemons with the container.
+Stopping the devcontainer stops its nested daemons. Devshell removes its
+container on exit and hands cache ownership back to the host user.
 
-Delete nested daemon state and logs:
+To stop the daemons and delete their state inside a development session:
 
 ```sh
 .devcontainer/scripts/clean-runtime-state.sh --force
 ```
 
-The cleanup script requires `--force` because it removes `/var/lib/docker`,
-`/var/lib/containerd`, `/var/lib/containerd-cfs-grpc`,
-`/var/lib/cfs-dev-registry`, related `/run` sockets, and
-`/var/log/cfs-devcontainer` inside the devcontainer.
+The script removes `/var/lib/docker`, `/var/lib/containerd`,
+`/var/lib/containerd-cfs-grpc`, `/var/lib/cfs-dev-registry`, the related
+runtime socket directories and `/var/log/cfs-devcontainer`. It does not
+remove the ocicfs store or unmount the shared filesystem. Start a fresh
+devshell session for a fresh nested stack.
