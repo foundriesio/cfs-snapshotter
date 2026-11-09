@@ -76,7 +76,7 @@ func runCheck(ctx context.Context, w io.Writer, cfg snapshot.Config, socketAddre
 			line(w, "4. containerd version 2.1+: unknown (unrecognized version %q); not enforced", r.version)
 		case r.tooOld:
 			failed = true
-			line(w, "4. containerd version 2.1+: FAIL: %s is older than 2.1, whose transfer service does not forward the unpack handshake and image-identity annotations; every pull will fail", r.version)
+			line(w, "4. containerd version 2.1+: FAIL: %s is older than 2.1; its transfer service lacks the unpack handshake and image-identity annotations cfs needs, so every pull will fail", r.version)
 		default:
 			line(w, "4. containerd version 2.1+: ok")
 		}
