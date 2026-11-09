@@ -23,7 +23,8 @@ Description: composefs-backed remote snapshotter for containerd
  container root filesystems from a content-addressed, composefs-backed
  store: a container mounts its image's read-only EROFS metadata once,
  shared by all its containers, and gets one flat overlay whose data comes
- from fs-verity-protected objects.
+ from the store's objects, protected by fs-verity when the store's
+ filesystem supports it.
  .
  By default a plain docker/containerd pull fills the store; started with
  -admit=preloaded the daemon instead serves only images placed
