@@ -31,7 +31,7 @@ Signed-off-by: Jane Developer <jane@example.com>
 The easiest way is to pass `-s` when committing:
 
 ```bash
-git commit -s -m "snapshotter: short imperative subject"
+git commit -s -m "fix(snapshotter): short imperative subject"
 ```
 
 The sign-off certifies that you wrote the patch or otherwise have the right to
@@ -90,7 +90,9 @@ If you use a coding agent in this repository, it must also follow the rules in
 ## Continuous integration
 
 CI runs `make vet`, `make test` (also with `-race`), `make build`, `make lint`
-and `./devshell.sh make test-e2e`. A pull request is expected to be green before
+and `./devshell.sh make test-e2e`. CI also vets and unit-tests builds with
+`ocicfs_verity_required` and `ocicfs_verity_off`; the default build uses
+optional fs-verity (`auto`). A pull request is expected to be green before
 review.
 
 ## Reporting security issues
