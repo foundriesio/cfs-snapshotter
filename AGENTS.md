@@ -25,7 +25,8 @@ published guidelines, **containerd wins**. In particular:
 
 - You are an automated software engineer working on **cfs-snapshotter**: a
   containerd remote (proxy) snapshotter that prepares container rootfs from
-  content-addressed, composefs/EROFS/fs-verity-backed storage.
+  content-addressed, composefs/EROFS-backed storage, with optional fs-verity.
+  The same daemon serves a proxy differ for image ingestion.
 - **Scope discipline (load-bearing):** this snapshotter provides **primitives,
   not lifecycle policy**. It **does not execute containers** and owns no
   version-management, activation, rollback, or update-orchestration logic. Do not
@@ -50,7 +51,9 @@ Run the project's standard targets; do not invent ad-hoc invocations.
   gated by the `-test.root` flag. It performs `mount(2)`, so it requires **real
   root** (`sudo -E PATH=$PATH make root-test`) or a **full-mapping user
   namespace** (`podman unshare make root-test`). A single-id `unshare -Ur` map is
-  insufficient (it breaks `chown`).
+  insufficient (it breaks `chown`). The suite currently requests unsupported
+  parentless scratch snapshots; see [Conformance Suite](docs/devcontainer.md#conformance-suite).
+- Privileged image-backed flows: `./devshell.sh make test-e2e`.
 
 ## 3. Go runtime & syntax constraints
 
@@ -65,10 +68,12 @@ Run the project's standard targets; do not invent ad-hoc invocations.
   under `cmd/` (main packages), `internal/` (non-importable implementation), and
   `pkg/` (public API), with `docs/` for documentation.
 - **Remote-snapshotter contract:** on `Prepare` of a target snapshot (labeled
-  `containerd.io/snapshot.ref`), populate the target from the content store and
-  return `ErrAlreadyExists` so containerd skips layer download/unpack; otherwise
-  delegate to the wrapped snapshotter. Model the design on the upstream
-  `stargz`, `nydus`, and `erofs` snapshotters.
+  `containerd.io/snapshot.ref`), preloaded mode checks the named stored image
+  and chain, records the snapshot and returns `ErrAlreadyExists` to skip
+  layer download/unpack. Admit-any mode returns a staging mount consumed by
+  the proxy differ. Container snapshots use an image-backed overlay; there
+  is no wrapped snapshotter or parentless scratch fallback. See
+  `internal/snapshot/snapshot.go` for the calling contract.
 - **Backend abstraction:** keep storage/mount behavior behind a `FileSystem`-style
   interface (the stargz idiom) rather than ad-hoc calls in the snapshotter state
   machine.
@@ -168,7 +173,9 @@ A change is complete only when, at minimum:
 
 - `make check` and `make build` pass cleanly.
 - Changes touching the snapshotter's privileged paths additionally pass
-  `make root-test` (the containerd conformance suite).
+  `./devshell.sh make test-e2e`. Also run `make root-test` and report the
+  known scratch-snapshot mismatch separately; it is not currently a passing
+  gate (see the conformance note above).
 - Concurrency-sensitive changes pass the race detector
   (`go test -race ./...`).
 - Every new/changed Go file carries the Apache-2.0 SPDX header, and any new

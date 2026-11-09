@@ -48,9 +48,10 @@ maintainer's job is choosing the version, writing the summary, and tagging.
    all artifacts to a **draft** release, and finalizes it as the last
    step. `-rc.N` tags are marked pre-release.
 4. Verify the release page: two `.tar.gz` archives, two `.deb` packages,
-   `checksums.txt` listing every artifact including the SBOMs, the source
-   archives, and notes consisting of your tag message (plus the generated
-   pull-request list when a previous stable release exists).
+   `cfs-snapshotter_<ver>_checksums.txt` listing the workflow-built
+   artifacts including the SBOMs; the GitHub-generated source archives;
+   and notes consisting of your tag message (plus the generated pull-request
+   list when a previous stable release exists).
 5. Remove the Dependabot entries from the generated list, and the "New
    Contributors" line for Dependabot, with `gh release edit vX.Y.Z
    --notes-file <file>`.
@@ -77,7 +78,8 @@ release page renders every newline as a line break.
 
 ## Compatibility
 
-- Kernel: Linux 6.6+ (EROFS, fs-verity, overlayfs data-only lowers)
+- Kernel: Linux 6.6+ (EROFS, overlayfs data-only lowers; fs-verity optional)
+- fs-verity: auto by default; required with ocicfs_verity_required
 - ocicfs: built against <version>
 - containerd: <supported range / config notes>
 - Tested on: <distros / devices>
