@@ -20,7 +20,7 @@ The examples use shell variables: set `ver` to the release number without
 `v`, and `arch` to `amd64` or `arm64`. For example:
 
 ```sh
-ver=0.1.0
+ver=0.5.0
 arch=amd64
 gh release download "v$ver" --repo foundriesio/cfs-snapshotter
 sha256sum --check --ignore-missing "cfs-snapshotter_${ver}_checksums.txt"
