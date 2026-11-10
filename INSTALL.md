@@ -318,7 +318,7 @@ and leaves wiring unverified.
   [composefs](https://github.com/composefs/composefs) if your distribution
   does not package it. The daemon refuses admit-any startup without it.
 - **ocicfs CLI:** needed to preload images. This snapshotter embeds ocicfs
-  v0.5.0; use a compatible CLI and matching store fs-verity mode. Preloaded
+  v0.5.1; use a compatible CLI and matching store fs-verity mode. Preloaded
   serving needs no build tools, but `ocicfs pull` needs `mkcomposefs` on
   the machine that builds the store.
 
