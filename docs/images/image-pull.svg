@@ -1,0 +1,109 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900" font-family="Noto Sans, Liberation Sans, DejaVu Sans, Arial, sans-serif">
+<defs>
+<marker id="ab" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#2563eb"/></marker>
+<marker id="ag" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#15803d"/></marker>
+<marker id="ap" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#7c3aed"/></marker>
+</defs>
+<rect width="1600" height="900" fill="#ffffff"/>
+<rect width="1600" height="72" fill="#1e3a5f"/>
+<text x="32" y="47" font-size="30" font-weight="700" fill="#fff">Image Pull and Ingestion</text>
+<text x="1568" y="46" font-size="18" fill="#dbe4f0" text-anchor="end">cfs-snapshotter + ocicfs · how image content reaches the device</text>
+<rect x="40" y="120" width="270" height="470" rx="10" fill="#eef4fb" stroke="#9db9dc" stroke-width="2"/>
+<text x="56" y="150" font-size="21" font-weight="700" fill="#1f2937">Clients</text>
+<rect x="56" y="166" width="238" height="70" rx="8" fill="#ffffff" stroke="#9db9dc" stroke-width="1.5"/>
+<text x="70" y="192" font-size="17" font-weight="700" fill="#1f2937">Docker client</text>
+<text x="70" y="212" font-size="14" fill="#4b5563">docker pull, docker build</text>
+<rect x="56" y="256" width="238" height="70" rx="8" fill="#ffffff" stroke="#9db9dc" stroke-width="1.5"/>
+<text x="70" y="282" font-size="17" font-weight="700" fill="#1f2937">containerd client</text>
+<text x="70" y="302" font-size="14" fill="#4b5563">ctr pull, nerdctl pull</text>
+<rect x="56" y="346" width="238" height="96" rx="8" fill="#ffffff" stroke="#9db9dc" stroke-width="1.5"/>
+<text x="70" y="372" font-size="17" font-weight="700" fill="#1f2937">composectl</text>
+<text x="70" y="392" font-size="14" fill="#4b5563">pulls into its own store, then</text>
+<text x="70" y="411" font-size="14" fill="#4b5563">installs into containerd</text>
+<text x="70" y="430" font-size="14" fill="#4b5563">(Docker fallback)</text>
+<rect x="56" y="462" width="238" height="90" rx="8" fill="#ffffff" stroke="#9db9dc" stroke-width="1.5"/>
+<text x="70" y="488" font-size="17" font-weight="700" fill="#1f2937">Update agent</text>
+<text x="70" y="508" font-size="14" fill="#4b5563">drives preload out of band:</text>
+<text x="70" y="527" font-size="14" fill="#4b5563">ocicfs pull, hold, release</text>
+<rect x="370" y="166" width="180" height="70" rx="10" fill="#fff4e6" stroke="#f0b36a" stroke-width="2"/>
+<text x="386" y="196" font-size="21" font-weight="700" fill="#1f2937">dockerd</text>
+<text x="386" y="218" font-size="14" fill="#4b5563" text-anchor="start" font-weight="400">Docker Engine</text>
+<rect x="610" y="120" width="300" height="330" rx="10" fill="#e8f0fb" stroke="#7fa6d9" stroke-width="2"/>
+<text x="626" y="150" font-size="21" font-weight="700" fill="#1f2937">containerd</text>
+<rect x="626" y="166" width="268" height="70" rx="8" fill="#ffffff" stroke="#7fa6d9" stroke-width="1.5"/>
+<text x="640" y="192" font-size="17" font-weight="700" fill="#1f2937">Image service</text>
+<text x="640" y="212" font-size="14" fill="#4b5563">image records, unpack</text>
+<rect x="626" y="256" width="268" height="70" rx="8" fill="#ffffff" stroke="#7fa6d9" stroke-width="1.5"/>
+<text x="640" y="282" font-size="17" font-weight="700" fill="#1f2937">Content store</text>
+<text x="640" y="302" font-size="14" fill="#4b5563">manifest, config, layer blobs</text>
+<rect x="626" y="346" width="268" height="90" rx="8" fill="#ffffff" stroke="#7fa6d9" stroke-width="1.5"/>
+<text x="640" y="372" font-size="17" font-weight="700" fill="#1f2937">Unpack</text>
+<text x="640" y="392" font-size="14" fill="#4b5563">Prepare each layer, then Apply;</text>
+<text x="640" y="411" font-size="14" fill="#4b5563">remote-snapshotter handshake</text>
+<rect x="970" y="120" width="290" height="330" rx="10" fill="#f3ecfb" stroke="#b494e0" stroke-width="2"/>
+<text x="986" y="150" font-size="21" font-weight="700" fill="#1f2937">cfs-snapshotter</text>
+<rect x="986" y="166" width="258" height="70" rx="8" fill="#ffffff" stroke="#b494e0" stroke-width="1.5"/>
+<text x="1000" y="192" font-size="17" font-weight="700" fill="#1f2937">Proxy snapshotter</text>
+<text x="1000" y="212" font-size="14" fill="#4b5563">snapshot chain, admission</text>
+<rect x="986" y="256" width="258" height="90" rx="8" fill="#ffffff" stroke="#b494e0" stroke-width="1.5"/>
+<text x="1000" y="282" font-size="17" font-weight="700" fill="#1f2937">Proxy differ</text>
+<text x="1000" y="302" font-size="14" fill="#4b5563">reads layer blobs from the</text>
+<text x="1000" y="321" font-size="14" fill="#4b5563">content store, writes into ocicfs</text>
+<rect x="986" y="366" width="258" height="70" rx="8" fill="#ffffff" stroke="#b494e0" stroke-width="1.5"/>
+<text x="1000" y="392" font-size="17" font-weight="700" fill="#1f2937">Never pulls</text>
+<text x="1000" y="412" font-size="14" fill="#4b5563">Prepare and Apply never fetch</text>
+<rect x="1320" y="120" width="240" height="420" rx="10" fill="#eaf7ec" stroke="#8ac79a" stroke-width="2"/>
+<text x="1336" y="150" font-size="21" font-weight="700" fill="#1f2937">ocicfs</text>
+<rect x="1336" y="166" width="208" height="90" rx="8" fill="#ffffff" stroke="#8ac79a" stroke-width="1.5"/>
+<text x="1350" y="192" font-size="17" font-weight="700" fill="#1f2937">Composefs image</text>
+<text x="1350" y="212" font-size="14" fill="#4b5563">one per image:</text>
+<text x="1350" y="231" font-size="14" fill="#4b5563">EROFS metadata</text>
+<rect x="1336" y="276" width="208" height="90" rx="8" fill="#ffffff" stroke="#8ac79a" stroke-width="1.5"/>
+<text x="1350" y="302" font-size="17" font-weight="700" fill="#1f2937">Shared file CAS</text>
+<text x="1350" y="322" font-size="14" fill="#4b5563">sha256-keyed file contents,</text>
+<text x="1350" y="341" font-size="14" fill="#4b5563">deduplicated across images</text>
+<rect x="1336" y="386" width="208" height="70" rx="8" fill="#ffffff" stroke="#8ac79a" stroke-width="1.5"/>
+<text x="1350" y="412" font-size="17" font-weight="700" fill="#1f2937">ocicfs CLI</text>
+<text x="1350" y="432" font-size="14" fill="#4b5563">pull, verify, hold, gc</text>
+<rect x="610" y="660" width="300" height="90" rx="10" fill="#f4f6f8" stroke="#9aa5b1" stroke-width="2"/>
+<text x="626" y="690" font-size="21" font-weight="700" fill="#1f2937">OCI registry</text>
+<text x="626" y="712" font-size="14" fill="#4b5563" text-anchor="start" font-weight="400">manifests, configs, layer blobs</text>
+<path d="M294 201 L370 201" fill="none" stroke="#2563eb" stroke-width="2.5" marker-end="url(#ab)"/>
+<path d="M550 201 L626 201" fill="none" stroke="#2563eb" stroke-width="2.5" marker-end="url(#ab)"/>
+<path d="M294 291 L626 291" fill="none" stroke="#2563eb" stroke-width="2.5" marker-end="url(#ab)"/>
+<path d="M294 391 L610 391" fill="none" stroke="#2563eb" stroke-width="2.5" marker-end="url(#ab)"/>
+<text x="440" y="384" font-size="13" text-anchor="middle" font-weight="600" stroke="#fff" stroke-width="5" paint-order="stroke" fill="#2563eb">install</text>
+<path d="M294 507 L1300 507 L1300 421 L1336 421" fill="none" stroke="#2563eb" stroke-width="2.5" marker-end="url(#ab)"/>
+<text x="790" y="500" font-size="13" text-anchor="start" font-weight="600" stroke="#fff" stroke-width="5" paint-order="stroke" fill="#2563eb">ocicfs pull &lt;image@digest&gt;  (optionally delta against a held image)</text>
+<path d="M910 201 L986 201" fill="none" stroke="#2563eb" stroke-width="2.5" marker-end="url(#ab)" marker-start="url(#ab)"/>
+<text x="948" y="190" font-size="12" text-anchor="middle" font-weight="600" stroke="#fff" stroke-width="5" paint-order="stroke" fill="#2563eb">gRPC</text>
+<path d="M894 301 L986 301" fill="none" stroke="#7c3aed" stroke-width="2.5" stroke-dasharray="9 6" marker-end="url(#ap)"/>
+<path d="M1244 301 L1336 301" fill="none" stroke="#15803d" stroke-width="2.5" marker-end="url(#ag)"/>
+<text x="1288" y="290" font-size="12" text-anchor="middle" font-weight="600" stroke="#fff" stroke-width="5" paint-order="stroke" fill="#15803d">ingest</text>
+<path d="M760 660 L760 540 L760 450" fill="none" stroke="#7c3aed" stroke-width="2.5" stroke-dasharray="9 6" marker-end="url(#ap)"/>
+<circle cx="760" cy="600" r="12" fill="#7c3aed"/>
+<text x="760" y="605" font-size="14" font-weight="700" fill="#fff" text-anchor="middle">A</text>
+<text x="790" y="583" font-size="13" text-anchor="start" font-weight="600" stroke="#fff" stroke-width="5" paint-order="stroke" fill="#7c3aed">runtime pull: manifest, config,</text>
+<text x="790" y="601" font-size="13" text-anchor="start" font-weight="600" stroke="#fff" stroke-width="5" paint-order="stroke" fill="#7c3aed">all missing layer blobs</text>
+<path d="M910 705 L1470 705 L1470 540" fill="none" stroke="#7c3aed" stroke-width="2.5" stroke-dasharray="9 6" marker-end="url(#ap)"/>
+<circle cx="1180" cy="705" r="12" fill="#7c3aed"/>
+<text x="1180" y="710" font-size="14" font-weight="700" fill="#fff" text-anchor="middle">B</text>
+<text x="1200" y="679" font-size="13" text-anchor="start" font-weight="600" stroke="#fff" stroke-width="5" paint-order="stroke" fill="#7c3aed">preload: manifest, config, only the files</text>
+<text x="1200" y="697" font-size="13" text-anchor="start" font-weight="600" stroke="#fff" stroke-width="5" paint-order="stroke" fill="#7c3aed">not already in the CAS</text>
+<rect x="40" y="600" width="540" height="160" rx="8" fill="#fffbeb" stroke="#f59e0b" stroke-width="1.5"/>
+<text x="54" y="624" font-size="14" fill="#1f2937">A  Runtime-driven: the runtime downloads the image; the proxy differ</text>
+<text x="54" y="643" font-size="14" fill="#1f2937">    applies each layer blob into the shared CAS and ocicfs builds the</text>
+<text x="54" y="662" font-size="14" fill="#1f2937">    composefs image. Native docker pull progress is preserved.</text>
+<text x="54" y="681" font-size="14" fill="#1f2937">B  Preloaded: ocicfs pull fetched the image earlier; it creates no runtime</text>
+<text x="54" y="700" font-size="14" fill="#1f2937">    image records. A later runtime pull registers the image: it fetches</text>
+<text x="54" y="719" font-size="14" fill="#1f2937">    manifest and config, then the snapshotter reports the chain as already</text>
+<text x="54" y="738" font-size="14" fill="#1f2937">    present, so no layer blob is downloaded or unpacked.</text>
+<rect x="32" y="800" width="1536" height="56" rx="8" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1.5"/>
+<text x="52" y="835" font-size="18" fill="#1f2937" text-anchor="start" font-weight="700">Legend</text>
+<path d="M160 828 L220 828" stroke="#2563eb" stroke-width="2.5" marker-end="url(#ab)"/>
+<text x="232" y="833" font-size="15" fill="#1f2937" text-anchor="start" font-weight="400">control / API call</text>
+<path d="M427.6 828 L487.6 828" stroke="#7c3aed" stroke-width="2.5" stroke-dasharray="9 6" marker-end="url(#ap)"/>
+<text x="499.6" y="833" font-size="15" fill="#1f2937" text-anchor="start" font-weight="400">OCI data (manifests, configs, blobs)</text>
+<path d="M842.8 828 L902.8 828" stroke="#15803d" stroke-width="2.5" marker-end="url(#ag)"/>
+<text x="914.8" y="833" font-size="15" fill="#1f2937" text-anchor="start" font-weight="400">materialization into the store</text>
+</svg>

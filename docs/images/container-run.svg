@@ -1,0 +1,114 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900" font-family="Noto Sans, Liberation Sans, DejaVu Sans, Arial, sans-serif">
+<defs>
+<marker id="ab" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#2563eb"/></marker>
+<marker id="ag" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#15803d"/></marker>
+<marker id="ap" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#7c3aed"/></marker>
+</defs>
+<rect width="1600" height="900" fill="#ffffff"/>
+<rect width="1600" height="72" fill="#1e3a5f"/>
+<text x="32" y="47" font-size="30" font-weight="700" fill="#fff">Container Run and Rootfs Assembly</text>
+<text x="1568" y="46" font-size="18" fill="#dbe4f0" text-anchor="end">cfs-snapshotter + ocicfs · how a container gets its root filesystem</text>
+<rect x="40" y="120" width="270" height="380" rx="10" fill="#eef4fb" stroke="#9db9dc" stroke-width="2"/>
+<text x="56" y="150" font-size="21" font-weight="700" fill="#1f2937">Clients</text>
+<rect x="56" y="166" width="238" height="70" rx="8" fill="#ffffff" stroke="#9db9dc" stroke-width="1.5"/>
+<text x="70" y="192" font-size="17" font-weight="700" fill="#1f2937">Docker client</text>
+<text x="70" y="212" font-size="14" fill="#4b5563">docker run, docker start</text>
+<rect x="56" y="256" width="238" height="90" rx="8" fill="#ffffff" stroke="#9db9dc" stroke-width="1.5"/>
+<text x="70" y="282" font-size="17" font-weight="700" fill="#1f2937">composectl / Compose</text>
+<text x="70" y="302" font-size="14" fill="#4b5563">composectl run drives</text>
+<text x="70" y="321" font-size="14" fill="#4b5563">docker compose up</text>
+<rect x="56" y="366" width="238" height="70" rx="8" fill="#ffffff" stroke="#9db9dc" stroke-width="1.5"/>
+<text x="70" y="392" font-size="17" font-weight="700" fill="#1f2937">containerd client</text>
+<text x="70" y="412" font-size="14" fill="#4b5563">ctr run, nerdctl run</text>
+<rect x="370" y="166" width="180" height="70" rx="10" fill="#fff4e6" stroke="#f0b36a" stroke-width="2"/>
+<text x="386" y="196" font-size="21" font-weight="700" fill="#1f2937">dockerd</text>
+<text x="386" y="218" font-size="14" fill="#4b5563" text-anchor="start" font-weight="400">Docker Engine</text>
+<rect x="610" y="120" width="290" height="380" rx="10" fill="#e8f0fb" stroke="#7fa6d9" stroke-width="2"/>
+<text x="626" y="150" font-size="21" font-weight="700" fill="#1f2937">containerd</text>
+<rect x="626" y="166" width="258" height="70" rx="8" fill="#ffffff" stroke="#7fa6d9" stroke-width="1.5"/>
+<text x="640" y="192" font-size="17" font-weight="700" fill="#1f2937">Container lifecycle</text>
+<text x="640" y="212" font-size="14" fill="#4b5563">create, start, stop, delete</text>
+<rect x="626" y="256" width="258" height="90" rx="8" fill="#ffffff" stroke="#7fa6d9" stroke-width="1.5"/>
+<text x="640" y="282" font-size="17" font-weight="700" fill="#1f2937">Snapshot request</text>
+<text x="640" y="302" font-size="14" fill="#4b5563">Prepare(key, parent=image chain)</text>
+<text x="640" y="321" font-size="14" fill="#4b5563">to the proxy snapshotter</text>
+<rect x="626" y="366" width="258" height="110" rx="8" fill="#ffffff" stroke="#7fa6d9" stroke-width="1.5"/>
+<text x="640" y="392" font-size="17" font-weight="700" fill="#1f2937">Mount + run</text>
+<text x="640" y="412" font-size="14" fill="#4b5563">performs the returned overlay</text>
+<text x="640" y="431" font-size="14" fill="#4b5563">mount, then starts the task</text>
+<text x="640" y="450" font-size="14" fill="#4b5563">through the OCI runtime</text>
+<rect x="960" y="120" width="290" height="380" rx="10" fill="#f3ecfb" stroke="#b494e0" stroke-width="2"/>
+<text x="976" y="150" font-size="21" font-weight="700" fill="#1f2937">cfs-snapshotter</text>
+<rect x="976" y="166" width="258" height="90" rx="8" fill="#ffffff" stroke="#b494e0" stroke-width="1.5"/>
+<text x="990" y="192" font-size="17" font-weight="700" fill="#1f2937">1 · Image mount</text>
+<text x="990" y="212" font-size="14" fill="#4b5563">mounts EROFS metadata read-only;</text>
+<text x="990" y="231" font-size="14" fill="#4b5563">one mount, shared per image</text>
+<rect x="976" y="276" width="258" height="90" rx="8" fill="#ffffff" stroke="#b494e0" stroke-width="1.5"/>
+<text x="990" y="302" font-size="17" font-weight="700" fill="#1f2937">2 · Writable state</text>
+<text x="990" y="322" font-size="14" fill="#4b5563">creates upperdir + workdir</text>
+<text x="990" y="341" font-size="14" fill="#4b5563">for this container</text>
+<rect x="976" y="386" width="258" height="90" rx="8" fill="#ffffff" stroke="#b494e0" stroke-width="1.5"/>
+<text x="990" y="412" font-size="17" font-weight="700" fill="#1f2937">3 · Mount spec</text>
+<text x="990" y="432" font-size="14" fill="#4b5563">returns one overlay mount spec;</text>
+<text x="990" y="451" font-size="14" fill="#4b5563">does not execute containers</text>
+<rect x="1310" y="120" width="250" height="250" rx="10" fill="#eaf7ec" stroke="#8ac79a" stroke-width="2"/>
+<text x="1326" y="150" font-size="21" font-weight="700" fill="#1f2937">ocicfs store</text>
+<rect x="1326" y="166" width="218" height="90" rx="8" fill="#ffffff" stroke="#8ac79a" stroke-width="1.5"/>
+<text x="1340" y="192" font-size="17" font-weight="700" fill="#1f2937">Composefs image</text>
+<text x="1340" y="212" font-size="14" fill="#4b5563">EROFS metadata per image;</text>
+<text x="1340" y="231" font-size="14" fill="#4b5563">names each file by digest</text>
+<rect x="1326" y="276" width="218" height="80" rx="8" fill="#ffffff" stroke="#8ac79a" stroke-width="1.5"/>
+<text x="1340" y="302" font-size="17" font-weight="700" fill="#1f2937">Shared file CAS</text>
+<text x="1340" y="322" font-size="14" fill="#4b5563">file contents, fs-verity sealed,</text>
+<text x="1340" y="341" font-size="14" fill="#4b5563">shared by every image</text>
+<rect x="960" y="560" width="600" height="210" rx="10" fill="#f4f6f8" stroke="#9aa5b1" stroke-width="2"/>
+<text x="976" y="590" font-size="21" font-weight="700" fill="#1f2937">Container rootfs</text>
+<text x="976" y="612" font-size="14" fill="#4b5563" text-anchor="start" font-weight="400">one OverlayFS mount per container, assembled from three directories</text>
+<rect x="976" y="616" width="568" height="44" rx="6" fill="#fde7ec" stroke="#e06b84" stroke-width="1.5"/>
+<text x="990" y="643" font-size="15" fill="#1f2937" text-anchor="start" font-weight="700">upperdir + workdir</text>
+<text x="1170" y="643" font-size="14" fill="#4b5563" text-anchor="start" font-weight="400">writable, private to this container (container changes)</text>
+<rect x="976" y="666" width="568" height="44" rx="6" fill="#e8f0fb" stroke="#7fa6d9" stroke-width="1.5"/>
+<text x="990" y="693" font-size="15" fill="#1f2937" text-anchor="start" font-weight="700">lowerdir: EROFS metadata</text>
+<text x="1210" y="693" font-size="14" fill="#4b5563" text-anchor="start" font-weight="400">read-only, shared by all containers of the image</text>
+<rect x="976" y="716" width="568" height="44" rx="6" fill="#eaf7ec" stroke="#8ac79a" stroke-width="1.5"/>
+<text x="990" y="743" font-size="15" fill="#1f2937" text-anchor="start" font-weight="700">:: data-only lower: CAS objects</text>
+<text x="1240" y="743" font-size="14" fill="#4b5563" text-anchor="start" font-weight="400">shared by all images, verity=require</text>
+<rect x="610" y="560" width="290" height="90" rx="10" fill="#e8f0fb" stroke="#7fa6d9" stroke-width="2"/>
+<text x="626" y="590" font-size="21" font-weight="700" fill="#1f2937">OCI runtime</text>
+<text x="626" y="612" font-size="14" fill="#4b5563" text-anchor="start" font-weight="400">containerd-shim-runc-v2 → runc</text>
+<rect x="610" y="680" width="290" height="90" rx="10" fill="#eaf7ec" stroke="#8ac79a" stroke-width="2"/>
+<text x="626" y="710" font-size="21" font-weight="700" fill="#1f2937">Running container</text>
+<text x="626" y="732" font-size="14" fill="#4b5563" text-anchor="start" font-weight="400">process tree inside the rootfs</text>
+<path d="M294 201 L370 201" fill="none" stroke="#2563eb" stroke-width="2.5" marker-end="url(#ab)"/>
+<path d="M294 301 L340 301 L340 201" fill="none" stroke="#2563eb" stroke-width="2.5" marker-end="url(#ab)"/>
+<path d="M550 201 L626 201" fill="none" stroke="#2563eb" stroke-width="2.5" marker-end="url(#ab)"/>
+<path d="M294 401 L610 401" fill="none" stroke="#2563eb" stroke-width="2.5" marker-end="url(#ab)"/>
+<path d="M884 301 L976 301" fill="none" stroke="#2563eb" stroke-width="2.5" marker-end="url(#ab)" marker-start="url(#ab)"/>
+<text x="930" y="290" font-size="12" text-anchor="middle" font-weight="600" stroke="#fff" stroke-width="5" paint-order="stroke" fill="#2563eb">Prepare</text>
+<path d="M755 500 L755 560" fill="none" stroke="#2563eb" stroke-width="2.5" marker-end="url(#ab)"/>
+<text x="770" y="535" font-size="12" text-anchor="start" font-weight="600" stroke="#fff" stroke-width="5" paint-order="stroke" fill="#2563eb">start task</text>
+<path d="M755 650 L755 680" fill="none" stroke="#2563eb" stroke-width="2.5" marker-end="url(#ab)"/>
+<path d="M884 421 L940 421 L940 540 L1000 540 L1000 560" fill="none" stroke="#2563eb" stroke-width="2.5" marker-end="url(#ab)"/>
+<text x="930" y="520" font-size="12" text-anchor="end" font-weight="600" stroke="#fff" stroke-width="5" paint-order="stroke" fill="#2563eb">performs the mount</text>
+<path d="M1310 211 L1234 211" fill="none" stroke="#15803d" stroke-width="2.5" marker-end="url(#ag)"/>
+<text x="1272" y="200" font-size="12" text-anchor="middle" font-weight="600" stroke="#fff" stroke-width="5" paint-order="stroke" fill="#15803d">mounts</text>
+<path d="M1250 431 L1280 431 L1280 560" fill="none" stroke="#15803d" stroke-width="2.5" marker-end="url(#ag)"/>
+<text x="1292" y="500" font-size="12" text-anchor="start" font-weight="600" stroke="#fff" stroke-width="5" paint-order="stroke" fill="#15803d">upper/work +</text>
+<text x="1292" y="518" font-size="12" text-anchor="start" font-weight="600" stroke="#fff" stroke-width="5" paint-order="stroke" fill="#15803d">mount spec</text>
+<path d="M1435 370 L1435 560" fill="none" stroke="#15803d" stroke-width="2.5" marker-end="url(#ag)"/>
+<text x="1447" y="460" font-size="12" text-anchor="start" font-weight="600" stroke="#fff" stroke-width="5" paint-order="stroke" fill="#15803d">lowers</text>
+<path d="M960 665 L900 665 L900 605" fill="none" stroke="#15803d" stroke-width="2.5" marker-end="url(#ag)"/>
+<text x="905" y="630" font-size="12" text-anchor="start" font-weight="600" stroke="#fff" stroke-width="5" paint-order="stroke" fill="#15803d">rootfs</text>
+<rect x="40" y="560" width="540" height="110" rx="8" fill="#fffbeb" stroke="#f59e0b" stroke-width="1.5"/>
+<text x="54" y="584" font-size="14" fill="#1f2937">No registry access at run time: every file read is served from the</text>
+<text x="54" y="603" font-size="14" fill="#1f2937">local CAS through the overlay. The image is never unpacked into a</text>
+<text x="54" y="622" font-size="14" fill="#1f2937">per-container directory tree, so starting a container costs one mount.</text>
+<text x="54" y="641" font-size="14" fill="#1f2937">containerd and the OCI runtime execute the container; cfs-snapshotter</text>
+<text x="54" y="660" font-size="14" fill="#1f2937">only prepares and tears down its filesystem.</text>
+<rect x="32" y="800" width="1536" height="56" rx="8" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1.5"/>
+<text x="52" y="835" font-size="18" fill="#1f2937" text-anchor="start" font-weight="700">Legend</text>
+<path d="M160 828 L220 828" stroke="#2563eb" stroke-width="2.5" marker-end="url(#ab)"/>
+<text x="232" y="833" font-size="15" fill="#1f2937" text-anchor="start" font-weight="400">control / API call</text>
+<path d="M427.6 828 L487.6 828" stroke="#15803d" stroke-width="2.5" marker-end="url(#ag)"/>
+<text x="499.6" y="833" font-size="15" fill="#1f2937" text-anchor="start" font-weight="400">filesystem backing / mount</text>
+</svg>

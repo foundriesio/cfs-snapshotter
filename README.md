@@ -84,6 +84,7 @@ For a local test stack instead of host installation, use the
 
 ## Documentation
 
+- [Architecture overview](docs/architecture.md).
 - [Install, configure and check the host](INSTALL.md).
 - [Run, preload and load images offline](docs/running.md).
 - [Develop, test and inspect mounts](docs/devcontainer.md).
