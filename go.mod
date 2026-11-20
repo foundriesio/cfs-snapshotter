@@ -14,7 +14,7 @@ require (
 	github.com/opencontainers/go-digest v1.0.0
 	github.com/opencontainers/image-spec v1.1.1
 	github.com/sirupsen/logrus v1.10.2
-	golang.org/x/sys v0.49.0
+	golang.org/x/sys v0.50.0
 	google.golang.org/grpc v1.83.2
 	google.golang.org/protobuf v1.36.12
 )
