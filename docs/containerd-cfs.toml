@@ -2,8 +2,9 @@
 #
 # containerd configuration for the cfs snapshotter. Merge this into
 # /etc/containerd/config.toml (see INSTALL.md for the two ways to do
-# that), then restart containerd. If your config.toml already has a
-# version line, drop the one below.
+# that), then restart containerd. When merging by hand, drop the
+# version line below and keep config.toml's own version line, or its
+# absence, as it is.
 
 version = 2
 

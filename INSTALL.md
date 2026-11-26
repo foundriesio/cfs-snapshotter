@@ -159,16 +159,23 @@ sudo cp /usr/share/doc/cfs-snapshotter/containerd-cfs.toml /etc/containerd/conf.
 ```
 
 Add the import to `/etc/containerd/config.toml`. Keep existing imports.
-`imports` must be a top-level key, before any `[section]` header. For a
-version 2 configuration:
+`imports` must be a top-level key, before any `[section]` header. Add
+only this line:
 
 ```toml
-version = 2
 imports = ["/etc/containerd/conf.d/*.toml"]
 ```
 
+Keep the file's `version` line as it is, and do not add one if it has
+none. Without one, containerd reads the file as version 1 and converts
+short plugin names such as `disabled_plugins = ["cri"]`; declaring
+`version = 2` turns that entry into an `invalid disabled plugin URI`
+error and containerd fails to start.
+
 Alternatively, merge the supplied block into the main config by hand;
-keep only one top-level `version` key and merge existing plugin tables.
+leave out its `version` line, keep the main config's `version` line (or
+its absence) as it is, and merge existing plugin tables. The block uses
+full plugin names, which work with or without a `version` line.
 The package does not edit containerd's configuration for you.
 
 The [supplied block](docs/containerd-cfs.toml) registers `cfs` and
