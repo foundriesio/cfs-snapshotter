@@ -25,12 +25,6 @@ version = 2
   type = "diff"
   address = "/run/containerd-cfs-grpc/containerd-cfs-grpc.sock"
 
-# Docker applies layers through the diff service, which tries the differs
-# in this order: cfs-diff takes the cfs snapshotter's layers and declines
-# every other, which then falls through to walking as before.
-[plugins."io.containerd.service.v1.diff-service"]
-  default = ["cfs-diff", "walking"]
-
 # `ctr pull` unpacks via the transfer service, which only unpacks for the
 # snapshotters listed here. Listing any entry replaces the built-in
 # default, so keep overlayfs alongside cfs.

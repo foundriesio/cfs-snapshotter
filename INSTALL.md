@@ -85,7 +85,8 @@ Upgrade with `sudo apt install ./<new-package>.deb`; roll back with
    or keep `sudo containerd-cfs-grpc` running in another terminal.
 
 3. Continue with [Connect containerd (and Docker)](#connect-containerd-and-docker).
-   The archive includes `containerd-cfs.toml` for that step.
+   The archive includes `containerd-cfs.toml` and
+   `containerd-cfs-diff-default.toml` for that step.
 
 Upgrade or roll back by installing the other version's binary and
 restarting the service. To uninstall this systemd installation:
@@ -125,7 +126,7 @@ sudo rm /usr/local/bin/containerd-cfs-grpc
    Without systemd, keep `sudo containerd-cfs-grpc` running in another
    terminal.
 
-3. Connect containerd using `docs/containerd-cfs.toml` from the checkout.
+3. Connect containerd using the files in `docs/` from the checkout.
 
 The default build and release artifacts use ocicfs's `auto` fs-verity
 mode. To require fs-verity:
@@ -142,20 +143,32 @@ package's mode. See [fs-verity modes](#fs-verity-modes).
 
 ### 1. Register the snapshotter and differ
 
-Use the supplied `containerd-cfs.toml`:
+Choose the files by the clients that pull onto cfs:
+
+| Clients using cfs | Files |
+|---|---|
+| Docker pulls in admit-any mode, `docker load`, nerdctl, `ctr --local`, CRI local pull | `containerd-cfs.toml` and `containerd-cfs-diff-default.toml` |
+| Only transfer-service pulls (`ctr images pull`, CRI by default) or Docker pulls in preloaded mode | `containerd-cfs.toml` |
+
+The second file makes containerd try `cfs-diff` first for every
+snapshotter, so while the cfs daemon is down, those clients' pulls fail
+on all snapshotters, not only cfs. Without it, their pulls onto cfs fail
+with `mount: no such device`; `-check` does not detect this.
 
 | Installation | Configuration source |
 |---|---|
-| Debian package | `/usr/share/doc/cfs-snapshotter/containerd-cfs.toml` |
-| Binary archive | `$archive/containerd-cfs.toml` |
-| Source checkout | `docs/containerd-cfs.toml` |
+| Debian package | `/usr/share/doc/cfs-snapshotter/` |
+| Binary archive | `$archive/` |
+| Source checkout | `docs/` |
 
-For the package, copy it to a drop-in directory (substitute the source
+For the package, copy them to a drop-in directory (substitute the source
 path for other installations):
 
 ```sh
 sudo mkdir -p /etc/containerd/conf.d
 sudo cp /usr/share/doc/cfs-snapshotter/containerd-cfs.toml /etc/containerd/conf.d/
+# Docker admit-any pulls, docker load, nerdctl, ctr --local, CRI local pull:
+sudo cp /usr/share/doc/cfs-snapshotter/containerd-cfs-diff-default.toml /etc/containerd/conf.d/
 ```
 
 Add the import to `/etc/containerd/config.toml`. Keep existing imports.
@@ -172,9 +185,10 @@ short plugin names such as `disabled_plugins = ["cri"]`; declaring
 `version = 2` turns that entry into an `invalid disabled plugin URI`
 error and containerd fails to start.
 
-Alternatively, merge the supplied block into the main config by hand;
-leave out its `version` line, keep the main config's `version` line (or
-its absence) as it is, and merge existing plugin tables. The block uses
+Alternatively, merge the supplied blocks into the main config by hand,
+including `containerd-cfs-diff-default.toml` if the table above says so;
+leave out the `version` line, keep the main config's `version` line (or
+its absence) as it is, and merge existing plugin tables. The blocks use
 full plugin names, which work with or without a `version` line.
 The package does not edit containerd's configuration for you.
 
@@ -183,14 +197,17 @@ The [supplied block](docs/containerd-cfs.toml) registers `cfs` and
 
 - Exports `enable_remote_snapshot_annotations = "true"`, so transfer
   pulls carry the image identity needed for admission.
-- Puts `cfs-diff` before `walking` in the diff service for Docker. The cfs
-  differ handles its staging mounts and declines other mount types.
 - Selects `cfs-diff` in the cfs transfer-service `unpack_config` entry.
   Setting this list replaces the built-in default, so the block includes
   `overlayfs`. Retain entries for any other snapshotters you use.
 
+The optional [`containerd-cfs-diff-default.toml`](docs/containerd-cfs-diff-default.toml)
+puts `cfs-diff` before `walking` in the diff service. The cfs differ
+handles its staging mounts and declines other mount types.
+
 Both plugins are needed for admit-any pulls and `docker load` in either
-mode. A missing or mis-ordered differ makes the layer apply fail with
+mode; clients that unpack through the diff service also need that order.
+A missing or mis-ordered differ makes the layer apply fail with
 `mount: no such device`: another differ cannot mount the cfs staging
 placeholder.
 
@@ -203,6 +220,10 @@ sudo systemctl restart cfs-snapshotter
 ```
 
 ### 2. Connect Docker, if used
+
+Docker pulls in admit-any mode and `docker load` need
+`containerd-cfs-diff-default.toml` from step 1. Docker pulls of preloaded
+images do not.
 
 Docker must use the containerd instance configured above. Check its
 service command with `systemctl cat docker`: an explicit

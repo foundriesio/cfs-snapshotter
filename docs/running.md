@@ -154,8 +154,9 @@ unavailable, its start fails and asks you to run `ocicfs pull`.
 
 ## Loading images offline (`docker load`)
 
-Both modes need the proxy differ configured. A missing or mis-ordered
-differ makes the layer apply fail with `mount: no such device`; check the
+Both modes need the proxy differ configured and placed first by
+`containerd-cfs-diff-default.toml`. A missing or mis-ordered differ makes
+the layer apply fail with `mount: no such device`; check the
 [containerd configuration](../INSTALL.md#1-register-the-snapshotter-and-differ).
 Choose the import path:
 
@@ -311,7 +312,7 @@ Fresh pull admission uses `containerd.io/snapshot/cri.image-ref`:
 | Runtime path | Configuration |
 |---|---|
 | Docker pull | Docker stamps the invoked reference. |
-| CRI local pull | Set `disable_snapshot_annotations = false` (the Unix default is `true`). |
+| CRI local pull | Set `disable_snapshot_annotations = false` (the Unix default is `true`) and install `containerd-cfs-diff-default.toml`. |
 | Transfer-service pull (`ctr` or CRI) | Set `enable_remote_snapshot_annotations = "true"` in the cfs proxy exports. |
 
 In preloaded mode, cfs resolves the stamped reference locally and checks
@@ -364,8 +365,10 @@ apply in both admit modes.
 ## Operational notes
 
 - After restarting the snapshotter, pulls can fail while containerd
-  reconnects. Retry once the socket is serving. Docker tries `cfs-diff`
-  first even for another snapshotter, so its pulls can be affected too.
+  reconnects. Retry once the socket is serving. With
+  `containerd-cfs-diff-default.toml` installed, Docker and other
+  diff-service clients try `cfs-diff` first even for another
+  snapshotter, so their pulls can be affected too.
 - Concurrent pulls of the same image in one namespace share build state.
   Aborting one can interrupt the other's layer apply. An immediate
   remove-and-repull can also race cleanup of old records. Retry the

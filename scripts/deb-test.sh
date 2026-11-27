@@ -46,6 +46,8 @@ grep -q RestartPreventExitStatus=3 /usr/lib/systemd/system/cfs-snapshotter.servi
 containerd-cfs-grpc -help 2>&1 | grep -q -- -check
 grep -q CFS_OPTS /etc/default/cfs-snapshotter
 grep -q proxy_plugins /usr/share/doc/cfs-snapshotter/containerd-cfs.toml
+grep -q diff-service /usr/share/doc/cfs-snapshotter/containerd-cfs-diff-default.toml
+if grep -q diff-service /usr/share/doc/cfs-snapshotter/containerd-cfs.toml; then exit 1; fi
 
 # Installing the same package again exercises the upgrade path.
 apt-get install -y --reinstall --no-install-recommends "$deb"

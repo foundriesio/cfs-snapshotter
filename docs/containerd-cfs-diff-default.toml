@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Optional addition to containerd-cfs.toml for clients that unpack layers
+# through containerd's diff service: Docker pulls in admit-any mode,
+# `docker load`, nerdctl, `ctr --local` and CRI local pulls. It makes containerd try cfs-diff first for every
+# snapshotter; cfs-diff takes the cfs snapshotter's layers and declines the
+# rest, which fall through to walking. While the cfs daemon is down, layer
+# applies and diffs through the diff service then fail for every snapshotter.
+
+[plugins."io.containerd.service.v1.diff-service"]
+  default = ["cfs-diff", "walking"]

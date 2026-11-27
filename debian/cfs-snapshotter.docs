@@ -1,4 +1,5 @@
 NOTICE
 README.md
 docs/containerd-cfs.toml
+docs/containerd-cfs-diff-default.toml
 docs/running.md
